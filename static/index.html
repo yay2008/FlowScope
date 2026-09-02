@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Volume Suite · 30s</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="toolbar">
+  <span class="logo">Volume Suite</span>
+  <label>合约 <input id="symbol" value="KQ.m@SHFE.fu" spellcheck="false"></label>
+  <button id="apply">切换</button>
+  <label>模式
+    <select id="mode">
+      <option value="rvol">Relative Volume</option>
+      <option value="crvol">CRVOL</option>
+      <option value="volume">Volume</option>
+      <option value="bsv">Buy/Sell Volume</option>
+      <option value="delta">Volume Delta</option>
+      <option value="cvd">CVD</option>
+    </select>
+  </label>
+  <label>阈值
+    <select id="threshtype">
+      <option value="RELATIVE">RELATIVE</option>
+      <option value="SMA">SMA</option>
+      <option value="Z-SCORE">Z-SCORE</option>
+    </select>
+  </label>
+  <label>拆分粒度
+    <select id="ltf">
+      <option value="0">tick(精确)</option>
+      <option value="1">1s</option>
+      <option value="5">5s</option>
+      <option value="15">15s</option>
+      <option value="30">30s(粗略)</option>
+    </select>
+  </label>
+  <span id="status" class="off">连接中…</span>
+  <span id="legend"></span>
+</div>
+<div id="chart"></div>
+<script src="https://unpkg.com/lightweight-charts@5/dist/lightweight-charts.standalone.production.js"></script>
+<script>window.LightweightCharts || document.write('<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5/dist/lightweight-charts.standalone.production.js"><\/script>')</script>
+<script src="app.js"></script>
+</body>
+</html>
