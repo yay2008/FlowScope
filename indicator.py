@@ -19,14 +19,14 @@ import pandas as pd
 BAR_NS = 30 * 10**9      # 30 秒 K 线宽度(纳秒)
 TZ_SHIFT_S = 8 * 3600    # tqSdk 时间戳是 UTC, +8h 转北京时间给前端展示
 
-# 前端配色/阈值配置(与 Pine 脚本默认值一致)
+# 前端配色/阈值配置(阈值倍数与等级色同 Pine 默认值; 默认柱色为原版灰白/灰加透明度, 降低存在感)
 CFG = {
     "mult": [1.5, 2.5, 3.5],              # 三级阈值倍数
     "rellen": 20,                     # RELATIVE 模式的相对均线长度
     "smalen": 300,                    # SMA 模式均线长度
     "zlen": 50,                       # Z-SCORE 窗口
     "colors": {
-        "up": "#d1d4dc", "down": "#9598a1",
+        "up": "rgba(209, 212, 220, 0.5)", "down": "rgba(149, 152, 161, 0.5)",
         "upLevels": ["#c8e6c9", "#a5d6a7", "#66bb6a"],
         "downLevels": ["#faa1a4", "#f77c80", "#f7525f"],
     },

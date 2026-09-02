@@ -10,7 +10,7 @@ const $ = (id) => document.getElementById(id);
 let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
 let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
 let derived = null;   // 派生数组(rolling sma/zscore 等)
-let mode = "rvol";
+let mode = "cvd";
 let threshtype = "RELATIVE";
 let ltf = 0;          // 买卖量拆分粒度(秒), 0=逐 tick 盘口判定
 let symbol = new URLSearchParams(location.search).get("symbol") || "KQ.m@SHFE.fu";
@@ -35,11 +35,20 @@ const chart = LightweightCharts.createChart($("chart"), {
   rightPriceScale: { borderColor: "#2a2e39" },
 });
 
+// K线配色: 涨灰白, 跌灰黑
 const candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
-  upColor: "#66bb6a", downColor: "#f7525f",
-  wickUpColor: "#66bb6a", wickDownColor: "#f7525f",
+  upColor: "#d1d4dc", downColor: "#4a4f5c",
+  wickUpColor: "#d1d4dc", wickDownColor: "#4a4f5c",
   borderVisible: false,
 }, 0);
+
+// 主图 EMA 21/55/100/200(金/蓝/青/紫)
+const EMA_PERIODS = [21, 55, 100, 200];
+const EMA_COLORS = ["#f0b90d", "#2962ff", "#009688", "#ab47bc"];
+const emaSeries = EMA_PERIODS.map((p, j) =>
+  chart.addSeries(LightweightCharts.LineSeries, {
+    color: EMA_COLORS[j], lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+  }, 0));
 
 // suite pane: 直方图(主值) + 直方图(卖量, 负值) + 蜡烛(CRVOL/CVD 模式)
 const histA = chart.addSeries(LightweightCharts.HistogramSeries, { priceFormat: { type: "volume" } }, 1);
@@ -63,23 +72,29 @@ lwWaveGray.createPriceLine({ price: 80, color: "rgba(242, 54, 69, 0.5)", lineSty
 lwWaveGray.createPriceLine({ price: 50, color: "rgba(149, 152, 161, 0.5)", lineStyle: LightweightCharts.LineStyle.Dotted, lineWidth: 1, title: "" });
 lwWaveGray.createPriceLine({ price: 20, color: "rgba(102, 187, 106, 0.5)", lineStyle: LightweightCharts.LineStyle.Dashed, lineWidth: 1, title: "" });
 
-try {
-  chart.panes()[0].setHeight(Math.floor(window.innerHeight * 0.45));
-  chart.panes()[1].setHeight(Math.floor(window.innerHeight * 0.30));
-  chart.panes()[2].setHeight(Math.floor(window.innerHeight * 0.20));
-} catch (e) { /* 旧版本无 pane 高度 API 可忽略 */ }
+// setHeight 的重分配算法依赖窗格当前像素高度, 首帧前调用会算出错误权重; setStretchFactor 纯比例语义, 时序安全
+chart.panes()[0].setStretchFactor(0.60);   // K线
+chart.panes()[1].setStretchFactor(0.20);   // Volume Suite
+chart.panes()[2].setStretchFactor(0.20);   // LSMA × CRVOL
 
 // 窗格左上角名称标签(series 的 title 选项会显示在右侧价格轴上, 改用绝对定位 div)
+// pane 的 DOM 要到首个绘制帧才创建, 拿不到就下一帧重试(上限 120 帧防止旧版库死循环)
 function addPaneLabel(paneIndex, text) {
-  try {
-    const el = chart.panes()[paneIndex].getHTMLElement();
-    if (!el) return;
+  let tries = 0;
+  const tryAdd = () => {
+    let el = null;
+    try { el = chart.panes()[paneIndex].getHTMLElement(); } catch (e) { return; }
+    if (!el) {
+      if (++tries < 120) requestAnimationFrame(tryAdd);
+      return;
+    }
     if (getComputedStyle(el).position === "static") el.style.position = "relative";
     const div = document.createElement("div");
     div.className = "pane-label";
     div.textContent = text;
     el.appendChild(div);
-  } catch (e) { /* 旧版本无 getHTMLElement 可忽略 */ }
+  };
+  tryAdd();
 }
 addPaneLabel(1, "Volume Suite");
 addPaneLabel(2, "LSMA × CRVOL");
@@ -235,6 +250,8 @@ function derive() {
   const buy = bars.map((b) => b.buy);
   const sell = bars.map((b) => b.sell);
   const delta = bars.map((b) => b.delta);
+  const close = bars.map((b) => b.close);
+  const emaLines = EMA_PERIODS.map((p) => ema(close, p));
   const posd = delta.map((d) => (d == null ? null : d > 0 ? d : 0));
   const negd = delta.map((d) => (d == null ? null : d < 0 ? d : 0));
 
@@ -267,7 +284,7 @@ function derive() {
   }
 
   derived = { vol, buy, sell, delta, posd, negd, smaVolN, rvol, rpos, rneg, rbuy, rsell,
-              zVol, zRpos, zRneg, zBuy, zSell, crv };
+              zVol, zRpos, zRneg, zBuy, zSell, crv, emaLines };
   derived.lw = deriveLw();
 }
 
@@ -428,6 +445,8 @@ function renderAll() {
   derive();
   sma300Cache = null;
   candleSeries.setData(bars.map(candleOf));
+  emaSeries.forEach((s, j) =>
+    s.setData(bars.map((b, i) => ({ time: b.time, value: derived.emaLines[j][i] })).filter((p) => p.value != null)));
   renderSuite();
   renderLw();
   updateLegend(bars.length - 1);
@@ -440,6 +459,10 @@ function updateLast() {
   const i = bars.length - 1;
   const b = bars[i];
   candleSeries.update(candleOf(b));
+  emaSeries.forEach((s, j) => {
+    const v = derived.emaLines[j][i];
+    if (v != null) s.update({ time: b.time, value: v });
+  });
 
   const { hist, histSell, candles } = buildSuiteData();
   // buildSuiteData 全量重建后仅 update 末点, 避免 setData 重置视图
