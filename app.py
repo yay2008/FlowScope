@@ -19,7 +19,7 @@ from ingest import FeedManager
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "KQ.m@SHFE.fu"
 
-app = FastAPI(title="Volume Suite Web")
+app = FastAPI(title="FlowScope")
 manager = FeedManager()
 
 

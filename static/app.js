@@ -1,4 +1,4 @@
-/* Volume Suite Web 前端
+/* FlowScope 前端
  * 数据: GET /api/history 拉历史快照, WS /ws 收增量 bar
  * 渲染: lightweight-charts v5, 三个 pane: K线 / Volume Suite / LSMA×CRVOL
  * 阈值与配色按 Volume Suite (By Leviathan) 口径在前端实时计算
@@ -56,11 +56,9 @@ const histB = chart.addSeries(LightweightCharts.HistogramSeries, { priceFormat: 
 const candleSuite = chart.addSeries(LightweightCharts.CandlestickSeries, { borderVisible: false }, 1);
 
 // pane 2: LSMA × CRVOL 共振(移植自 LSMA × CRVOL 共振 V1.pine, 只需 OHLCV, 全部前端计算)
-// wave 主线按状态拆成 3 条阶梯线(灰/红/绿), 切换时把前一点画进新颜色保持连续
+// wave 主线固定灰色阶梯线(原版按超买红/超卖绿着色, 按需求去掉状态色, 超买超卖仍由虚线和圆点标示)
 const lwLineOpts = { lineWidth: 1, lineType: LightweightCharts.LineType.WithSteps, priceLineVisible: false, lastValueVisible: false };
 const lwWaveGray = chart.addSeries(LightweightCharts.LineSeries, { ...lwLineOpts, color: "#9598a1" }, 2);
-const lwWaveRed = chart.addSeries(LightweightCharts.LineSeries, { ...lwLineOpts, color: "#f7525f" }, 2);
-const lwWaveGrn = chart.addSeries(LightweightCharts.LineSeries, { ...lwLineOpts, color: "#66bb6a" }, 2);
 // 超买超卖压力点(wt2 越线时在 80/20 上画点)
 const lwDotOpts = { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 3, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false };
 const lwDotLow = chart.addSeries(LightweightCharts.LineSeries, { ...lwDotOpts, color: "#00e676" }, 2);
@@ -96,8 +94,8 @@ function addPaneLabel(paneIndex, text) {
   };
   tryAdd();
 }
-addPaneLabel(1, "Volume Suite");
-addPaneLabel(2, "LSMA × CRVOL");
+addPaneLabel(1, "FlowMeter");
+addPaneLabel(2, "FlowWave");
 
 // ---------- 指标计算(前端, 移植 Volume Suite 阈值逻辑) ----------
 
@@ -400,21 +398,13 @@ function renderSuite() {
 // LSMA × CRVOL pane 数据: 阈值沿用 cfg.mult(与 Pine th1/2/3 默认值一致)
 // 脉冲透明度对应 Pine color.new(x, 88/55/25/0); 涨 teal 跌红, 三级放量换醒目实色
 function buildLwData() {
-  const wavePts = { gray: [], red: [], grn: [] };
-  const dotLow = [], dotHigh = [], pulse = [];
+  const wave = [], dotLow = [], dotHigh = [], pulse = [];
   const th = cfg.mult;
   const ALPHA = [0.12, 0.45, 0.75, 1];
-  const stateOf = (w) => (w >= LW.ob ? "red" : w <= LW.os ? "grn" : "gray");
   const L = derived.lw;
   for (let i = 0; i < bars.length; i++) {
     const b = bars[i];
-    const w = L.wave[i];
-    if (w != null) {
-      const st = stateOf(w);
-      if (i > 0 && L.wave[i - 1] != null && stateOf(L.wave[i - 1]) !== st)
-        wavePts[st].push({ time: bars[i - 1].time, value: L.wave[i - 1] });
-      wavePts[st].push({ time: b.time, value: w });
-    }
+    if (L.wave[i] != null) wave.push({ time: b.time, value: L.wave[i] });
     if (L.wt2[i] != null) {
       if (L.wt2[i] < LW.os) dotLow.push({ time: b.time, value: LW.os });
       else if (L.wt2[i] > LW.ob) dotHigh.push({ time: b.time, value: LW.ob });
@@ -428,14 +418,12 @@ function buildLwData() {
       pulse.push({ time: b.time, value: rv * 5, color });
     }
   }
-  return { wavePts, dotLow, dotHigh, pulse };
+  return { wave, dotLow, dotHigh, pulse };
 }
 
 function renderLw() {
-  const { wavePts, dotLow, dotHigh, pulse } = buildLwData();
-  lwWaveGray.setData(wavePts.gray);
-  lwWaveRed.setData(wavePts.red);
-  lwWaveGrn.setData(wavePts.grn);
+  const { wave, dotLow, dotHigh, pulse } = buildLwData();
+  lwWaveGray.setData(wave);
   lwDotLow.setData(dotLow);
   lwDotHigh.setData(dotHigh);
   lwPulse.setData(pulse);
@@ -474,7 +462,7 @@ function updateLast() {
   }
   if (candles.length) candleSuite.update(candles[candles.length - 1]);
   else if (mode === "crvol" || mode === "cvd") candleSuite.update({ time: b.time });
-  renderLw();            // 3 色拆分序列增量更新繁琐, 直接整体 setData(数据量小)
+  renderLw();            // 整体 setData(数据量小)
   updateLegend(i);
 }
 
