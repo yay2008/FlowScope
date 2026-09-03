@@ -15,6 +15,9 @@ let threshtype = "RELATIVE";
 let ltf = 0;          // 买卖量拆分粒度(秒), 0=逐 tick 盘口判定
 let symbol = new URLSearchParams(location.search).get("symbol") || "KQ.m@SHFE.fu";
 let ws = null;
+let wsGeneration = 0;
+let reconnectTimer = null;
+let loadGeneration = 0;
 
 $("symbol").value = symbol;
 
@@ -305,16 +308,12 @@ function levelOf(kind, i) {
     const smaN = rollingSmaCache(kind, i);
     if (base == null || smaN == null) return 0;
     const w = kind === "posd" || kind === "negd" ? [2, 3, 7] : [1, 1, 1];
-    if (kind === "negd" || kind === "sell") {
-      // 卖方量/delta 为负值, 阈值同向比较
-      if (ge(base, smaN * (m[2] + 1) * w[2])) return 3;
-      if (ge(base, smaN * (m[1] + 1) * w[1])) return 2;
-      if (ge(base, smaN * (m[0] + 1) * w[0])) return 1;
-      return 0;
-    }
-    if (ge(base, smaN * (m[2] + 1) * w[2])) return 3;
-    if (ge(base, smaN * (m[1] + 1) * w[1])) return 2;
-    if (ge(base, smaN * (m[0] + 1) * w[0])) return 1;
+    const compareBase = kind === "negd" ? -base : base;
+    const compareSma = kind === "negd" ? -smaN : smaN;
+    if (compareSma <= 0) return 0;
+    if (ge(compareBase, compareSma * (m[2] + 1) * w[2])) return 3;
+    if (ge(compareBase, compareSma * (m[1] + 1) * w[1])) return 2;
+    if (ge(compareBase, compareSma * (m[0] + 1) * w[0])) return 1;
     return 0;
   }
   // Z-SCORE
@@ -502,7 +501,10 @@ chart.subscribeCrosshairMove((param) => {
 
 $("mode").addEventListener("change", (e) => { mode = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
 $("threshtype").addEventListener("change", (e) => { threshtype = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
-$("ltf").addEventListener("change", (e) => { ltf = parseInt(e.target.value, 10); loadHistory(); });
+$("ltf").addEventListener("change", (e) => {
+  ltf = parseInt(e.target.value, 10);
+  loadHistory().catch((error) => { setStatus(false, "加载失败: " + error.message); });
+});
 $("apply").addEventListener("click", () => {
   const s = $("symbol").value.trim();
   if (s) location.search = "?symbol=" + encodeURIComponent(s);
@@ -516,11 +518,31 @@ function setStatus(ok, text) {
 
 // ---------- 数据加载与实时推送 ----------
 
-async function loadHistory() {
+async function loadHistory(generation = ++loadGeneration) {
   setStatus(false, "加载中…");
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+    ws = null;
+  }
   const resp = await fetch("/api/history?symbol=" + encodeURIComponent(symbol) + "&ltf=" + ltf);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const data = await resp.json();
-  if (data.pending) { setTimeout(loadHistory, 3000); return; }
+  if (generation !== loadGeneration) return;
+  if (data.pending) {
+    const ingestStatus = data.status;
+    if (ingestStatus && ingestStatus.status === "error") {
+      setStatus(false, "行情错误: " + (ingestStatus.lastError || "未知错误"));
+    } else {
+      setStatus(false, "等待行情…");
+    }
+    setTimeout(() => {
+      if (generation === loadGeneration) {
+        loadHistory(generation).catch((error) => { setStatus(false, "加载失败: " + error.message); });
+      }
+    }, 3000);
+    return;
+  }
   cfg = data.cfg;
   bars = data.bars;
   renderAll();
@@ -537,14 +559,29 @@ function onBar(bar) {
 }
 
 function connectWs() {
-  if (ws) ws.close();
-  ws = new WebSocket(`ws://${location.host}/ws?symbol=${encodeURIComponent(symbol)}`);
+  const generation = ++wsGeneration;
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+  }
+  const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${wsScheme}://${location.host}/ws?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}`);
   ws.onopen = () => setStatus(true, "已连接");
-  ws.onclose = () => { setStatus(false, "已断开, 重连中…"); setTimeout(connectWs, 3000); };
+  ws.onclose = () => {
+    if (generation !== wsGeneration) return;
+    setStatus(false, "已断开, 重连中…");
+    reconnectTimer = setTimeout(() => {
+      if (generation === wsGeneration) connectWs();
+    }, 3000);
+  };
   ws.onerror = () => setStatus(false, "连接错误");
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
-    if (msg.type === "bar" && msg.bar) onBar(msg.bar);
+    if (msg.type === "bar" && msg.ltf === ltf && msg.bar) onBar(msg.bar);
   };
 }
 

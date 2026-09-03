@@ -1,0 +1,6 @@
+fastapi>=0.110,<1
+numpy>=1.26,<3
+pandas>=2.0,<4
+tqsdk>=3.10,<4
+uvicorn[standard]>=0.29,<1
+python-dotenv>=1.0,<2
