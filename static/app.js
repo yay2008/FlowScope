@@ -12,11 +12,14 @@ let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
 let derived = null;   // 派生数组(rolling sma/zscore 等)
 let mode = "cvd";
 let threshtype = "RELATIVE";
-let ltf = 0;          // 买卖量拆分粒度(秒), 0=逐 tick 盘口判定
+let cvdSource = "tick";
+let klineLtf = 10;    // 切回 K线口径时保留上次选择，默认同 Pine 的 10S。
+let ltf = 0;         // 协议：0=tick，正数=实际小周期 K线。
 let view = "candle";  // 主图视图: candle=K线, footprint=足迹图
 let fpBars = [];      // 足迹 bar: {time, levels: [[price, buy, sell], ...按价格升序]}
-let fpGeneration = 0;
 let fpBarSpacing = null;   // 进足迹模式前的 barSpacing, 退出时恢复
+let barRevision = -1, fpRevision = -1;
+let watchdog = null;
 let symbol = new URLSearchParams(location.search).get("symbol") || "KQ.m@SHFE.fu";
 let ws = null;
 let wsGeneration = 0;
@@ -53,7 +56,7 @@ class FootprintRenderer {
   draw(target, priceConverter) {
     if (!this._data || !this._data.bars.length) return;
     const { bars, barSpacing } = this._data;
-    const tickSize = (this._options && this._options.tickSize) || 1;
+    const tickSize = this._options?.tickSize;
     target.useMediaCoordinateSpace(({ context: ctx }) => {
       const cellW = Math.max(barSpacing * 0.85, 6);
       const halfW = cellW / 2;
@@ -67,16 +70,10 @@ class FootprintRenderer {
         if (!levels || !levels.length) continue;
         const x = bars[i].x - cellW / 2;
         const ys = levels.map((lv) => priceConverter(lv[0]));
-        // 行高: 相邻价位 y 差的中位数; 单档 bar 用 tickSize 推算, 兜底 6px
-        const gaps = [];
-        for (let j = 1; j < ys.length; j++) {
-          if (ys[j] != null && ys[j - 1] != null) gaps.push(Math.abs(ys[j] - ys[j - 1]));
-        }
+        const diagonals = FlowData.diagonalVolumes(levels, tickSize);
+        // 稀疏成交档位之间可能隔了多个 tick，行高只按真实最小变动价位计算。
         let rowH = 6;
-        if (gaps.length) {
-          gaps.sort((a, b) => a - b);
-          rowH = gaps[gaps.length >> 1];
-        } else if (ys[0] != null) {
+        if (tickSize > 0 && ys[0] != null) {
           const y2 = priceConverter(levels[0][0] + tickSize);
           if (y2 != null && y2 !== ys[0]) rowH = Math.abs(y2 - ys[0]);
         }
@@ -121,11 +118,12 @@ class FootprintRenderer {
             ctx.fillText(String(sell), x + halfW / 2, y);
             ctx.fillText(String(buy), x + halfW * 1.5, y);
             // 对角不平衡: 买[j] >= 3*卖[j-1] 或 卖[j] >= 3*买[j+1] (levels 按价格升序)
-            const sellBelow = j > 0 ? levels[j - 1][2] : 0;
-            const buyAbove = j < levels.length - 1 ? levels[j + 1][1] : 0;
+            const diagonal = diagonals[j];
             let imbColor = null;
-            if (buy >= FP.imbRatio * Math.max(sellBelow, 1) && buy >= FP.imbMinVol) imbColor = FP.imbBuyColor;
-            else if (sell >= FP.imbRatio * Math.max(buyAbove, 1) && sell >= FP.imbMinVol) imbColor = FP.imbSellColor;
+            if (diagonal && d.coverage === "complete") {
+              if (buy >= FP.imbRatio * Math.max(diagonal.sellBelow, 1) && buy >= FP.imbMinVol) imbColor = FP.imbBuyColor;
+              else if (sell >= FP.imbRatio * Math.max(diagonal.buyAbove, 1) && sell >= FP.imbMinVol) imbColor = FP.imbSellColor;
+            }
             if (imbColor) {
               ctx.strokeStyle = imbColor;
               ctx.lineWidth = 1.5;
@@ -152,7 +150,9 @@ class FootprintSeries {
   update(data, options) { this._renderer.update(data, options); }
   priceValueBuilder(plotRow) {
     const levels = plotRow.levels;
-    return [levels[0][0], levels[levels.length - 1][0], levels[levels.length - 1][0]];
+    return [Math.min(levels[0][0], plotRow.low ?? Infinity),
+            Math.max(levels[levels.length - 1][0], plotRow.high ?? -Infinity),
+            plotRow.close ?? levels[levels.length - 1][0]];
   }
   isWhitespace(data) { return !data.levels || !data.levels.length; }
   destroy() {}
@@ -161,6 +161,7 @@ class FootprintSeries {
 // ---------- 图表初始化 ----------
 
 const chart = LightweightCharts.createChart($("chart"), {
+  autoSize: true,
   layout: {
     background: { color: "#131722" },
     textColor: "#d1d4dc",
@@ -435,13 +436,8 @@ function levelOf(kind, i) {
   const d = derived;
   const ge = (x, t) => x != null && t != null && x >= t;
   if (threshtype === "RELATIVE") {
-    const k = kind === "delta" ? 1.5 : 1;
     const rel = { vol: d.rvol, posd: d.rpos, negd: d.rneg, buy: d.rbuy, sell: d.rsell }[kind][i];
-    if (rel == null) return 0;
-    if (ge(rel, m[2] * k)) return 3;
-    if (ge(rel, m[1] * k)) return  2;
-    if (ge(rel, m[0] * k)) return 1;
-    return 0;
+    return FlowData.relativeLevel(kind, rel, m);
   }
   if (threshtype === "SMA") {
     const base = { vol: d.vol, posd: d.posd, negd: d.negd, buy: d.buy, sell: d.sell }[kind][i];
@@ -495,6 +491,7 @@ function candleOf(b) {
 function buildSuiteData() {
   const hist = [], histSell = [], candles = [];
   const n = bars.length;
+  const cumulative = mode === "crvol" ? derived.crv : mode === "cvd" ? bars.map((b) => b.cvd) : null;
   for (let i = 0; i < n; i++) {
     const b = bars[i], d = derived;
     const up = b.close > b.open;      // 与原指标一致: 十字线算跌
@@ -513,21 +510,24 @@ function buildSuiteData() {
       hist.push({ time: b.time, value: b.delta, color: colorFor(b.delta > 0, lvl) });
     } else {
       // crvol / cvd: 蜡烛图, o=前一累计值, h=l=c=当前值
-      const arr = mode === "crvol" ? d.crv : bars.map((x) => x.cvd);
-      if (arr[i] == null || i === 0 || arr[i - 1] == null) continue;
+      const arr = cumulative;
+      const shape = mode === "cvd" ? FlowData.cvdCandle(b) :
+        (arr[i] == null || i === 0 || arr[i - 1] == null ? null :
+          {time: b.time, open: arr[i - 1], high: Math.max(arr[i - 1], arr[i]),
+           low: Math.min(arr[i - 1], arr[i]), close: arr[i]});
+      if (!shape) continue;
       const lvl = mode === "crvol" ? levelOf("vol", i)
                                   : levelOf(b.delta > 0 ? "posd" : "negd", i);
       // 原指标: CRVOL 蜡烛按 K线阴阳着色, CVD 蜡烛按 delta 正负着色
       const col = mode === "crvol" ? colorFor(up, lvl) : colorFor(b.delta > 0, lvl);
-      candles.push({ time: b.time, open: arr[i - 1], high: Math.max(arr[i - 1], arr[i]),
-                     low: Math.min(arr[i - 1], arr[i]), close: arr[i],
-                     color: col, wickColor: col });
+      candles.push({ ...shape, color: col, wickColor: col });
     }
   }
   return { hist, histSell, candles };
 }
 
 function renderSuite() {
+  if (!derived) return;
   const { hist, histSell, candles } = buildSuiteData();
   histA.setData(hist);
   histB.setData(histSell);
@@ -593,14 +593,16 @@ function updateLast() {
 
   const { hist, histSell, candles } = buildSuiteData();
   // buildSuiteData 全量重建后仅 update 末点, 避免 setData 重置视图
-  if (hist.length) histA.update(hist[hist.length - 1]);
-  else histA.update({ time: b.time });
+  const latestHist = hist[hist.length - 1];
+  histA.update(latestHist?.time === b.time ? latestHist : { time: b.time });
   if (mode === "bsv") {
-    if (histSell.length) histB.update(histSell[histSell.length - 1]);
-    else histB.update({ time: b.time });
+    const latestSell = histSell[histSell.length - 1];
+    histB.update(latestSell?.time === b.time ? latestSell : { time: b.time });
   }
-  if (candles.length) candleSuite.update(candles[candles.length - 1]);
-  else if (mode === "crvol" || mode === "cvd") candleSuite.update({ time: b.time });
+  if (mode === "crvol" || mode === "cvd") {
+    const latestCandle = candles[candles.length - 1];
+    candleSuite.update(latestCandle?.time === b.time ? latestCandle : { time: b.time });
+  }
   renderLw();            // 整体 setData(数据量小)
   updateLegend(i);
 }
@@ -615,6 +617,8 @@ function updateLegend(i) {
   if (i < 0 || i >= bars.length) return;
   const b = bars[i];
   const d = derived;
+  const quality = view === "footprint" ? fpBars.find((fp) => fp.time === b.time)?.coverage : b.coverage;
+  $("coverage").textContent = "覆盖:" + (({complete: "完整", partial: "部分", missing: "缺失", legacy: "旧历史"})[quality] || "缺失");
   const t = new Date(b.time * 1000).toISOString().slice(5, 19).replace("T", " ");
   const suiteVal =
     mode === "rvol" ? fmt(d.rvol[i], 2) :
@@ -641,9 +645,19 @@ chart.subscribeCrosshairMove((param) => {
 
 $("mode").addEventListener("change", (e) => { mode = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
 $("threshtype").addEventListener("change", (e) => { threshtype = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
-$("ltf").addEventListener("change", (e) => {
-  ltf = parseInt(e.target.value, 10);
+function updateSplitSelection() {
+  ltf = FlowData.splitLtf(cvdSource, klineLtf);
+  $("ltf").disabled = cvdSource === "tick";
+  $("ltf").value = String(klineLtf);
   loadHistory().catch((error) => { setStatus(false, "加载失败: " + error.message); });
+}
+$("cvd-source").addEventListener("change", (e) => {
+  cvdSource = e.target.value;
+  updateSplitSelection();
+});
+$("ltf").addEventListener("change", (e) => {
+  klineLtf = parseInt(e.target.value, 10);
+  updateSplitSelection();
 });
 $("apply").addEventListener("click", () => {
   const s = $("symbol").value.trim();
@@ -663,7 +677,7 @@ function ohlcOf(t) {   // bars 按 time 升序, 二分查找出 footprint bar �
 }
 
 const toFpItem = (b) => {
-  const item = { time: b.time, levels: b.levels };
+  const item = { time: b.time, levels: b.levels, coverage: b.coverage };
   const k = ohlcOf(b.time);
   if (k) { item.open = k.open; item.high = k.high; item.low = k.low; item.close = k.close; }
   return item;
@@ -679,47 +693,29 @@ function setView(v) {
   fpSeries.applyOptions({ visible: isFp });
   if (isFp) {
     fpBarSpacing = chart.timeScale().options().barSpacing;
-    chart.timeScale().applyOptions({ barSpacing: 60 });   // 分裂格较宽, 自动放大
-    if (fpBars.length) {
-      fpSeries.setData(fpBars.map(toFpItem));
-      chart.timeScale().scrollToRealTime();
-    } else {
-      loadFootprint().catch((error) => { setStatus(false, "足迹加载失败: " + error.message); });
-    }
+    chart.timeScale().applyOptions({ barSpacing: 60 });
   } else if (fpBarSpacing != null) {
     chart.timeScale().applyOptions({ barSpacing: fpBarSpacing });
     fpBarSpacing = null;
   }
+  if (cfg) connectWs();  // 订阅视图需求并获得完整快照，补齐未观看期间的足迹。
 }
 
-async function loadFootprint(generation = ++fpGeneration) {
-  const resp = await fetch("/api/footprint?symbol=" + encodeURIComponent(symbol));
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (generation !== fpGeneration) return;
-  if (data.pending) {
-    setTimeout(() => {
-      if (generation === fpGeneration) {
-        loadFootprint(generation).catch((error) => { setStatus(false, "足迹加载失败: " + error.message); });
-      }
-    }, 3000);
-    return;
-  }
-  fpBars = data.bars;
-  fpSeries.applyOptions({ tickSize: data.tickSize || 1 });
+function applyFootprint(data, replace = false) {
+  if (!data || data.revision < fpRevision) return;
+  fpRevision = data.revision;
+  const oldLast = fpBars[fpBars.length - 1]?.time;
+  const canUpdate = !replace && data.bars.length === 1 && fpBars.length < 800 &&
+                    (oldLast == null || data.bars[0].time >= oldLast);
+  fpBars = FlowData.mergeBars(replace ? [] : fpBars, data.bars);
+  const first = bars[0]?.time;
+  if (first != null) fpBars = fpBars.filter((b) => b.time >= first);
+  fpSeries.applyOptions({ tickSize: data.tickSize });
   if (view === "footprint") {
-    fpSeries.setData(fpBars.map(toFpItem));
-    chart.timeScale().scrollToRealTime();
+    if (canUpdate) fpSeries.update(toFpItem(data.bars[0]));
+    else fpSeries.setData(fpBars.map(toFpItem));
   }
-}
-
-function onFootprintBar(bar) {
-  if (!fpBars.length) return;              // 未加载过足迹历史, 等进足迹模式时全量拉取
-  const last = fpBars[fpBars.length - 1];
-  if (last.time === bar.time) fpBars[fpBars.length - 1] = bar;
-  else if (bar.time > last.time) fpBars.push(bar);
-  else return;                             // 乱序旧 bar 忽略
-  if (view === "footprint") fpSeries.update(toFpItem(fpBars[fpBars.length - 1]));
+  updateLegend(bars.length - 1);
 }
 
 function setStatus(ok, text) {
@@ -732,6 +728,10 @@ function setStatus(ok, text) {
 
 async function loadHistory(generation = ++loadGeneration) {
   setStatus(false, "加载中…");
+  ++wsGeneration;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  clearTimeout(watchdog);
   if (ws) {
     ws.onclose = null;
     ws.close();
@@ -762,39 +762,85 @@ async function loadHistory(generation = ++loadGeneration) {
   connectWs();
 }
 
-function onBar(bar) {
-  const last = bars.length ? bars[bars.length -  1] : null;
-  if (last && last.time === bar.time) bars[bars.length - 1] = bar;
-  else if (!last || bar.time > last.time) bars.push(bar);
-  else return;                       // 乱序旧 bar 忽略
-  updateLast();
+function onBars(updates) {
+  if (!updates.length) return;
+  const oldLast = bars[bars.length - 1]?.time;
+  const onlyLast = updates.length === 1 && updates[0].time === oldLast;
+  bars = FlowData.mergeBars(bars, updates);
+  if (onlyLast) updateLast();
+  else renderAll();  // 补齐/修订历史和窗口裁剪时，所有图表使用同一份数据。
+  if (view === "footprint" && fpBars.length) {
+    const latest = fpBars[fpBars.length - 1];
+    if (onlyLast && latest.time === oldLast) fpSeries.update(toFpItem(latest));
+    else fpSeries.setData(fpBars.map(toFpItem));
+  }
 }
 
 function connectWs() {
   const generation = ++wsGeneration;
-  if (reconnectTimer !== null) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  clearTimeout(watchdog);
   if (ws) {
     ws.onclose = null;
     ws.close();
   }
+  setStatus(false, "同步中…");
   const wsScheme = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${wsScheme}://${location.host}/ws?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}`);
-  ws.onopen = () => setStatus(true, "已连接");
-  ws.onclose = () => {
+  const socket = new WebSocket(`${wsScheme}://${location.host}/ws?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}&footprint=${view === "footprint"}`);
+  ws = socket;
+  let synced = false;
+  const armWatchdog = () => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      if (generation === wsGeneration) socket.close();
+    }, synced ? 45000 : 100000);
+  };
+  socket.onopen = () => {
+    if (generation === wsGeneration) armWatchdog();
+  };
+  socket.onclose = () => {
     if (generation !== wsGeneration) return;
-    setStatus(false, "已断开, 重连中…");
+    clearTimeout(watchdog);
+    setStatus(false, "已断开, 重连补齐中…");
     reconnectTimer = setTimeout(() => {
       if (generation === wsGeneration) connectWs();
     }, 3000);
   };
-  ws.onerror = () => setStatus(false, "连接错误");
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.type === "bar" && msg.ltf === ltf && msg.bar) onBar(msg.bar);
-    else if (msg.type === "footprint" && msg.bar) onFootprintBar(msg.bar);
+  socket.onerror = () => {
+    if (generation === wsGeneration) setStatus(false, "连接错误");
+  };
+  socket.onmessage = (ev) => {
+    if (generation !== wsGeneration) return;
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "ping") {
+        if (msg.error || msg.status?.status !== "connected") {
+          setStatus(false, msg.error || "行情源: " + (msg.status?.lastError || msg.status?.status || "未知"));
+        } else if (synced) setStatus(true, "已连接");
+      } else if (msg.symbol === symbol && msg.type === "snapshot" && msg.ltf === ltf) {
+        cfg = msg.cfg;
+        bars = FlowData.mergeBars([], msg.bars);
+        barRevision = msg.revision;
+        fpRevision = -1;
+        renderAll();
+        if (msg.footprint) applyFootprint(msg.footprint, true);
+        else { fpBars = []; fpSeries.setData([]); }
+        synced = true;
+        setStatus(true, "已连接");
+      } else if (synced && msg.symbol === symbol) {
+        if (msg.type === "bars" && msg.ltf === ltf && msg.revision > barRevision) {
+          onBars(msg.bars);
+          barRevision = msg.revision;
+        } else if ((msg.type === "footprints" || msg.type === "footprint_snapshot") && msg.revision > fpRevision) {
+          applyFootprint(msg, msg.type === "footprint_snapshot");
+        }
+      }
+      armWatchdog();
+    } catch (error) {
+      setStatus(false, "数据同步失败: " + error.message);
+      socket.close();
+    }
   };
 }
 

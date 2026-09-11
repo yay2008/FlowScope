@@ -38,7 +38,7 @@ async def _shutdown():
 async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0):
     """返回最近 N 根 bar 的完整快照; 订阅未就绪时最多等 90 秒(闭市回填慢)。
 
-    ltf: 买卖量拆分粒度(秒), 0=逐 tick 盘口判定, 1/5/15/30=小周期阴阳归类;
+    ltf: 买卖量拆分粒度(秒), 0=逐 tick 盘口判定, 1/5/10/15/30=小周期阴阳归类;
          切换后最多 1~2 秒由 ingest 线程重算
     """
     if ltf not in CFG["ltfOptions"]:
@@ -74,7 +74,7 @@ def status():
 async def footprint(symbol: str = DEFAULT_SYMBOL):
     """返回 tick 窗口内各 bar 的分价位买卖量矩阵(足迹图)，口径同 ltf=0。
 
-    快照未就绪时最多等 90 秒(闭市回填慢); tick 历史只有约 83 分钟，更早的 bar 无足迹。
+    快照未就绪时最多等 90 秒(闭市回填慢)；历史覆盖取决于 tick 窗口和持续采集。
     """
     try:
         normalized_symbol = validate_symbol(symbol)
@@ -93,33 +93,61 @@ async def footprint(symbol: str = DEFAULT_SYMBOL):
         if manager.status_snapshot()["status"] == "error":
             break
         await asyncio.sleep(0.2)
-    return {"symbol": normalized_symbol, "tickSize": 1.0, "bars": [], "pending": True,
+    return {"symbol": normalized_symbol, "tickSize": None, "bars": [], "pending": True,
             "status": manager.status_snapshot()}
 
 
 @app.websocket("/ws")
-async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0):
+async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, footprint: bool = False):
     await websocket.accept()
     try:
         symbol = validate_symbol(symbol)
-        manager.ensure(symbol)
+        feed = manager.ensure(symbol)
         if ltf not in CFG["ltfOptions"]:
             ltf = 0
     except ValueError as exc:
         await websocket.close(code=1008, reason=str(exc))
         return
     q: asyncio.Queue = asyncio.Queue(maxsize=100)
-    manager.add_client(q, symbol, ltf)
+    manager.add_client(q, symbol, ltf, footprint)
     try:
+        # 先注册，再读取快照。期间入队的旧增量可由 revision 排除，避免 REST→WS 空窗。
+        deadline = time.monotonic() + 90
+        while True:
+            snapshot = feed.snapshot_for(ltf)
+            fp = feed.footprint_snapshot() if footprint else None
+            if snapshot is not None and (not footprint or fp is not None):
+                break
+            if time.monotonic() >= deadline:
+                await websocket.close(code=1013, reason="等待行情超时，请重试")
+                return
+            await asyncio.sleep(0.1)
+        await websocket.send_json({"type": "snapshot", **snapshot, "footprint": fp})
+        bar_revision = snapshot["revision"]
+        fp_revision = fp["revision"] if fp else -1
         while True:
             try:
                 msg = await asyncio.wait_for(q.get(), timeout=15)
             except asyncio.TimeoutError:
                 # 心跳: 闭市无数据时也能及时发现断连
-                await websocket.send_json({"type": "ping"})
+                state = manager.status_snapshot()
+                with feed._state_lock:
+                    error = feed.error
+                await websocket.send_json({"type": "ping", "status": state, "error": error})
+                continue
+            if msg.get("type") == "resync":
+                await websocket.close(code=1013, reason="客户端积压，请重取快照")
+                return
+            is_fp = msg.get("type") in {"footprints", "footprint_snapshot"}
+            revision = msg.get("revision", -1)
+            if revision <= (fp_revision if is_fp else bar_revision):
                 continue
             if msg.get("symbol") == symbol:
                 await websocket.send_json(msg)
+                if is_fp:
+                    fp_revision = revision
+                else:
+                    bar_revision = revision
     except (WebSocketDisconnect, RuntimeError, asyncio.CancelledError):
         pass
     finally:

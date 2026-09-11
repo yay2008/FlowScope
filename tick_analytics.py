@@ -1,0 +1,103 @@
+"""复用快照分类与已完成 bar 聚合，仅重算新增/修订 tick 所在的 bar。"""
+import numpy as np
+import pandas as pd
+
+from indicator import BAR_NS, TZ_SHIFT_S, _classify_ticks, split_ticks_to_bars, build_footprint
+
+
+class TickAnalytics:
+    def __init__(self):
+        self.frame = None
+        self.first_tick_ns = None
+        self.changed_ns = None
+        self.version = 0
+        self._hashes = pd.Series(dtype="uint64")
+        self._aggregates = {}
+        self._fp = None
+        self._fp_version = -1
+
+    def update(self, ticks):
+        columns = ["datetime", "last_price", "ask_price1", "bid_price1", "volume"]
+        key_column = "id" if "id" in ticks else "datetime"
+        raw = ticks[list(dict.fromkeys([key_column, *columns]))].copy()
+        raw = raw.dropna(subset=[key_column, "datetime", "last_price", "volume"])
+        raw = raw[(raw.datetime > 0) & (raw[key_column] >= 0) & (raw.volume >= 0) &
+                  np.isfinite(raw.last_price) & np.isfinite(raw.volume)]
+        raw = raw.drop_duplicates(key_column, keep="last").sort_values(key_column).reset_index(drop=True)
+        if raw.empty:
+            if self.frame is None:
+                self.frame = _classify_ticks(raw)
+            return
+        keys = raw[key_column].to_numpy(dtype=np.int64)
+        hashes = pd.util.hash_pandas_object(raw, index=False)
+        hashes.index = keys
+        old = self._hashes.reindex(keys)
+        changed = old.isna().to_numpy() | (old.to_numpy() != hashes.to_numpy())
+        # reindex 存在缺项时会把 uint64 转 float，比较哈希须避免精度丢失。
+        known = np.isin(keys, self._hashes.index)
+        if known.any():
+            changed[known] = self._hashes.loc[keys[known]].to_numpy() != hashes.loc[keys[known]].to_numpy()
+        if not changed.any():
+            return
+        start = int(np.flatnonzero(changed)[0])
+        initial = self.frame is None or self.frame.empty
+        # 无重叠且 ID 不连续表示丢过 tick；从新窗口重新建立覆盖边界。
+        gap = (not initial and not known.any() and
+               (key_column != "id" or keys[0] != int(self.frame["_key"].iloc[-1]) + 1))
+        if gap:
+            self._aggregates.clear()
+            self._fp = None
+            initial = True
+            start = 0
+        head = None if initial else self.frame[self.frame["_key"] < keys[start]]
+        seed = None if head is None or head.empty else head.iloc[-1]
+        classified = _classify_ticks(raw.iloc[start:],
+                                     previous_volume=None if seed is None else seed.volume,
+                                     previous_side=0 if seed is None else seed.side)
+        classified["_key"] = keys[start:]
+        self.frame = classified.reset_index(drop=True) if head is None else pd.concat([head, classified], ignore_index=True)
+        if initial:
+            self.first_tick_ns = int(raw.datetime.iloc[0])
+        self.changed_ns = int(raw.datetime.iloc[start])
+        self.version += 1
+        self._hashes = hashes
+        # 保留窗口边缘整根 bar 和一个前置 tick，以免裁剪后重算边缘 bar 丢量。
+        cutoff = int(raw.datetime.iloc[0]) // BAR_NS * BAR_NS
+        keep = np.flatnonzero(self.frame.datetime.to_numpy() >= cutoff)
+        if len(keep):
+            self.frame = self.frame.iloc[max(0, int(keep[0]) - 1):].reset_index(drop=True)
+
+    def aggregate(self, ltf, first_bar_ns):
+        cached, version = self._aggregates.get(ltf, (None, -1))
+        if cached is None or version < self.version - 1:
+            cached = split_ticks_to_bars(self.frame, ltf, classified=self.frame)
+        elif version != self.version:
+            boundary = self.changed_ns // BAR_NS * BAR_NS
+            tail = self.frame[self.frame.datetime >= boundary]
+            fresh = split_ticks_to_bars(tail, ltf, classified=tail)
+            cached = pd.concat([cached[cached.index < boundary], fresh])
+        cached = cached[cached.index >= first_bar_ns]
+        self._aggregates[ltf] = (cached, self.version)
+        return cached
+
+    def footprint(self, klines, tick_size, coverage):
+        if self._fp is None or self._fp_version < self.version - 1:
+            self._fp = build_footprint(klines, self.frame, tick_size, classified=self.frame)["bars"]
+        elif self._fp_version != self.version:
+            boundary = self.changed_ns // BAR_NS * BAR_NS
+            boundary_s = boundary // 10**9 + TZ_SHIFT_S
+            tail = self.frame[self.frame.datetime >= boundary]
+            fresh = build_footprint(klines, tail, tick_size, classified=tail)["bars"]
+            self._fp = [bar for bar in self._fp if bar["time"] < boundary_s] + fresh
+        self._fp_version = self.version
+        allowed = set(coverage)
+        self._fp = [{**bar, "coverage": coverage[bar["time"]]} for bar in self._fp if bar["time"] in allowed][-800:]
+        step = float(tick_size) if tick_size is not None else None
+        if step is not None and (not np.isfinite(step) or step <= 0):
+            step = None
+        return {"tickSize": step, "bars": self._fp}
+
+    def retain(self, ltfs, footprint):
+        self._aggregates = {ltf: value for ltf, value in self._aggregates.items() if ltf in ltfs}
+        if not footprint:
+            self._fp = None

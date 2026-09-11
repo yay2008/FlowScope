@@ -4,8 +4,8 @@
 设计要点:
 - wait_update 循环独占一个守护线程; FastAPI 线程经命令队列请求新合约订阅
 - 闭市时初始数据回填不触发 wait_update 返回, 循环用 1s deadline 轮询兼容
-- 每根走完且有 tick 覆盖的 bar 的 buy/sell 追加写入 data/{symbol}_30s.csv;
-  tick 历史只有约 83 分钟, 更早的 buy/sell 靠 CSV 随运行时间累积
+- 每根走完且覆盖完整的 bar 写入按粒度隔离的 v2 CSV；旧 CSV 仅作 legacy 回填。
+- tick 窗口最多 10000 条，更早的 buy/sell 靠 CSV 随运行时间累积。
 """
 from __future__ import annotations
 
@@ -20,14 +20,16 @@ import pandas as pd
 from dotenv import load_dotenv
 from tqsdk import TqApi, TqAuth
 
-from indicator import CFG, build_bars, bars_to_records, build_footprint, finalize_bars
+from indicator import CFG, build_bars, build_bars_from_ltf, bars_to_records
+from history_store import HistoryStore
+from tick_analytics import TickAnalytics
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-MAX_TICKS = 10000     # get_tick_serial 单次上限 10000 条 ≈ 83 分钟
+MAX_TICKS = 10000     # 条数窗口；按 500ms 一条估算约 83 分钟
 MAX_KLINES = 2000     # 2000 根 30s K线 ≈ 2.5 个交易日
 SNAPSHOT_BARS = 800   # 推送给前端的最近 bar 数
 MAX_FEEDS = 32
@@ -47,113 +49,156 @@ def validate_symbol(symbol: str) -> str:
 
 
 class Feed:
-    """单个合约的订阅、快照与 CSV 落盘"""
+    """单合约快照；只有 ingest 线程读写 SDK 数据和历史文件。"""
 
     def __init__(self, symbol: str):
         self.symbol = validate_symbol(symbol)
-        self.klines = None
-        self.ticks = None
-        self.ready = threading.Event()     # 首个快照就绪
-        self.snapshots: dict[int, dict] = {}
-        self.footprint: dict | None = None
-        self.error: str | None = None
-        self._last_tick_dt = None
+        self.klines = self.ticks = self.quote = None
+        self.ready = threading.Event()
+        self.snapshots = {}
+        self.footprint = None
+        self.error = None
         self._state_lock = threading.RLock()
-        self._csv_values: dict[int, tuple[float, float]] = {}
-        self._csv_last_time = 0
-        self.csv_path = os.path.join(DATA_DIR, f"{_csv_key(self.symbol)}_30s.csv")
-        self._load_csv_cache()
+        self._requested = {0: float("inf")}
+        self._fp_until = 0.0
+        self._demand_version = 0
+        self._computed_version = -1
+        self.revision = 0
+        self.stores = {}
+        self.analytics = TickAnalytics()
+        self.lower_klines = {}
 
     def subscribe(self, api: TqApi):
+        self.quote = api.get_quote(self.symbol)
         self.klines = api.get_kline_serial(self.symbol, 30, data_length=MAX_KLINES)
         self.ticks = api.get_tick_serial(self.symbol, data_length=MAX_TICKS)
+        self.analytics = TickAnalytics()
+        self.lower_klines = {30: self.klines}
         with self._state_lock:
-            self._last_tick_dt = None
             self.snapshots.clear()
             self.footprint = None
             self.ready.clear()
             self.error = None
+            self._computed_version = -1
 
-    def _load_csv_cache(self):
-        if not os.path.exists(self.csv_path):
-            return
-        try:
-            csv = pd.read_csv(self.csv_path)
-            if {"time", "buy", "sell"}.issubset(csv.columns):
-                csv = csv[["time", "buy", "sell"]].dropna()
-                csv["time"] = pd.to_numeric(csv["time"], errors="coerce")
-                csv["buy"] = pd.to_numeric(csv["buy"], errors="coerce")
-                csv["sell"] = pd.to_numeric(csv["sell"], errors="coerce")
-                csv = csv.dropna().astype({"time": "int64"})
-                duplicate_rows = len(csv) != csv["time"].nunique()
-                csv = csv.drop_duplicates("time", keep="last").sort_values("time")
-                for row in csv[["time", "buy", "sell"]].dropna().itertuples(index=False):
-                    self._csv_values[int(row.time)] = (float(row.buy), float(row.sell))
-                if self._csv_values:
-                    self._csv_last_time = max(self._csv_values)
-                if duplicate_rows:
-                    temp_path = f"{self.csv_path}.tmp"
-                    csv.to_csv(temp_path, index=False)
-                    os.replace(temp_path, self.csv_path)
-                    print(f"[ingest] 已压缩重复 CSV 记录: {self.csv_path}", flush=True)
-        except Exception:
-            print(f"[ingest] 读取 CSV 失败: {self.csv_path}", flush=True)
+    def ensure_ltf_subscriptions(self, api):
+        """只在 ingest 线程订阅当前被请求的小周期 K 线。"""
+        with self._state_lock:
+            wanted = [ltf for ltf, expires in self._requested.items()
+                      if ltf > 0 and expires >= time.monotonic()]
+        for ltf in wanted:
+            if ltf not in self.lower_klines:
+                self.lower_klines[ltf] = api.get_kline_serial(
+                    self.symbol, ltf, data_length=min(10000, MAX_KLINES * 30 // ltf + 1))
 
-    def snapshot_for(self, ltf: int) -> dict | None:
+    def request(self, ltf=None, footprint=False):
+        now = time.monotonic()
+        with self._state_lock:
+            if ltf is not None:
+                if ltf not in CFG["ltfOptions"]:
+                    ltf = 0
+                if self._requested.get(ltf, 0) < now:
+                    self._demand_version += 1
+                    self.snapshots.pop(ltf, None)
+                self._requested[ltf] = float("inf") if ltf == 0 else now + 60
+            if footprint:
+                if self._fp_until < now:
+                    self._demand_version += 1
+                    self.footprint = None
+                self._fp_until = now + 60
+
+    def snapshot_for(self, ltf):
+        self.request(ltf=ltf)
         with self._state_lock:
             return self.snapshots.get(ltf)
 
-    def footprint_snapshot(self) -> dict | None:
+    def footprint_snapshot(self):
+        self.request(footprint=True)
         with self._state_lock:
             return self.footprint
 
-    def _append_csv(self, bars: pd.DataFrame):
-        done = bars.iloc[:-1]                 # 最后一根 bar 未走完, 不落盘
-        done = done[done["buy"].notna() & done["sell"].notna()]
-        done = done[(done["time"] > self._csv_last_time) &
-                    ~done["time"].isin(self._csv_values)]
-        if done.empty:
-            return
-        done[["time", "buy", "sell"]].to_csv(
-            self.csv_path, mode="a", header=not os.path.exists(self.csv_path), index=False)
-        for row in done[["time", "buy", "sell"]].itertuples(index=False):
-            timestamp = int(row.time)
-            self._csv_values[timestamp] = (float(row.buy), float(row.sell))
-        self._csv_last_time = max(self._csv_last_time, max(self._csv_values))
+    def _store(self, ltf):
+        if ltf not in self.stores:
+            key = _csv_key(self.symbol)
+            source = "" if ltf == 0 else "kline_"
+            self.stores[ltf] = HistoryStore(
+                os.path.join(DATA_DIR, f"{key}_30s_{source}ltf{ltf}_v2.csv"),
+                os.path.join(DATA_DIR, f"{key}_30s.csv") if ltf == 0 else None)
+        return self.stores[ltf]
 
     def recompute(self, broadcast):
-        """在 ingest 线程内调用: 重算 bars -> 更新快照 -> 广播最新 bar -> 落盘"""
-        tick_bars = build_bars(self.klines, self.ticks, 0)
-        if tick_bars.empty:
+        with self._state_lock:
+            now = time.monotonic()
+            ltfs = [ltf for ltf, expires in self._requested.items() if expires >= now]
+            want_fp = self._fp_until >= now
+            demand_version = self._demand_version
+            previous = dict(self.snapshots)
+            previous_fp = self.footprint
+        self.analytics.update(self.ticks)
+        self.analytics.retain([0], want_fp)
+        classified = self.analytics.frame
+        valid_klines = self.klines.dropna(subset=["datetime", "close"])
+        if valid_klines.empty:
             return
-        if self._csv_values:
-            lack = tick_bars["buy"].isna() & tick_bars["time"].map(self._csv_values.__contains__)
-            if lack.any():
-                tick_bars.loc[lack, "buy"] = tick_bars.loc[lack, "time"].map(
-                    lambda timestamp: self._csv_values[int(timestamp)][0])
-                tick_bars.loc[lack, "sell"] = tick_bars.loc[lack, "time"].map(
-                    lambda timestamp: self._csv_values[int(timestamp)][1])
-                tick_bars = finalize_bars(tick_bars)
-        self._append_csv(tick_bars)
-
+        first_bar_ns = int(valid_klines.datetime.iloc[0])
         snapshots = {}
         messages = []
-        for ltf in CFG["ltfOptions"]:
-            bars = tick_bars if ltf == 0 else build_bars(self.klines, self.ticks, ltf)
+        revision = self.revision + 1
+        tick_bars = None
+        for ltf in ltfs:
+            if ltf == 0:
+                aggregates = self.analytics.aggregate(0, first_bar_ns)
+                bars = build_bars(self.klines, self.ticks, 0, classified=classified,
+                                  aggregates=aggregates, first_tick_ns=self.analytics.first_tick_ns)
+            else:
+                lower = self.lower_klines.get(ltf)
+                if lower is None or not (lower.datetime > 0).any():
+                    continue
+                bars = build_bars_from_ltf(self.klines, lower, ltf)
             if bars.empty:
                 continue
+            if ltf == 0:
+                tick_bars = bars
+            store = self._store(ltf)
+            bars = store.merge(bars)
+            store.save_completed(bars)
+            bars = store.with_cvd(bars)
             recs = bars_to_records(bars.tail(SNAPSHOT_BARS))
-            snapshots[ltf] = {"symbol": self.symbol, "cfg": CFG, "ltf": ltf, "bars": recs}
-            messages.append({"type": "bar", "symbol": self.symbol, "ltf": ltf, "bar": recs[-1]})
-        fp = build_footprint(self.klines, self.ticks)
+            snapshots[ltf] = {"symbol": self.symbol, "cfg": CFG, "ltf": ltf,
+                              "source": "tick" if ltf == 0 else "kline",
+                              "revision": revision, "cvdBase": store.base,
+                              "bars": recs}
+            old = {b["time"]: b for b in previous.get(ltf, {}).get("bars", [])}
+            changed = [bar for bar in recs if old.get(bar["time"]) != bar]
+            if changed:
+                messages.append({"type": "bars", "symbol": self.symbol, "ltf": ltf,
+                                 "revision": revision, "bars": changed})
+        fp = None
+        if want_fp and tick_bars is not None:
+            coverage = dict(zip(tick_bars.time, tick_bars.coverage))
+            fp = self.analytics.footprint(self.klines, getattr(self.quote, "price_tick", None), coverage)
+            fp = {"symbol": self.symbol, "revision": revision, **fp}
+            # 足迹更新必须带步长；步长可能在首次加载后才就绪。
+            removed = (set(bar["time"] for bar in previous_fp["bars"]) -
+                       set(bar["time"] for bar in fp["bars"])) if previous_fp else set()
+            if previous_fp is None or fp["tickSize"] != previous_fp["tickSize"] or removed:
+                messages.append({"type": "footprint_snapshot", **fp})
+            else:
+                old = {b["time"]: b for b in previous_fp["bars"]}
+                changed = [bar for bar in fp["bars"] if old.get(bar["time"]) != bar]
+                if changed:
+                    messages.append({"type": "footprints", "symbol": self.symbol,
+                                     "revision": revision, "tickSize": fp["tickSize"], "bars": changed})
         with self._state_lock:
-            self.snapshots.update(snapshots)
-            self.footprint = {"symbol": self.symbol, **fp}
-            self.ready.set()
+            self.snapshots = snapshots
+            self.footprint = fp
+            self.revision = revision
+            self._computed_version = demand_version
+            self.error = None
+            if snapshots:
+                self.ready.set()
         for message in messages:
             broadcast(message)
-        if fp["bars"]:
-            broadcast({"type": "footprint", "symbol": self.symbol, "bar": fp["bars"][-1]})
 
 
 class FeedManager:
@@ -162,7 +207,7 @@ class FeedManager:
     def __init__(self):
         self.feeds: dict[str, Feed] = {}
         self.cmd_q: queue.Queue[str] = queue.Queue()
-        self.clients: dict[asyncio.Queue, tuple[str, int]] = {}
+        self.clients: dict[asyncio.Queue, tuple[str, int, bool]] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
@@ -185,11 +230,16 @@ class FeedManager:
             thread.join(timeout=5)
         self._set_status("stopped")
 
-    def add_client(self, queue_: asyncio.Queue, symbol: str, ltf: int):
-        self.clients[queue_] = (symbol, ltf)
+    def add_client(self, queue_: asyncio.Queue, symbol: str, ltf: int, footprint=False):
+        with self._lock:
+            self.clients[queue_] = (symbol, ltf, footprint)
+            feed = self.feeds.get(symbol)
+        if feed is not None:
+            feed.request(ltf=ltf, footprint=footprint)
 
     def remove_client(self, queue_: asyncio.Queue):
-        self.clients.pop(queue_, None)
+        with self._lock:
+            self.clients.pop(queue_, None)
 
     def ensure(self, symbol: str) -> Feed:
         value = validate_symbol(symbol)
@@ -228,17 +278,22 @@ class FeedManager:
             self.loop.call_soon_threadsafe(self._fanout, msg)
 
     def _fanout(self, msg: dict):
-        for q, subscription in list(self.clients.items()):
-            if msg.get("type") == "footprint":
-                # 足迹口径固定 tick 级, 与客户端 ltf 无关, 只按 symbol 匹配
-                if msg.get("symbol") != subscription[0]:
+        with self._lock:
+            clients = list(self.clients.items())
+        for q, subscription in clients:
+            if msg.get("type") in {"footprints", "footprint_snapshot"}:
+                if msg.get("symbol") != subscription[0] or not subscription[2]:
                     continue
-            elif (msg.get("symbol"), msg.get("ltf")) != subscription:
+            elif (msg.get("symbol"), msg.get("ltf")) != subscription[:2]:
                 continue
             try:
                 q.put_nowait(msg)
             except asyncio.QueueFull:
-                self.clients.pop(q, None)
+                # 不能静默移除后继续心跳。通知 WS 关闭，让客户端重连并重取快照。
+                self.remove_client(q)
+                while not q.empty():
+                    q.get_nowait()
+                q.put_nowait({"type": "resync", "symbol": subscription[0]})
 
     def _run(self):
         backoff = 1
@@ -303,17 +358,32 @@ class FeedManager:
             api.wait_update(deadline=time.time() + 1)
             with self._lock:
                 feeds = list(self.feeds.values())
+                clients = list(self.clients.values())
+            for symbol, ltf, footprint in clients:
+                feed = next((f for f in feeds if f.symbol == symbol), None)
+                if feed is not None:
+                    feed.request(ltf=ltf, footprint=footprint)
             for feed in feeds:
                 if feed.ticks is None or len(feed.ticks) == 0:
                     continue
-                last_dt = feed.ticks.iloc[-1]["datetime"]
+                try:
+                    feed.ensure_ltf_subscriptions(api)
+                except Exception as exc:
+                    with feed._state_lock:
+                        feed.error = f"小周期 K线订阅失败: {exc}"
+                    continue
                 with feed._state_lock:
                     needs_recompute = (not feed.snapshots or
-                                       (pd.notna(last_dt) and last_dt != feed._last_tick_dt))
-                    if needs_recompute:
-                        feed._last_tick_dt = last_dt
+                                       feed._computed_version != feed._demand_version or
+                                       feed.error is not None or
+                                       api.is_changing(feed.ticks) or
+                                       api.is_changing(feed.klines) or
+                                       any(api.is_changing(lower) for lower in feed.lower_klines.values()) or
+                                       api.is_changing(feed.quote, "price_tick"))
                 if needs_recompute:
                     try:
                         feed.recompute(self.broadcast)
                     except Exception as exc:
+                        with feed._state_lock:
+                            feed.error = f"指标计算失败: {exc}"
                         print(f"[ingest] recompute {feed.symbol} 出错: {exc}", flush=True)
