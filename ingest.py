@@ -20,7 +20,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from tqsdk import TqApi, TqAuth
 
-from indicator import CFG, build_bars, build_bars_from_ltf, bars_to_records
+from indicator import (CFG, DEFAULT_TF_SEC, TF_OPTIONS, bar_ns_for, ltf_options,
+                       build_bars, build_bars_from_ltf, bars_to_records)
 from history_store import HistoryStore
 from tick_analytics import TickAnalytics
 
@@ -30,8 +31,8 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 MAX_TICKS = 10000     # 条数窗口；按 500ms 一条估算约 83 分钟
-MAX_KLINES = 2000     # 2000 根 30s K线 ≈ 2.5 个交易日
-SNAPSHOT_BARS = 800   # 推送给前端的最近 bar 数
+MAX_KLINES = 2000     # K线根数窗口(与周期无关): 30s ≈ 2.5 个交易日, 10s ≈ 5.5 小时
+SNAPSHOT_BARS = 800   # 推送给前端的最近 bar 数(与周期无关)
 MAX_FEEDS = 32
 SYMBOL_RE = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*(?:@[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)?\Z")
 
@@ -48,11 +49,25 @@ def validate_symbol(symbol: str) -> str:
     return value
 
 
-class Feed:
-    """单合约快照；只有 ingest 线程读写 SDK 数据和历史文件。"""
+def validate_tf(tf) -> int:
+    """主周期(秒) 校验; 非整数或不在可选集内时回落到默认周期。"""
+    try:
+        value = int(tf)
+    except (TypeError, ValueError):
+        return DEFAULT_TF_SEC
+    return value if value in TF_OPTIONS else DEFAULT_TF_SEC
 
-    def __init__(self, symbol: str):
+
+class Feed:
+    """单合约 + 单主周期快照；只有 ingest 线程读写 SDK 数据和历史文件。
+
+    周期是 Feed 级维度: 不同周期各自订阅 K 线、各自聚合与落盘, 但共享同一路 tick。
+    """
+
+    def __init__(self, symbol: str, tf: int = DEFAULT_TF_SEC):
         self.symbol = validate_symbol(symbol)
+        self.tf = validate_tf(tf)
+        self.bar_ns = bar_ns_for(self.tf)
         self.klines = self.ticks = self.quote = None
         self.ready = threading.Event()
         self.snapshots = {}
@@ -65,15 +80,15 @@ class Feed:
         self._computed_version = -1
         self.revision = 0
         self.stores = {}
-        self.analytics = TickAnalytics()
+        self.analytics = TickAnalytics(self.bar_ns)
         self.lower_klines = {}
 
     def subscribe(self, api: TqApi):
         self.quote = api.get_quote(self.symbol)
-        self.klines = api.get_kline_serial(self.symbol, 30, data_length=MAX_KLINES)
+        self.klines = api.get_kline_serial(self.symbol, self.tf, data_length=MAX_KLINES)
         self.ticks = api.get_tick_serial(self.symbol, data_length=MAX_TICKS)
-        self.analytics = TickAnalytics()
-        self.lower_klines = {30: self.klines}
+        self.analytics = TickAnalytics(self.bar_ns)
+        self.lower_klines = {self.tf: self.klines}
         with self._state_lock:
             self.snapshots.clear()
             self.footprint = None
@@ -83,19 +98,21 @@ class Feed:
 
     def ensure_ltf_subscriptions(self, api):
         """只在 ingest 线程订阅当前被请求的小周期 K 线。"""
+        allowed = ltf_options(self.tf)
         with self._state_lock:
             wanted = [ltf for ltf, expires in self._requested.items()
-                      if ltf > 0 and expires >= time.monotonic()]
+                      if ltf > 0 and ltf in allowed and expires >= time.monotonic()]
         for ltf in wanted:
             if ltf not in self.lower_klines:
                 self.lower_klines[ltf] = api.get_kline_serial(
-                    self.symbol, ltf, data_length=min(10000, MAX_KLINES * 30 // ltf + 1))
+                    self.symbol, ltf, data_length=min(10000, MAX_KLINES * self.tf // ltf + 1))
 
     def request(self, ltf=None, footprint=False):
         now = time.monotonic()
+        allowed = ltf_options(self.tf)
         with self._state_lock:
             if ltf is not None:
-                if ltf not in CFG["ltfOptions"]:
+                if ltf not in allowed:
                     ltf = 0
                 if self._requested.get(ltf, 0) < now:
                     self._demand_version += 1
@@ -121,9 +138,19 @@ class Feed:
         if ltf not in self.stores:
             key = _csv_key(self.symbol)
             source = "" if ltf == 0 else "kline_"
-            self.stores[ltf] = HistoryStore(
-                os.path.join(DATA_DIR, f"{key}_30s_{source}ltf{ltf}_v2.csv"),
-                os.path.join(DATA_DIR, f"{key}_30s.csv") if ltf == 0 else None)
+            # 文件名带主周期: tf=30 时与历史文件名完全一致, 既有历史无缝沿用;
+            # tf=10 是独立文件, 不与 30s 混流(bar 边界不同, 混读会毁掉 CVD)。
+            stem = f"{key}_{self.tf}s_{source}ltf{ltf}"
+            # v3 起 buy/sell 改用 Lee-Ready 新算法, 必须换文件: v2 里的 buy/sell 是
+            # 旧算法结果, 混读会被当成新算法, 并让 CVD 在接缝处跳变。
+            # v2 与更早的 {key}_30s.csv 只作 legacy 回填来源, 永远不会被改写;
+            # 它们只对应 30s 周期, 其它周期没有可比的历史。
+            legacy = []
+            if self.tf == DEFAULT_TF_SEC:
+                legacy = [os.path.join(DATA_DIR, f"{key}_30s_{source}ltf{ltf}_v2.csv")]
+                if ltf == 0:
+                    legacy.insert(0, os.path.join(DATA_DIR, f"{key}_30s.csv"))
+            self.stores[ltf] = HistoryStore(os.path.join(DATA_DIR, f"{stem}_v3.csv"), legacy)
         return self.stores[ltf]
 
     def recompute(self, broadcast):
@@ -149,12 +176,13 @@ class Feed:
             if ltf == 0:
                 aggregates = self.analytics.aggregate(0, first_bar_ns)
                 bars = build_bars(self.klines, self.ticks, 0, classified=classified,
-                                  aggregates=aggregates, first_tick_ns=self.analytics.first_tick_ns)
+                                  aggregates=aggregates, first_tick_ns=self.analytics.first_tick_ns,
+                                  bar_ns=self.bar_ns)
             else:
                 lower = self.lower_klines.get(ltf)
                 if lower is None or not (lower.datetime > 0).any():
                     continue
-                bars = build_bars_from_ltf(self.klines, lower, ltf)
+                bars = build_bars_from_ltf(self.klines, lower, ltf, bar_ns=self.bar_ns)
             if bars.empty:
                 continue
             if ltf == 0:
@@ -164,7 +192,8 @@ class Feed:
             store.save_completed(bars)
             bars = store.with_cvd(bars)
             recs = bars_to_records(bars.tail(SNAPSHOT_BARS))
-            snapshots[ltf] = {"symbol": self.symbol, "cfg": CFG, "ltf": ltf,
+            snapshots[ltf] = {"symbol": self.symbol, "cfg": period_cfg(self.tf), "ltf": ltf,
+                              "tf": self.tf,
                               "source": "tick" if ltf == 0 else "kline",
                               "revision": revision, "cvdBase": store.base,
                               "bars": recs}
@@ -172,12 +201,12 @@ class Feed:
             changed = [bar for bar in recs if old.get(bar["time"]) != bar]
             if changed:
                 messages.append({"type": "bars", "symbol": self.symbol, "ltf": ltf,
-                                 "revision": revision, "bars": changed})
+                                 "tf": self.tf, "revision": revision, "bars": changed})
         fp = None
         if want_fp and tick_bars is not None:
             coverage = dict(zip(tick_bars.time, tick_bars.coverage))
             fp = self.analytics.footprint(self.klines, getattr(self.quote, "price_tick", None), coverage)
-            fp = {"symbol": self.symbol, "revision": revision, **fp}
+            fp = {"symbol": self.symbol, "tf": self.tf, "revision": revision, **fp}
             # 足迹更新必须带步长；步长可能在首次加载后才就绪。
             removed = (set(bar["time"] for bar in previous_fp["bars"]) -
                        set(bar["time"] for bar in fp["bars"])) if previous_fp else set()
@@ -187,7 +216,7 @@ class Feed:
                 old = {b["time"]: b for b in previous_fp["bars"]}
                 changed = [bar for bar in fp["bars"] if old.get(bar["time"]) != bar]
                 if changed:
-                    messages.append({"type": "footprints", "symbol": self.symbol,
+                    messages.append({"type": "footprints", "symbol": self.symbol, "tf": self.tf,
                                      "revision": revision, "tickSize": fp["tickSize"], "bars": changed})
         with self._state_lock:
             self.snapshots = snapshots
@@ -201,20 +230,34 @@ class Feed:
             broadcast(message)
 
 
+def feed_key(symbol: str, tf: int) -> tuple[str, int]:
+    """FeedManager 的订阅标识: 同一合约的不同主周期是各自独立的 Feed。"""
+    return (symbol, validate_tf(tf))
+
+
+def feed_label(key: tuple[str, int]) -> str:
+    return f"{key[0]}@{key[1]}s"
+
+
+def period_cfg(tf: int) -> dict:
+    """下发前端的配置: 把拆分粒度收敛到该周期合法的子集, 避免前端给出无意义选项。"""
+    return {**CFG, "tf": tf, "tfOptions": TF_OPTIONS, "ltfOptions": ltf_options(tf)}
+
+
 class FeedManager:
     """管理全部订阅; wait_update 循环跑在独立守护线程"""
 
     def __init__(self):
-        self.feeds: dict[str, Feed] = {}
-        self.cmd_q: queue.Queue[str] = queue.Queue()
-        self.clients: dict[asyncio.Queue, tuple[str, int, bool]] = {}
+        self.feeds: dict[tuple[str, int], Feed] = {}
+        self.cmd_q: queue.Queue[tuple[str, int]] = queue.Queue()
+        self.clients: dict[asyncio.Queue, tuple[str, int, int, bool]] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.status = "stopped"
         self.last_error: str | None = None
-        self.failed_feeds: dict[str, str] = {}
+        self.failed_feeds: dict[tuple[str, int], str] = {}
 
     def start(self, loop: asyncio.AbstractEventLoop):
         self.loop = loop
@@ -230,10 +273,12 @@ class FeedManager:
             thread.join(timeout=5)
         self._set_status("stopped")
 
-    def add_client(self, queue_: asyncio.Queue, symbol: str, ltf: int, footprint=False):
+    def add_client(self, queue_: asyncio.Queue, symbol: str, ltf: int, footprint=False,
+                   tf: int = DEFAULT_TF_SEC):
+        key = feed_key(symbol, tf)
         with self._lock:
-            self.clients[queue_] = (symbol, ltf, footprint)
-            feed = self.feeds.get(symbol)
+            self.clients[queue_] = (key[0], key[1], ltf, footprint)
+            feed = self.feeds.get(key)
         if feed is not None:
             feed.request(ltf=ltf, footprint=footprint)
 
@@ -241,32 +286,34 @@ class FeedManager:
         with self._lock:
             self.clients.pop(queue_, None)
 
-    def ensure(self, symbol: str) -> Feed:
-        value = validate_symbol(symbol)
+    def ensure(self, symbol: str, tf: int = DEFAULT_TF_SEC) -> Feed:
+        key = feed_key(symbol, tf)
         with self._lock:
-            if value in self.failed_feeds:
-                raise ValueError(self.failed_feeds[value])
-            feed = self.feeds.get(value)
+            if key in self.failed_feeds:
+                raise ValueError(self.failed_feeds[key])
+            feed = self.feeds.get(key)
             if feed is None:
                 if len(self.feeds) >= MAX_FEEDS:
                     raise ValueError("订阅合约数量已达上限")
-                feed = Feed(value)
-                self.feeds[value] = feed
-                self.cmd_q.put(value)
+                feed = Feed(key[0], key[1])
+                self.feeds[key] = feed
+                self.cmd_q.put(key)
             return feed
 
     def fail_feed(self, feed: Feed, message: str):
+        key = feed_key(feed.symbol, feed.tf)
         with feed._state_lock:
             feed.error = message
         with self._lock:
-            if self.feeds.get(feed.symbol) is feed:
-                self.feeds.pop(feed.symbol, None)
-            self.failed_feeds[feed.symbol] = message
+            if self.feeds.get(key) is feed:
+                self.feeds.pop(key, None)
+            self.failed_feeds[key] = message
 
     def status_snapshot(self) -> dict:
         with self._lock:
             return {"status": self.status, "lastError": self.last_error,
-                    "feeds": sorted(self.feeds), "failedFeeds": dict(self.failed_feeds)}
+                    "feeds": sorted(feed_label(key) for key in self.feeds),
+                    "failedFeeds": {feed_label(k): v for k, v in self.failed_feeds.items()}}
 
     def _set_status(self, status: str, error: str | None = None):
         with self._lock:
@@ -282,9 +329,9 @@ class FeedManager:
             clients = list(self.clients.items())
         for q, subscription in clients:
             if msg.get("type") in {"footprints", "footprint_snapshot"}:
-                if msg.get("symbol") != subscription[0] or not subscription[2]:
+                if (msg.get("symbol"), msg.get("tf")) != subscription[:2] or not subscription[3]:
                     continue
-            elif (msg.get("symbol"), msg.get("ltf")) != subscription[:2]:
+            elif (msg.get("symbol"), msg.get("tf"), msg.get("ltf")) != subscription[:3]:
                 continue
             try:
                 q.put_nowait(msg)
@@ -293,7 +340,7 @@ class FeedManager:
                 self.remove_client(q)
                 while not q.empty():
                     q.get_nowait()
-                q.put_nowait({"type": "resync", "symbol": subscription[0]})
+                q.put_nowait({"type": "resync", "symbol": subscription[0], "tf": subscription[1]})
 
     def _run(self):
         backoff = 1
@@ -323,15 +370,15 @@ class FeedManager:
             backoff = min(backoff * 2, 30)
 
     def _run_api(self, api: TqApi):
-        subscribed: set[str] = set()
+        subscribed: set[tuple[str, int]] = set()
         with self._lock:
             feeds = list(self.feeds.values())
         for feed in feeds:
             try:
                 feed.subscribe(api)
-                subscribed.add(feed.symbol)
+                subscribed.add(feed_key(feed.symbol, feed.tf))
             except Exception as exc:
-                message = f"合约 {feed.symbol} 订阅失败: {exc}"
+                message = f"合约 {feed_label(feed_key(feed.symbol, feed.tf))} 订阅失败: {exc}"
                 self.fail_feed(feed, message)
                 print(f"[ingest] {message}", flush=True)
 
@@ -339,18 +386,18 @@ class FeedManager:
             # 处理新订阅命令(在 ingest 线程内调用 get_* 保证线程安全)
             try:
                 while True:
-                    symbol = self.cmd_q.get_nowait()
-                    if symbol in subscribed:
+                    key = self.cmd_q.get_nowait()
+                    if key in subscribed:
                         continue
                     with self._lock:
-                        feed = self.feeds.get(symbol)
+                        feed = self.feeds.get(key)
                     if feed is None:
                         continue
                     try:
                         feed.subscribe(api)
-                        subscribed.add(symbol)
+                        subscribed.add(key)
                     except Exception as exc:
-                        message = f"合约 {symbol} 订阅失败: {exc}"
+                        message = f"合约 {feed_label(key)} 订阅失败: {exc}"
                         self.fail_feed(feed, message)
                         print(f"[ingest] {message}", flush=True)
             except queue.Empty:
@@ -359,8 +406,9 @@ class FeedManager:
             with self._lock:
                 feeds = list(self.feeds.values())
                 clients = list(self.clients.values())
-            for symbol, ltf, footprint in clients:
-                feed = next((f for f in feeds if f.symbol == symbol), None)
+            by_key = {feed_key(f.symbol, f.tf): f for f in feeds}
+            for symbol, tf, ltf, footprint in clients:
+                feed = by_key.get((symbol, tf))
                 if feed is not None:
                     feed.request(ltf=ltf, footprint=footprint)
             for feed in feeds:
@@ -386,4 +434,4 @@ class FeedManager:
                     except Exception as exc:
                         with feed._state_lock:
                             feed.error = f"指标计算失败: {exc}"
-                        print(f"[ingest] recompute {feed.symbol} 出错: {exc}", flush=True)
+                        print(f"[ingest] recompute {feed_label(feed_key(feed.symbol, feed.tf))} 出错: {exc}", flush=True)

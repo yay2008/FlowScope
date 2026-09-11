@@ -53,7 +53,8 @@ class DataTests(unittest.TestCase):
     def test_footprint_preserves_actual_prices_without_metadata(self):
         result = build_footprint(klines(), ticks())
         self.assertIsNone(result["tickSize"])
-        self.assertEqual(result["bars"][1]["levels"], [[101., 10., 0.], [103., 10., 0.]])
+        # levels 第 4 位是新算法的未知量; 101 档是下移一笔, 新算法记卖不记买
+        self.assertEqual(result["bars"][1]["levels"], [[101., 0., 10., 0.], [103., 10., 0., 0.]])
 
     def test_price_step_comes_from_metadata_even_with_sparse_trades(self):
         result = build_footprint(klines(), ticks(), .5)
@@ -82,7 +83,7 @@ class DataTests(unittest.TestCase):
             self.assertEqual(list(store.values), [int(bars.iloc[1].time)])
             clipped = build_bars(klines(), ticks().iloc[3:])
             merged = store.merge(clipped)
-            self.assertEqual(merged.iloc[1].buy, 20)
+            self.assertEqual(merged.iloc[1].buy, 10)
             self.assertEqual(merged.iloc[1].coverage, "complete")
 
     def test_cvd_stays_fixed_after_window_shift_and_restart(self):
@@ -94,7 +95,7 @@ class DataTests(unittest.TestCase):
             expected = store.with_cvd(bars).iloc[-1].cvd
             restarted = HistoryStore(path)
             shifted = restarted.with_cvd(bars.iloc[-1:].copy())
-            self.assertEqual(expected, 40)
+            self.assertEqual(expected, 20)
             self.assertEqual(shifted.iloc[-1].cvd, expected)
 
     def test_legacy_kept_unchanged_and_displayed_as_estimated_cvd(self):
@@ -121,15 +122,15 @@ class DataTests(unittest.TestCase):
             self.assertTrue(bars.coverage.eq("partial").all())
             store.save_completed(bars)
             result = store.with_cvd(bars)
-            self.assertEqual(result.cvd.tolist(), [10, 30, 40])
-            self.assertEqual(result.cvdOpen.tolist(), [0, 10, 30])
+            self.assertEqual(result.cvd.tolist(), [10, 10, 20])
+            self.assertEqual(result.cvdOpen.tolist(), [0, 10, 10])
             self.assertTrue(result.cvdConfirmed.isna().all())
             self.assertEqual(store.values, {})
             restarted = HistoryStore(path)
             shifted = build_bars(k, ticks().iloc[3:])
             shifted = restarted.with_cvd(restarted.merge(shifted))
-            self.assertEqual(shifted.iloc[1].cvd, 30)
-            self.assertEqual(shifted.iloc[2].cvd, 40)
+            self.assertEqual(shifted.iloc[1].cvd, 10)
+            self.assertEqual(shifted.iloc[2].cvd, 20)
 
     def test_confirmed_replacement_does_not_double_count_estimated_history(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -140,8 +141,8 @@ class DataTests(unittest.TestCase):
             full = build_bars(klines(), ticks())
             store.save_completed(full)
             result = store.with_cvd(full)
-            self.assertEqual(result.iloc[-1].cvd, 40)
-            self.assertEqual(result.iloc[-1].cvdConfirmed, 30)
+            self.assertEqual(result.iloc[-1].cvd, 20)
+            self.assertEqual(result.iloc[-1].cvdConfirmed, 10)
 
 
 if __name__ == "__main__":

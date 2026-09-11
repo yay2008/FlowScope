@@ -64,6 +64,26 @@ class IncrementalTests(unittest.TestCase):
         engine.update(data.iloc[2:])
         self.assertEqual(engine.version, revision)
 
+    def test_incremental_matches_full_recompute_across_lr_state_changes(self):
+        """增量重算必须把新算法的判向状态(前价/前盘口/沿用方向)逐列传回。
+
+        这段数据刻意串起四类状态变化: 报价上移、无成交报价更新、价差内部同价、
+        累计量清零换日, 再加一次跨越 GAP_NS 的断档。
+        """
+        data = pd.DataFrame({
+            "datetime": [BASE + int(s * 10**9) for s in [0, 1, 2, 3, 4, 5, 200, 201]],
+            "last_price": [4287, 4287, 4287, 4285, 4285, 4285, 4285, 4285],
+            "ask_price1": [4287, 4288, 4290, 4290, 4290, 4290, 4290, 4290],
+            "bid_price1": [4286, 4287, 4289, 4289, 4289, 4289, 4289, 4289],
+            "volume":     [100, 120, 120, 160, 200, 30, 60, 90],
+            "id": range(8),
+        })
+        engine = TickAnalytics()
+        for count in range(1, len(data) + 1):
+            engine.update(data.iloc[:count])
+            pd.testing.assert_frame_equal(engine.aggregate(0, BASE),
+                                          split_ticks_to_bars(data.iloc[:count], 0))
+
     def test_tick_gap_starts_new_coverage_boundary(self):
         data = ticks()
         data["id"] = range(len(data))
@@ -132,9 +152,12 @@ class FeedTests(unittest.TestCase):
         messages = []
         self.feed.recompute(messages.append)
         changes = next(m for m in messages if m["type"] == "bars")["bars"]
-        self.assertEqual(len(changes), 2)
+        # 该修订只翻转旧算法口径(101 从"贴卖一"变成"砸买一"), 新算法两版都判卖,
+        # 所以 delta 不动、只有对照列变化, 广播的 bar 数由 2 降到 1。
+        self.assertEqual(len(changes), 1)
         self.assertEqual(changes[0]["delta"], 0)
-        self.assertEqual(changes[-1]["cvd"], 20)
+        self.assertEqual(changes[0]["sellLegacy"], 10)
+        self.assertEqual(changes[-1]["cvd"], 10)
 
     def test_empty_footprint_can_later_receive_first_trade(self):
         self.feed.request(footprint=True)
@@ -150,14 +173,14 @@ class FeedTests(unittest.TestCase):
         manager = ingest.FeedManager()
         q = asyncio.Queue(maxsize=1)
         manager.add_client(q, self.feed.symbol, 0)
-        msg = {"type": "bars", "symbol": self.feed.symbol, "ltf": 0, "bars": []}
+        msg = {"type": "bars", "symbol": self.feed.symbol, "tf": self.feed.tf, "ltf": 0, "bars": []}
         manager._fanout(msg)
         manager._fanout(msg)
         self.assertEqual(q.get_nowait()["type"], "resync")
 
     def test_ws_reconnect_supplies_missing_bars_and_ignores_old_queue_data(self):
         manager = ingest.FeedManager()
-        manager.feeds[self.feed.symbol] = self.feed
+        manager.feeds[ingest.feed_key(self.feed.symbol, self.feed.tf)] = self.feed
         self.feed.recompute(lambda _: None)
         class Socket:
             def __init__(self):
@@ -179,8 +202,8 @@ class FeedTests(unittest.TestCase):
                 first = await socket.receive()
                 self.assertEqual(first["type"], "snapshot")
                 self.assertEqual(len(first["bars"]), 3)
-                manager.broadcast({"type": "bars", "symbol": self.feed.symbol, "ltf": 0,
-                                   "revision": first["revision"], "bars": [{"time": 0}]})
+                manager.broadcast({"type": "bars", "symbol": self.feed.symbol, "tf": self.feed.tf,
+                                   "ltf": 0, "revision": first["revision"], "bars": [{"time": 0}]})
                 self.feed.ticks.loc[4, "volume"] = 145
                 self.feed.klines.loc[2, "volume"] = 15
                 self.feed.recompute(manager.broadcast)

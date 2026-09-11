@@ -17,7 +17,6 @@ import uvicorn
 
 import app as server
 import ingest
-from indicator import BAR_NS
 
 
 def tick_rows(first, count):
@@ -48,11 +47,11 @@ class PreviewManager(ingest.FeedManager):
                 if feed.ticks is None:
                     feed.quote = SimpleNamespace(price_tick=1.)
                     feed.ticks = tick_rows(0, 10000)
-                    feed.klines = kline_rows(feed.ticks)
+                    feed.klines = kline_rows(feed.ticks, feed.tf)
                 else:
                     fresh = tick_rows(int(feed.ticks.id.iloc[-1]) + 1, 1)
                     feed.ticks = pd.concat([feed.ticks, fresh], ignore_index=True).tail(10000)
-                    boundary = int(fresh.datetime.iloc[0]) // BAR_NS * BAR_NS
+                    boundary = int(fresh.datetime.iloc[0]) // feed.bar_ns * feed.bar_ns
                     last = feed.klines.iloc[-1]
                     price = float(fresh.last_price.iloc[0])
                     if int(last.datetime) == boundary:
@@ -60,16 +59,18 @@ class PreviewManager(ingest.FeedManager):
                         feed.klines.loc[idx, ["high", "low", "close", "volume"]] = [
                             max(last.high, price), min(last.low, price), price, last.volume + 2]
                     else:
-                        feed.klines = pd.concat([feed.klines, kline_rows(fresh)], ignore_index=True).tail(2000)
-                for symbol, ltf, footprint in clients:
-                    if symbol == feed.symbol:
+                        feed.klines = pd.concat(
+                            [feed.klines, kline_rows(fresh, feed.tf)], ignore_index=True).tail(2000)
+                for symbol, tf, ltf, footprint in clients:
+                    if symbol == feed.symbol and tf == feed.tf:
                         feed.request(ltf=ltf, footprint=footprint)
                 try:
                     with feed._state_lock:
                         requested = list(feed._requested)
                     for ltf in requested:
                         if ltf > 0:
-                            feed.lower_klines[ltf] = feed.klines if ltf == 30 else kline_rows(feed.ticks, ltf)
+                            feed.lower_klines[ltf] = (feed.klines if ltf == feed.tf
+                                                      else kline_rows(feed.ticks, ltf))
                     # 模拟 K 线与 tick 分批到达；完整→部分→完整不得导致图表异常或重连循环。
                     idx = feed.klines.index[-1]
                     actual_volume = feed.klines.loc[idx, "volume"]

@@ -6,7 +6,9 @@ from indicator import BAR_NS, TZ_SHIFT_S, _classify_ticks, split_ticks_to_bars, 
 
 
 class TickAnalytics:
-    def __init__(self):
+    def __init__(self, bar_ns: int = BAR_NS):
+        # bar_ns: 主周期宽度(纳秒)。缓存与"脏边界"都按它分桶, 所以一个实例只服务一个周期。
+        self.bar_ns = bar_ns
         self.frame = None
         self.first_tick_ns = None
         self.changed_ns = None
@@ -51,9 +53,18 @@ class TickAnalytics:
             start = 0
         head = None if initial else self.frame[self.frame["_key"] < keys[start]]
         seed = None if head is None or head.empty else head.iloc[-1]
-        classified = _classify_ticks(raw.iloc[start:],
-                                     previous_volume=None if seed is None else seed.volume,
-                                     previous_side=0 if seed is None else seed.side)
+        # 判向状态逐列传回(含新算法的 prev_time/prev_price/prev_ask/prev_bid/carry),
+        # 否则增量重算与全量重算会在窗口接缝处给出不同的方向。
+        classified = _classify_ticks(
+            raw.iloc[start:],
+            previous_volume=None if seed is None else seed.volume,
+            previous_side=0 if seed is None else seed.side,
+            previous_time=None if seed is None else seed.datetime,
+            previous_price=None if seed is None else seed.lr_price,
+            previous_ask=None if seed is None else seed.lr_ask,
+            previous_bid=None if seed is None else seed.lr_bid,
+            previous_carry=0 if seed is None else seed.lr_carry,
+        )
         classified["_key"] = keys[start:]
         self.frame = classified.reset_index(drop=True) if head is None else pd.concat([head, classified], ignore_index=True)
         if initial:
@@ -62,7 +73,7 @@ class TickAnalytics:
         self.version += 1
         self._hashes = hashes
         # 保留窗口边缘整根 bar 和一个前置 tick，以免裁剪后重算边缘 bar 丢量。
-        cutoff = int(raw.datetime.iloc[0]) // BAR_NS * BAR_NS
+        cutoff = int(raw.datetime.iloc[0]) // self.bar_ns * self.bar_ns
         keep = np.flatnonzero(self.frame.datetime.to_numpy() >= cutoff)
         if len(keep):
             self.frame = self.frame.iloc[max(0, int(keep[0]) - 1):].reset_index(drop=True)
@@ -70,11 +81,11 @@ class TickAnalytics:
     def aggregate(self, ltf, first_bar_ns):
         cached, version = self._aggregates.get(ltf, (None, -1))
         if cached is None or version < self.version - 1:
-            cached = split_ticks_to_bars(self.frame, ltf, classified=self.frame)
+            cached = split_ticks_to_bars(self.frame, ltf, classified=self.frame, bar_ns=self.bar_ns)
         elif version != self.version:
-            boundary = self.changed_ns // BAR_NS * BAR_NS
+            boundary = self.changed_ns // self.bar_ns * self.bar_ns
             tail = self.frame[self.frame.datetime >= boundary]
-            fresh = split_ticks_to_bars(tail, ltf, classified=tail)
+            fresh = split_ticks_to_bars(tail, ltf, classified=tail, bar_ns=self.bar_ns)
             cached = pd.concat([cached[cached.index < boundary], fresh])
         cached = cached[cached.index >= first_bar_ns]
         self._aggregates[ltf] = (cached, self.version)
@@ -82,12 +93,14 @@ class TickAnalytics:
 
     def footprint(self, klines, tick_size, coverage):
         if self._fp is None or self._fp_version < self.version - 1:
-            self._fp = build_footprint(klines, self.frame, tick_size, classified=self.frame)["bars"]
+            self._fp = build_footprint(klines, self.frame, tick_size, classified=self.frame,
+                                       bar_ns=self.bar_ns)["bars"]
         elif self._fp_version != self.version:
-            boundary = self.changed_ns // BAR_NS * BAR_NS
+            boundary = self.changed_ns // self.bar_ns * self.bar_ns
             boundary_s = boundary // 10**9 + TZ_SHIFT_S
             tail = self.frame[self.frame.datetime >= boundary]
-            fresh = build_footprint(klines, tail, tick_size, classified=tail)["bars"]
+            fresh = build_footprint(klines, tail, tick_size, classified=tail,
+                                    bar_ns=self.bar_ns)["bars"]
             self._fp = [bar for bar in self._fp if bar["time"] < boundary_s] + fresh
         self._fp_version = self.version
         allowed = set(coverage)

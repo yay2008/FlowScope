@@ -13,8 +13,8 @@ import time
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
-from indicator import CFG
-from ingest import FeedManager, validate_symbol
+from indicator import CFG, DEFAULT_TF_SEC, ltf_options
+from ingest import FeedManager, period_cfg, validate_symbol, validate_tf
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "KQ.m@SHFE.fu"
@@ -35,17 +35,19 @@ async def _shutdown():
 
 
 @app.get("/api/history")
-async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0):
+async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_TF_SEC):
     """返回最近 N 根 bar 的完整快照; 订阅未就绪时最多等 90 秒(闭市回填慢)。
 
+    tf : 主图周期(秒), 10 或 30; 非法值回落到 30
     ltf: 买卖量拆分粒度(秒), 0=逐 tick 盘口判定, 1/5/10/15/30=小周期阴阳归类;
-         切换后最多 1~2 秒由 ingest 线程重算
+         必须能整除主周期, 否则回落为 0; 切换后最多 1~2 秒由 ingest 线程重算
     """
-    if ltf not in CFG["ltfOptions"]:
+    tf = validate_tf(tf)
+    if ltf not in ltf_options(tf):
         ltf = 0
     try:
         normalized_symbol = validate_symbol(symbol)
-        feed = manager.ensure(normalized_symbol)
+        feed = manager.ensure(normalized_symbol, tf)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -60,8 +62,8 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0):
         if manager.status_snapshot()["status"] == "error":
             break
         await asyncio.sleep(0.2)
-    return {"symbol": normalized_symbol, "cfg": CFG, "bars": [], "pending": True,
-            "status": manager.status_snapshot()}
+    return {"symbol": normalized_symbol, "cfg": period_cfg(tf), "tf": tf, "ltf": ltf,
+            "bars": [], "pending": True, "status": manager.status_snapshot()}
 
 
 @app.get("/api/status")
@@ -71,14 +73,16 @@ def status():
 
 
 @app.get("/api/footprint")
-async def footprint(symbol: str = DEFAULT_SYMBOL):
+async def footprint(symbol: str = DEFAULT_SYMBOL, tf: int = DEFAULT_TF_SEC):
     """返回 tick 窗口内各 bar 的分价位买卖量矩阵(足迹图)，口径同 ltf=0。
 
+    tf: 主图周期(秒), 足迹跟着主图周期走。
     快照未就绪时最多等 90 秒(闭市回填慢)；历史覆盖取决于 tick 窗口和持续采集。
     """
+    tf = validate_tf(tf)
     try:
         normalized_symbol = validate_symbol(symbol)
-        feed = manager.ensure(normalized_symbol)
+        feed = manager.ensure(normalized_symbol, tf)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -98,18 +102,20 @@ async def footprint(symbol: str = DEFAULT_SYMBOL):
 
 
 @app.websocket("/ws")
-async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, footprint: bool = False):
+async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, footprint: bool = False,
+             tf: int = DEFAULT_TF_SEC):
     await websocket.accept()
     try:
         symbol = validate_symbol(symbol)
-        feed = manager.ensure(symbol)
-        if ltf not in CFG["ltfOptions"]:
+        tf = validate_tf(tf)
+        feed = manager.ensure(symbol, tf)
+        if ltf not in ltf_options(tf):
             ltf = 0
     except ValueError as exc:
         await websocket.close(code=1008, reason=str(exc))
         return
     q: asyncio.Queue = asyncio.Queue(maxsize=100)
-    manager.add_client(q, symbol, ltf, footprint)
+    manager.add_client(q, symbol, ltf, footprint, tf)
     try:
         # 先注册，再读取快照。期间入队的旧增量可由 revision 排除，避免 REST→WS 空窗。
         deadline = time.monotonic() + 90

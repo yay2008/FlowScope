@@ -15,6 +15,10 @@ let threshtype = "RELATIVE";
 let cvdSource = "tick";
 let klineLtf = 10;    // 切回 K线口径时保留上次选择，默认同 Pine 的 10S。
 let ltf = 0;         // 协议：0=tick，正数=实际小周期 K线。
+let tf = 30;         // 主图周期(秒), 10 或 30; 后端按 (symbol, tf) 独立订阅与落盘
+// 各主周期下合法的拆分粒度; 与后端 indicator.ltf_options 同源, 首次拿到 cfg 后以 cfg 为准
+const LTF_BY_TF = { 10: [1, 5, 10], 30: [1, 5, 10, 15, 30] };
+let classifySource = "lr";   // 判向算法: lr=新算法(Lee-Ready), legacy=旧算法(对照)
 let view = "candle";  // 主图视图: candle=K线, footprint=足迹图
 let fpBars = [];      // 足迹 bar: {time, levels: [[price, buy, sell], ...按价格升序]}
 let fpBarSpacing = null;   // 进足迹模式前的 barSpacing, 退出时恢复
@@ -39,6 +43,8 @@ const FP = {
   imbBuyColor: "#00e676", imbSellColor: "#f23645",
   upColor: "#f0b90d", downColor: "#ef6c00", // K线轮廓: 涨金 跌橙
   pocColor: "rgba(232, 234, 237, 0.9)",
+  // 判不出方向的那部分成交量: 中性紫, 与橙系热力底和绿/红不平衡框都能区分
+  unknownColor: (ratio) => `rgba(167, 139, 250, ${0.35 + 0.55 * ratio})`,
 };
 
 class FootprintRenderer {
@@ -97,20 +103,26 @@ class FootprintRenderer {
         }
         let maxVol = 0, pocIdx = -1;
         for (let j = 0; j < levels.length; j++) {
-          const v = levels[j][1] + levels[j][2];
+          const v = levels[j][1] + levels[j][2] + (levels[j][3] || 0);   // 未知量也占档位总量
           if (v > maxVol) { maxVol = v; pocIdx = j; }
         }
         if (maxVol <= 0) continue;
         for (let j = 0; j < levels.length; j++) {
           const y = ys[j];
           if (y == null) continue;
-          const buy = levels[j][1], sell = levels[j][2];
+          const buy = levels[j][1], sell = levels[j][2], unknown = levels[j][3] || 0;
           const top = y - rowH / 2;
           const h = Math.max(rowH - 1, 1);
           ctx.fillStyle = this._heat(sell / maxVol);
           ctx.fillRect(x, top, halfW, h);
           ctx.fillStyle = this._heat(buy / maxVol);
           ctx.fillRect(x + halfW, top, cellW - halfW, h);
+          if (unknown > 0) {
+            // 判不出方向的量压在格子底部整条: 不参与左卖右买, 但必须可见
+            const band = Math.max(h * 0.3, 2);
+            ctx.fillStyle = FP.unknownColor(unknown / maxVol);
+            ctx.fillRect(x, top + h - band, cellW, band);
+          }
           if (showText && rowH >= 9) {
             ctx.fillStyle = "rgba(19, 23, 34, 0.6)";      // 左右半格分隔线
             ctx.fillRect(x + halfW, top, 1, h);
@@ -386,12 +398,19 @@ function deriveLw() {
   return { wave, wt2, crvSlope };
 }
 
+// ---------- 判向算法对照 ----------
+// 后端对同一根 bar 并列输出两套量: buy/sell/unknown 是新算法(Lee-Ready),
+// buyLegacy/sellLegacy 是旧算法。这里只切换"读哪一套", CVD 恒按新算法累计。
+const buyOf = (b) => (classifySource === "legacy" ? b.buyLegacy : b.buy) ?? null;
+const sellOf = (b) => (classifySource === "legacy" ? b.sellLegacy : b.sell) ?? null;
+const deltaOf = (b) => (classifySource === "legacy" ? b.deltaLegacy : b.delta) ?? null;
+
 function derive() {
   const n = bars.length;
   const vol = bars.map((b) => b.volume);
-  const buy = bars.map((b) => b.buy);
-  const sell = bars.map((b) => b.sell);
-  const delta = bars.map((b) => b.delta);
+  const buy = bars.map((b) => buyOf(b));
+  const sell = bars.map((b) => sellOf(b));
+  const delta = bars.map((b) => deltaOf(b));
   const close = bars.map((b) => b.close);
   const emaLines = EMA_PERIODS.map((p) => ema(close, p));
   const posd = delta.map((d) => (d == null ? null : d > 0 ? d : 0));
@@ -501,13 +520,15 @@ function buildSuiteData() {
       if (val == null) continue;
       hist.push({ time: b.time, value: val, color: colorFor(up, levelOf("vol", i)) });
     } else if (mode === "bsv") {
-      if (b.buy == null) continue;
-      hist.push({ time: b.time, value: b.buy, color: colorFor(true, levelOf("buy", i)) });
-      histSell.push({ time: b.time, value: -b.sell, color: colorFor(false, levelOf("sell", i)) });
+      const buy = buyOf(b), sell = sellOf(b);
+      if (buy == null) continue;
+      hist.push({ time: b.time, value: buy, color: colorFor(true, levelOf("buy", i)) });
+      histSell.push({ time: b.time, value: -(sell ?? 0), color: colorFor(false, levelOf("sell", i)) });
     } else if (mode === "delta") {
-      if (b.delta == null) continue;
-      const lvl = levelOf(b.delta > 0 ? "posd" : "negd", i);   // 原指标: delta>0 才算涨
-      hist.push({ time: b.time, value: b.delta, color: colorFor(b.delta > 0, lvl) });
+      const delta = deltaOf(b);
+      if (delta == null) continue;
+      const lvl = levelOf(delta > 0 ? "posd" : "negd", i);   // 原指标: delta>0 才算涨
+      hist.push({ time: b.time, value: delta, color: colorFor(delta > 0, lvl) });
     } else {
       // crvol / cvd: 蜡烛图, o=前一累计值, h=l=c=当前值
       const arr = cumulative;
@@ -624,11 +645,15 @@ function updateLegend(i) {
     mode === "rvol" ? fmt(d.rvol[i], 2) :
     mode === "crvol" ? fmt(d.crv[i], 2) :
     mode === "volume" ? fmt(b.volume) :
-    mode === "bsv" ? `${fmt(b.buy)}/${fmt(b.sell)}` :
-    mode === "delta" ? fmt(b.delta) : fmt(b.cvd);
+    mode === "bsv" ? `${fmt(buyOf(b))}/${fmt(sellOf(b))}` :
+    mode === "delta" ? fmt(deltaOf(b)) : fmt(b.cvd);
+  // 判向对照: 同一根 bar 同时给出新算法(买/卖/未知)与旧算法(买/卖)
+  const fp = view === "footprint" ? fpBars.find((item) => item.time === b.time) : null;
+  const unknown = fp ? fp.levels.reduce((sum, lv) => sum + (lv[3] || 0), 0) : (b.unknown ?? 0);
   $("legend").textContent =
     `${t}  O:${fmt(b.open)} H:${fmt(b.high)} L:${fmt(b.low)} C:${fmt(b.close)}  ` +
-  `  ${mode.toUpperCase()}:${suiteVal}  Δ:${fmt(b.delta)}  CVD:${fmt(b.cvd)}` +
+  `  ${mode.toUpperCase()}:${suiteVal}  Δ:${fmt(deltaOf(b))}  CVD:${fmt(b.cvd)}` +
+  `  新买/卖:${fmt(b.buy)}/${fmt(b.sell)} 未知:${fmt(unknown)} 旧买/卖:${fmt(b.buyLegacy)}/${fmt(b.sellLegacy)}` +
   `  LSMA:${fmt(derived.lw.wave[i], 1)} RVOL:${fmt(d.rvol[i], 2)} 斜率:${fmt(derived.lw.crvSlope[i], 2)}`;
 }
 
@@ -645,11 +670,36 @@ chart.subscribeCrosshairMove((param) => {
 
 $("mode").addEventListener("change", (e) => { mode = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
 $("threshtype").addEventListener("change", (e) => { threshtype = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
+$("classify").addEventListener("change", (e) => {
+  classifySource = e.target.value;
+  renderAll();       // 买卖量参与阈值/均线派生, 换口径要整体重算
+  updateLegend(bars.length - 1);
+});
 function updateSplitSelection() {
   ltf = FlowData.splitLtf(cvdSource, klineLtf);
   $("ltf").disabled = cvdSource === "tick";
   $("ltf").value = String(klineLtf);
   loadHistory().catch((error) => { setStatus(false, "加载失败: " + error.message); });
+}
+
+// 拆分粒度选项随主周期收敛: 15/30 在 10s 主周期下既不能整除也不比主周期细, 必须禁用。
+// 当前选择若变得非法, 回落到该周期下最粗的合法粒度(即主周期本身)。
+function applyLtfOptions(options) {
+  const legal = options && options.length ? options.filter((s) => s > 0) : (LTF_BY_TF[tf] || [1, 5, 10]);
+  for (const option of $("ltf").options) {
+    option.disabled = !legal.includes(Number(option.value));
+  }
+  if (!legal.includes(klineLtf)) {
+    klineLtf = legal[legal.length - 1];
+    $("ltf").value = String(klineLtf);
+    if (cvdSource !== "tick") ltf = FlowData.splitLtf(cvdSource, klineLtf);
+  }
+}
+
+function applyPeriod() {
+  document.title = `FlowScope · ${tf}s`;
+  $("tf").value = String(tf);
+  applyLtfOptions(cfg && cfg.ltfOptions);
 }
 $("cvd-source").addEventListener("change", (e) => {
   cvdSource = e.target.value;
@@ -658,6 +708,11 @@ $("cvd-source").addEventListener("change", (e) => {
 $("ltf").addEventListener("change", (e) => {
   klineLtf = parseInt(e.target.value, 10);
   updateSplitSelection();
+});
+$("tf").addEventListener("change", (e) => {
+  tf = Number(e.target.value) === 10 ? 10 : 30;
+  applyPeriod();
+  loadHistory().catch((error) => { setStatus(false, "加载失败: " + error.message); });
 });
 $("apply").addEventListener("click", () => {
   const s = $("symbol").value.trim();
@@ -737,7 +792,8 @@ async function loadHistory(generation = ++loadGeneration) {
     ws.close();
     ws = null;
   }
-  const resp = await fetch("/api/history?symbol=" + encodeURIComponent(symbol) + "&ltf=" + ltf);
+  const resp = await fetch("/api/history?symbol=" + encodeURIComponent(symbol) +
+                           "&ltf=" + ltf + "&tf=" + tf);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const data = await resp.json();
   if (generation !== loadGeneration) return;
@@ -757,6 +813,9 @@ async function loadHistory(generation = ++loadGeneration) {
   }
   cfg = data.cfg;
   bars = data.bars;
+  barRevision = -1;      // 换周期/换粒度后 revision 基准不同, 必须重新对齐
+  fpRevision = -1;
+  applyPeriod();
   renderAll();
   chart.timeScale().scrollToRealTime();
   connectWs();
@@ -787,7 +846,7 @@ function connectWs() {
   }
   setStatus(false, "同步中…");
   const wsScheme = location.protocol === "https:" ? "wss" : "ws";
-  const socket = new WebSocket(`${wsScheme}://${location.host}/ws?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}&footprint=${view === "footprint"}`);
+  const socket = new WebSocket(`${wsScheme}://${location.host}/ws?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}&tf=${tf}&footprint=${view === "footprint"}`);
   ws = socket;
   let synced = false;
   const armWatchdog = () => {
@@ -818,17 +877,18 @@ function connectWs() {
         if (msg.error || msg.status?.status !== "connected") {
           setStatus(false, msg.error || "行情源: " + (msg.status?.lastError || msg.status?.status || "未知"));
         } else if (synced) setStatus(true, "已连接");
-      } else if (msg.symbol === symbol && msg.type === "snapshot" && msg.ltf === ltf) {
+      } else if (msg.symbol === symbol && msg.type === "snapshot" && msg.ltf === ltf && msg.tf === tf) {
         cfg = msg.cfg;
         bars = FlowData.mergeBars([], msg.bars);
         barRevision = msg.revision;
         fpRevision = -1;
+        applyPeriod();
         renderAll();
         if (msg.footprint) applyFootprint(msg.footprint, true);
         else { fpBars = []; fpSeries.setData([]); }
         synced = true;
         setStatus(true, "已连接");
-      } else if (synced && msg.symbol === symbol) {
+      } else if (synced && msg.symbol === symbol && msg.tf === tf) {
         if (msg.type === "bars" && msg.ltf === ltf && msg.revision > barRevision) {
           onBars(msg.bars);
           barRevision = msg.revision;
