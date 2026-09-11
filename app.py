@@ -70,6 +70,33 @@ def status():
     return manager.status_snapshot()
 
 
+@app.get("/api/footprint")
+async def footprint(symbol: str = DEFAULT_SYMBOL):
+    """返回 tick 窗口内各 bar 的分价位买卖量矩阵(足迹图)，口径同 ltf=0。
+
+    快照未就绪时最多等 90 秒(闭市回填慢); tick 历史只有约 83 分钟，更早的 bar 无足迹。
+    """
+    try:
+        normalized_symbol = validate_symbol(symbol)
+        feed = manager.ensure(normalized_symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        snapshot = feed.footprint_snapshot()
+        if snapshot is not None:
+            return snapshot
+        with feed._state_lock:
+            if feed.error:
+                raise HTTPException(status_code=400, detail=feed.error)
+        if manager.status_snapshot()["status"] == "error":
+            break
+        await asyncio.sleep(0.2)
+    return {"symbol": normalized_symbol, "tickSize": 1.0, "bars": [], "pending": True,
+            "status": manager.status_snapshot()}
+
+
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0):
     await websocket.accept()

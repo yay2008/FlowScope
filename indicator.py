@@ -36,31 +36,50 @@ CFG = {
 }
 
 
-def split_ticks_to_bars(ticks: pd.DataFrame, ltf_sec: int = 0) -> pd.DataFrame:
-    """tick 序列 -> 每根 30s bar 的主动买/卖量。
+def _classify_ticks(ticks: pd.DataFrame) -> pd.DataFrame:
+    """tick 序列 -> 逐 tick 的(datetime, last_price, dv, side)。
 
-    ltf_sec = 0: 逐 tick 判定, last_price >= ask_price1 -> 主动买, <= bid_price1 -> 主动卖,
-                 落在盘口中间沿用上一笔方向(最细粒度, 优于 TV 的 LTF 口径)。
-    ltf_sec > 0: 先把 tick 聚成该秒级小周期, 按小周期阴阳整体归类
-                 (close>open 全量记买, close<open 全量记卖, 十字线丢弃),
-                 等价于原 Volume Suite 指标的 LTF Timeframe 口径。
-    volume 是当日累计, 差分得单笔量; 跨交易日(夜盘 21:00)累计清零,
+    volume 是当日累计, 差分得单笔量 dv; 跨交易日(夜盘 21:00)累计清零,
     diff 为负时该 tick 的累计值即新日已成交量。
+    side: last_price >= ask_price1 -> 1(主动买), <= bid_price1 -> -1(主动卖),
+    落在盘口中间沿用上一笔方向。
     """
     df = ticks[["datetime", "last_price", "ask_price1", "bid_price1", "volume"]].dropna(
-        subset=["datetime", "last_price"])
+        subset=["datetime", "last_price"]).copy()
+    df["dv"] = 0.0
+    df["side"] = 0.0
     if df.empty:
-        return pd.DataFrame(columns=["buy", "sell"], index=pd.Index([], name="bar_ns"))
-
+        return df
     dv = df["volume"].diff().fillna(0.0)
     neg = dv < 0
     dv[neg] = df["volume"][neg]
+    df["dv"] = dv
+    side = pd.Series(np.nan, index=df.index)
+    up = df["last_price"] >= df["ask_price1"]
+    down = df["last_price"] <= df["bid_price1"]
+    side[up] = 1.0
+    side[down] = -1.0
+    df["side"] = side.ffill().fillna(0.0)
+    return df
+
+
+def split_ticks_to_bars(ticks: pd.DataFrame, ltf_sec: int = 0) -> pd.DataFrame:
+    """tick 序列 -> 每根 30s bar 的主动买/卖量。
+
+    ltf_sec = 0: 逐 tick 判定(见 _classify_ticks), 最细粒度, 优于 TV 的 LTF 口径。
+    ltf_sec > 0: 先把 tick 聚成该秒级小周期, 按小周期阴阳整体归类
+                 (close>open 全量记买, close<open 全量记卖, 十字线丢弃),
+                 等价于原 Volume Suite 指标的 LTF Timeframe 口径。
+    """
+    df = _classify_ticks(ticks)
+    if df.empty:
+        return pd.DataFrame(columns=["buy", "sell"], index=pd.Index([], name="bar_ns"))
 
     if ltf_sec > 0:
         # 小周期聚合(仅支持能整除 30s 的粒度, 小周期不会横跨 30s bar 边界)
         micro_ns = ltf_sec * 10**9
         micro = (df["datetime"] // micro_ns) * micro_ns
-        g = df.assign(dv=dv).groupby(micro)
+        g = df.groupby(micro)
         m_open = g["last_price"].first()
         m_close = g["last_price"].last()
         m_vol = g["dv"].sum()
@@ -71,17 +90,49 @@ def split_ticks_to_bars(ticks: pd.DataFrame, ltf_sec: int = 0) -> pd.DataFrame:
         bar_key = (res.index // BAR_NS) * BAR_NS
         return res.groupby(bar_key)[["buy", "sell"]].sum().rename_axis("bar_ns")
 
-    side = pd.Series(np.nan, index=df.index)
-    up = df["last_price"] >= df["ask_price1"]
-    down = df["last_price"] <= df["bid_price1"]
-    side[up] = 1.0
-    side[down] = -1.0
-    side = side.ffill().fillna(0.0)
-
-    df["buy"] = dv.where(side == 1, 0.0)
-    df["sell"] = dv.where(side == -1, 0.0)
+    df["buy"] = df["dv"].where(df["side"] == 1, 0.0)
+    df["sell"] = df["dv"].where(df["side"] == -1, 0.0)
     bar_ns = (df["datetime"] // BAR_NS) * BAR_NS
     return df.groupby(bar_ns)[["buy", "sell"]].sum().rename_axis("bar_ns")
+
+
+def build_footprint(klines: pd.DataFrame, ticks: pd.DataFrame) -> dict:
+    """30s K线 + tick -> 足迹矩阵(每根 bar 各价格档位的主动买/卖量)。
+
+    口径同 split_ticks_to_bars(ltf=0); 只输出 klines 中存在且被 tick 覆盖的 bar
+    (tick 历史窗口约 83 分钟)。tickSize 由成交价最小正差推断(兜底 1.0), 档位按它对齐。
+    返回 {"tickSize": float,
+          "bars": [{"time": 北京时间戳秒, "levels": [[price, buy, sell], ...按价格升序]}]}
+    """
+    df = _classify_ticks(ticks)
+    if df.empty:
+        return {"tickSize": 1.0, "bars": []}
+
+    prices = np.sort(df["last_price"].unique())
+    diffs = np.diff(prices)
+    diffs = diffs[diffs > 0]
+    tick_size = float(diffs.min()) if len(diffs) else 1.0
+
+    df["price"] = (df["last_price"] / tick_size).round() * tick_size
+    df["buy"] = df["dv"].where(df["side"] == 1, 0.0)
+    df["sell"] = df["dv"].where(df["side"] == -1, 0.0)
+    df["bar_ns"] = (df["datetime"] // BAR_NS) * BAR_NS
+    levels = df.groupby(["bar_ns", "price"])[["buy", "sell"]].sum()
+    # 500ms 快照常见无成交 tick(dv=0), 过滤零量档位避免 "0×0" 幽灵行
+    levels = levels[(levels["buy"] > 0) | (levels["sell"] > 0)]
+
+    bar_times = {int(ns): int(ns // 10**9 + TZ_SHIFT_S)
+                 for ns in klines["datetime"].dropna()}
+    bars = []
+    for bar_ns, group in levels.groupby(level=0):
+        time_s = bar_times.get(bar_ns)
+        if time_s is None:
+            continue
+        lvl = [[float(price), float(buy), float(sell)]
+               for price, buy, sell in zip(group.index.get_level_values("price"),
+                                           group["buy"], group["sell"])]
+        bars.append({"time": time_s, "levels": lvl})
+    return {"tickSize": tick_size, "bars": bars}
 
 
 def finalize_bars(df: pd.DataFrame) -> pd.DataFrame:

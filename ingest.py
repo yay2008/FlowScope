@@ -20,7 +20,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from tqsdk import TqApi, TqAuth
 
-from indicator import CFG, build_bars, bars_to_records, finalize_bars
+from indicator import CFG, build_bars, bars_to_records, build_footprint, finalize_bars
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -55,6 +55,7 @@ class Feed:
         self.ticks = None
         self.ready = threading.Event()     # 首个快照就绪
         self.snapshots: dict[int, dict] = {}
+        self.footprint: dict | None = None
         self.error: str | None = None
         self._last_tick_dt = None
         self._state_lock = threading.RLock()
@@ -69,6 +70,7 @@ class Feed:
         with self._state_lock:
             self._last_tick_dt = None
             self.snapshots.clear()
+            self.footprint = None
             self.ready.clear()
             self.error = None
 
@@ -100,6 +102,10 @@ class Feed:
     def snapshot_for(self, ltf: int) -> dict | None:
         with self._state_lock:
             return self.snapshots.get(ltf)
+
+    def footprint_snapshot(self) -> dict | None:
+        with self._state_lock:
+            return self.footprint
 
     def _append_csv(self, bars: pd.DataFrame):
         done = bars.iloc[:-1]                 # 最后一根 bar 未走完, 不落盘
@@ -139,11 +145,15 @@ class Feed:
             recs = bars_to_records(bars.tail(SNAPSHOT_BARS))
             snapshots[ltf] = {"symbol": self.symbol, "cfg": CFG, "ltf": ltf, "bars": recs}
             messages.append({"type": "bar", "symbol": self.symbol, "ltf": ltf, "bar": recs[-1]})
+        fp = build_footprint(self.klines, self.ticks)
         with self._state_lock:
             self.snapshots.update(snapshots)
+            self.footprint = {"symbol": self.symbol, **fp}
             self.ready.set()
         for message in messages:
             broadcast(message)
+        if fp["bars"]:
+            broadcast({"type": "footprint", "symbol": self.symbol, "bar": fp["bars"][-1]})
 
 
 class FeedManager:
@@ -219,7 +229,11 @@ class FeedManager:
 
     def _fanout(self, msg: dict):
         for q, subscription in list(self.clients.items()):
-            if (msg.get("symbol"), msg.get("ltf")) != subscription:
+            if msg.get("type") == "footprint":
+                # 足迹口径固定 tick 级, 与客户端 ltf 无关, 只按 symbol 匹配
+                if msg.get("symbol") != subscription[0]:
+                    continue
+            elif (msg.get("symbol"), msg.get("ltf")) != subscription:
                 continue
             try:
                 q.put_nowait(msg)

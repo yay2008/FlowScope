@@ -13,6 +13,10 @@ let derived = null;   // 派生数组(rolling sma/zscore 等)
 let mode = "cvd";
 let threshtype = "RELATIVE";
 let ltf = 0;          // 买卖量拆分粒度(秒), 0=逐 tick 盘口判定
+let view = "candle";  // 主图视图: candle=K线, footprint=足迹图
+let fpBars = [];      // 足迹 bar: {time, levels: [[price, buy, sell], ...按价格升序]}
+let fpGeneration = 0;
+let fpBarSpacing = null;   // 进足迹模式前的 barSpacing, 退出时恢复
 let symbol = new URLSearchParams(location.search).get("symbol") || "KQ.m@SHFE.fu";
 let ws = null;
 let wsGeneration = 0;
@@ -20,6 +24,139 @@ let reconnectTimer = null;
 let loadGeneration = 0;
 
 $("symbol").value = symbol;
+
+// ---------- 足迹图自定义 series (lightweight-charts v5 custom series) ----------
+// 数据项: {time, levels: [[price, buy, sell], ...按价格升序]}
+// 每档一格分左右两半(左卖右买), 暖色热力底色按档量强度渐变;
+// K线轮廓(影线+柱体框)垫在格子下; POC(最大量档)白框, 对角不平衡(>=3:1)色框
+
+const FP = {
+  imbRatio: 3,                              // 对角不平衡阈值: 买[j] vs 卖[j-1] 或 卖[j] vs 买[j+1]
+  imbMinVol: 10,                            // 优势侧最小量, 防小数字噪声
+  imbBuyColor: "#00e676", imbSellColor: "#f23645",
+  upColor: "#f0b90d", downColor: "#ef6c00", // K线轮廓: 涨金 跌橙
+  pocColor: "rgba(232, 234, 237, 0.9)",
+};
+
+class FootprintRenderer {
+  constructor() {
+    this._data = null;
+    this._options = null;
+  }
+  update(data, options) {
+    this._data = data;
+    this._options = options;
+  }
+  _heat(ratio) {   // 暖色热力: 同一色系, 亮度 = 档量 / bar 最大档量
+    return `rgba(245, 166, 35, ${0.08 + 0.87 * ratio})`;
+  }
+  draw(target, priceConverter) {
+    if (!this._data || !this._data.bars.length) return;
+    const { bars, barSpacing } = this._data;
+    const tickSize = (this._options && this._options.tickSize) || 1;
+    target.useMediaCoordinateSpace(({ context: ctx }) => {
+      const cellW = Math.max(barSpacing * 0.85, 6);
+      const halfW = cellW / 2;
+      const showText = cellW >= 42;
+      ctx.font = "9px Consolas, monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      for (let i = 0; i < bars.length; i++) {
+        const d = bars[i].originalData;
+        const levels = d.levels;
+        if (!levels || !levels.length) continue;
+        const x = bars[i].x - cellW / 2;
+        const ys = levels.map((lv) => priceConverter(lv[0]));
+        // 行高: 相邻价位 y 差的中位数; 单档 bar 用 tickSize 推算, 兜底 6px
+        const gaps = [];
+        for (let j = 1; j < ys.length; j++) {
+          if (ys[j] != null && ys[j - 1] != null) gaps.push(Math.abs(ys[j] - ys[j - 1]));
+        }
+        let rowH = 6;
+        if (gaps.length) {
+          gaps.sort((a, b) => a - b);
+          rowH = gaps[gaps.length >> 1];
+        } else if (ys[0] != null) {
+          const y2 = priceConverter(levels[0][0] + tickSize);
+          if (y2 != null && y2 !== ys[0]) rowH = Math.abs(y2 - ys[0]);
+        }
+        // K线轮廓: 影线(最高-最低) + 柱体框(开-收), 垫在格子下
+        if (d.high != null && d.low != null) {
+          const yH = priceConverter(d.high), yL = priceConverter(d.low);
+          if (yH != null && yL != null) {
+            const frameColor = d.close >= d.open ? FP.upColor : FP.downColor;
+            ctx.strokeStyle = frameColor;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(bars[i].x, yH);
+            ctx.lineTo(bars[i].x, yL);
+            ctx.stroke();
+            const yO = priceConverter(d.open), yC = priceConverter(d.close);
+            if (yO != null && yC != null) {
+              ctx.lineWidth = 1.5;
+              ctx.strokeRect(x, Math.min(yO, yC), cellW, Math.max(Math.abs(yC - yO), 1));
+            }
+          }
+        }
+        let maxVol = 0, pocIdx = -1;
+        for (let j = 0; j < levels.length; j++) {
+          const v = levels[j][1] + levels[j][2];
+          if (v > maxVol) { maxVol = v; pocIdx = j; }
+        }
+        if (maxVol <= 0) continue;
+        for (let j = 0; j < levels.length; j++) {
+          const y = ys[j];
+          if (y == null) continue;
+          const buy = levels[j][1], sell = levels[j][2];
+          const top = y - rowH / 2;
+          const h = Math.max(rowH - 1, 1);
+          ctx.fillStyle = this._heat(sell / maxVol);
+          ctx.fillRect(x, top, halfW, h);
+          ctx.fillStyle = this._heat(buy / maxVol);
+          ctx.fillRect(x + halfW, top, cellW - halfW, h);
+          if (showText && rowH >= 9) {
+            ctx.fillStyle = "rgba(19, 23, 34, 0.6)";      // 左右半格分隔线
+            ctx.fillRect(x + halfW, top, 1, h);
+            ctx.fillStyle = "rgba(232, 234, 237, 0.92)";
+            ctx.fillText(String(sell), x + halfW / 2, y);
+            ctx.fillText(String(buy), x + halfW * 1.5, y);
+            // 对角不平衡: 买[j] >= 3*卖[j-1] 或 卖[j] >= 3*买[j+1] (levels 按价格升序)
+            const sellBelow = j > 0 ? levels[j - 1][2] : 0;
+            const buyAbove = j < levels.length - 1 ? levels[j + 1][1] : 0;
+            let imbColor = null;
+            if (buy >= FP.imbRatio * Math.max(sellBelow, 1) && buy >= FP.imbMinVol) imbColor = FP.imbBuyColor;
+            else if (sell >= FP.imbRatio * Math.max(buyAbove, 1) && sell >= FP.imbMinVol) imbColor = FP.imbSellColor;
+            if (imbColor) {
+              ctx.strokeStyle = imbColor;
+              ctx.lineWidth = 1.5;
+              ctx.strokeRect(x + 0.5, top + 0.5, cellW - 1, h - 1);
+            }
+            if (j === pocIdx) {                            // POC 白框画内侧, 与不平衡框共存时两层都可见
+              ctx.strokeStyle = FP.pocColor;
+              ctx.lineWidth = 1.5;
+              ctx.strokeRect(x + 2.5, top + 2.5, Math.max(cellW - 5, 1), Math.max(h - 5, 1));
+            }
+          }
+        }
+      }
+    });
+  }
+}
+
+class FootprintSeries {
+  constructor() {
+    this._renderer = new FootprintRenderer();
+  }
+  defaultOptions() { return { priceLineVisible: false, lastValueVisible: false }; }
+  renderer() { return this._renderer; }
+  update(data, options) { this._renderer.update(data, options); }
+  priceValueBuilder(plotRow) {
+    const levels = plotRow.levels;
+    return [levels[0][0], levels[levels.length - 1][0], levels[levels.length - 1][0]];
+  }
+  isWhitespace(data) { return !data.levels || !data.levels.length; }
+  destroy() {}
+}
 
 // ---------- 图表初始化 ----------
 
@@ -52,6 +189,9 @@ const emaSeries = EMA_PERIODS.map((p, j) =>
   chart.addSeries(LightweightCharts.LineSeries, {
     color: EMA_COLORS[j], lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
   }, 0));
+
+// 足迹图 series (pane 0, 默认隐藏; 视图切到足迹图时显示, tickSize 由 /api/footprint 下发)
+const fpSeries = chart.addCustomSeries(new FootprintSeries(), { visible: false, tickSize: 1 }, 0);
 
 // suite pane: 直方图(主值) + 直方图(卖量, 负值) + 蜡烛(CRVOL/CVD 模式)
 const histA = chart.addSeries(LightweightCharts.HistogramSeries, { priceFormat: { type: "volume" } }, 1);
@@ -510,6 +650,78 @@ $("apply").addEventListener("click", () => {
   if (s) location.search = "?symbol=" + encodeURIComponent(s);
 });
 
+// ---------- 足迹图视图切换与数据 ----------
+
+function ohlcOf(t) {   // bars 按 time 升序, 二分查找出 footprint bar 对应的 K线 OHLC
+  let lo = 0, hi = bars.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (bars[mid].time === t) return bars[mid];
+    if (bars[mid].time < t) lo = mid + 1; else hi = mid - 1;
+  }
+  return null;
+}
+
+const toFpItem = (b) => {
+  const item = { time: b.time, levels: b.levels };
+  const k = ohlcOf(b.time);
+  if (k) { item.open = k.open; item.high = k.high; item.low = k.low; item.close = k.close; }
+  return item;
+};
+
+$("view").addEventListener("change", (e) => setView(e.target.value));
+
+function setView(v) {
+  view = v;
+  const isFp = v === "footprint";
+  candleSeries.applyOptions({ visible: !isFp });
+  emaSeries.forEach((s) => s.applyOptions({ visible: !isFp }));
+  fpSeries.applyOptions({ visible: isFp });
+  if (isFp) {
+    fpBarSpacing = chart.timeScale().options().barSpacing;
+    chart.timeScale().applyOptions({ barSpacing: 60 });   // 分裂格较宽, 自动放大
+    if (fpBars.length) {
+      fpSeries.setData(fpBars.map(toFpItem));
+      chart.timeScale().scrollToRealTime();
+    } else {
+      loadFootprint().catch((error) => { setStatus(false, "足迹加载失败: " + error.message); });
+    }
+  } else if (fpBarSpacing != null) {
+    chart.timeScale().applyOptions({ barSpacing: fpBarSpacing });
+    fpBarSpacing = null;
+  }
+}
+
+async function loadFootprint(generation = ++fpGeneration) {
+  const resp = await fetch("/api/footprint?symbol=" + encodeURIComponent(symbol));
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (generation !== fpGeneration) return;
+  if (data.pending) {
+    setTimeout(() => {
+      if (generation === fpGeneration) {
+        loadFootprint(generation).catch((error) => { setStatus(false, "足迹加载失败: " + error.message); });
+      }
+    }, 3000);
+    return;
+  }
+  fpBars = data.bars;
+  fpSeries.applyOptions({ tickSize: data.tickSize || 1 });
+  if (view === "footprint") {
+    fpSeries.setData(fpBars.map(toFpItem));
+    chart.timeScale().scrollToRealTime();
+  }
+}
+
+function onFootprintBar(bar) {
+  if (!fpBars.length) return;              // 未加载过足迹历史, 等进足迹模式时全量拉取
+  const last = fpBars[fpBars.length - 1];
+  if (last.time === bar.time) fpBars[fpBars.length - 1] = bar;
+  else if (bar.time > last.time) fpBars.push(bar);
+  else return;                             // 乱序旧 bar 忽略
+  if (view === "footprint") fpSeries.update(toFpItem(fpBars[fpBars.length - 1]));
+}
+
 function setStatus(ok, text) {
   const el = $("status");
   el.className = ok ? "on" : "off";
@@ -582,6 +794,7 @@ function connectWs() {
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.type === "bar" && msg.ltf === ltf && msg.bar) onBar(msg.bar);
+    else if (msg.type === "footprint" && msg.bar) onFootprintBar(msg.bar);
   };
 }
 
