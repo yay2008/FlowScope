@@ -34,6 +34,11 @@ MAX_TICKS = 10000     # 条数窗口；按 500ms 一条估算约 83 分钟
 MAX_KLINES = 2000     # K线根数窗口(与周期无关): 30s ≈ 2.5 个交易日, 10s ≈ 5.5 小时
 SNAPSHOT_BARS = 800   # 推送给前端的最近 bar 数(与周期无关)
 MAX_FEEDS = 32
+# 订阅失败不是永久状态: 冷却期结束后自动重订, 避免一次抖动或一次手误把合约锁死到进程重启。
+FAIL_RETRY_SEC = 30
+COMPUTE_RETRY_SEC = 1
+# 健康和失败 Feed 都按真实需求回收；后台自动重试不延长闲置期。
+IDLE_EVICT_SEC = 600
 SYMBOL_RE = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*(?:@[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)?\Z")
 
 
@@ -73,9 +78,17 @@ class Feed:
         self.snapshots = {}
         self.footprint = None
         self.error = None
+        # 订阅失败的冷却截止时刻(None = 未失败); 冷却期过后由 FeedManager 自动重订。
+        self.retry_at = None
+        self.compute_retry_at = 0.0
         self._state_lock = threading.RLock()
         self._requested = {0: float("inf")}
         self._fp_until = 0.0
+        # "真实请求"(页面/客户端)的最近时刻与首访时刻; 供 FeedManager 判定闲置。
+        # None 表示还没人真正要过这份数据。ingest 线程的保活调用不会写这两个字段,
+        # 否则"有人在算"与"有人在看"混在一起, Feed 就永远回收不掉。
+        self._created = time.monotonic()
+        self._last_demand = None
         self._demand_version = 0
         self._computed_version = -1
         self.revision = 0
@@ -94,7 +107,15 @@ class Feed:
             self.footprint = None
             self.ready.clear()
             self.error = None
+            self.retry_at = None
+            self.compute_retry_at = 0.0
             self._computed_version = -1
+
+    def release_serials(self):
+        """由采集线程在 TqApi 关闭后释放实时引用，保留 JSON 快照和历史缓存。"""
+        self.klines = self.ticks = self.quote = None
+        self.lower_klines = {}
+        self.analytics = TickAnalytics(self.bar_ns)
 
     def ensure_ltf_subscriptions(self, api):
         """只在 ingest 线程订阅当前被请求的小周期 K 线。"""
@@ -107,30 +128,58 @@ class Feed:
                 self.lower_klines[ltf] = api.get_kline_serial(
                     self.symbol, ltf, data_length=min(10000, MAX_KLINES * self.tf // ltf + 1))
 
-    def request(self, ltf=None, footprint=False):
+    def request(self, ltf=None, footprint=False, demand=False):
+        """登记数据需求; demand=True 表示来自页面/客户端的真实请求(参与闲置回收判定)。
+
+        ingest 线程每轮都会调用本方法保持计算, 所以它传 demand=False: 否则"有人在算"
+        会被误当成"有人在看", Feed 永远回收不掉。
+        """
         now = time.monotonic()
         allowed = ltf_options(self.tf)
         with self._state_lock:
+            if demand:
+                self._last_demand = now
+            # 0 是默认快照, 记无穷表示"一直保持"; 其它粒度超过 60 秒没有新请求即视为弃用。
             if ltf is not None:
+                keep = {key: value for key, value in self._requested.items() if value > now}
+                keep[0] = float("inf")
                 if ltf not in allowed:
                     ltf = 0
-                if self._requested.get(ltf, 0) < now:
+                if keep.get(ltf, 0) < now:
                     self._demand_version += 1
                     self.snapshots.pop(ltf, None)
-                self._requested[ltf] = float("inf") if ltf == 0 else now + 60
+                keep[ltf] = float("inf") if ltf == 0 else now + 60
+                self._requested = keep
             if footprint:
                 if self._fp_until < now:
                     self._demand_version += 1
                     self.footprint = None
                 self._fp_until = now + 60
 
-    def snapshot_for(self, ltf):
-        self.request(ltf=ltf)
+    def has_demand(self, now=None):
+        """除"刚刚被请求过"之外的活跃需求: 非默认粒度窗口或足迹窗口仍开着。
+
+        刻意不看 ltf=0: 它是常驻保活项, 若据此判定有需求, Feed 就永远回收不掉。
+        """
+        now = time.monotonic() if now is None else now
+        with self._state_lock:
+            return (any(expires > now for ltf, expires in self._requested.items() if ltf != 0)
+                    or self._fp_until > now)
+
+    def idle_for(self, now=None):
+        """距最近一次真实请求过了多久(秒); 从未被请求时以创建时刻起算。"""
+        now = time.monotonic() if now is None else now
+        with self._state_lock:
+            return now - (self._created if self._last_demand is None else self._last_demand)
+
+    def snapshot_for(self, ltf, demand=True):
+        """读取快照。demand=False 供 ingest 线程保持计算用, 不计入闲置回收判定。"""
+        self.request(ltf=ltf, demand=demand)
         with self._state_lock:
             return self.snapshots.get(ltf)
 
-    def footprint_snapshot(self):
-        self.request(footprint=True)
+    def footprint_snapshot(self, demand=True):
+        self.request(footprint=True, demand=demand)
         with self._state_lock:
             return self.footprint
 
@@ -250,19 +299,42 @@ class FeedManager:
     def __init__(self):
         self.feeds: dict[tuple[str, int], Feed] = {}
         self.cmd_q: queue.Queue[tuple[str, int]] = queue.Queue()
+        # 值: (合约, 主周期, 拆分粒度, 是否要足迹)
         self.clients: dict[asyncio.Queue, tuple[str, int, int, bool]] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        # 唯一的订阅状态，绑定实例；相同 key 的新 Feed 不能继承旧实例的订阅。
+        self._subscribed: dict[tuple[str, int], Feed] = {}
+        # 包括订阅一半失败的实例；SDK 仍可能持有它们的序列，回收时必须关闭旧连接。
+        self._sdk_feeds: set[Feed] = set()
+        self._rebuild_api = threading.Event()
         self.status = "stopped"
         self.last_error: str | None = None
-        self.failed_feeds: dict[tuple[str, int], str] = {}
+        # 订阅失败登记: key -> {reason, retry_at}；仅控制主订阅冷却，不用于跳过计算错误。
+        self.failed_feeds: dict[tuple[str, int], dict] = {}
+
+    def feed_retry_error(self, feed: Feed) -> str | None:
+        """失败 Feed 未过冷却期时给出可重试的错误文案; 否则返回 None(可以重订)。"""
+        key = feed_key(feed.symbol, feed.tf)
+        with self._lock:
+            entry = self.failed_feeds.get(key)
+            reason = entry["reason"] if entry else None
+            retry_at = entry["retry_at"] if entry else None
+        if not reason:
+            return None
+        wait = (retry_at or 0.0) - time.monotonic()
+        if wait <= 0:
+            return None
+        return f"{reason}({wait:.0f} 秒后自动重试)"
 
     def start(self, loop: asyncio.AbstractEventLoop):
         self.loop = loop
         if self._thread is None or not self._thread.is_alive():
             self._stop.clear()
+            with self._lock:
+                self._subscribed.clear()
             self._thread = threading.Thread(target=self._run, daemon=True, name="tqsdk-ingest")
             self._thread.start()
 
@@ -280,40 +352,76 @@ class FeedManager:
             self.clients[queue_] = (key[0], key[1], ltf, footprint)
             feed = self.feeds.get(key)
         if feed is not None:
-            feed.request(ltf=ltf, footprint=footprint)
+            feed.request(ltf=ltf, footprint=footprint, demand=True)
 
     def remove_client(self, queue_: asyncio.Queue):
         with self._lock:
-            self.clients.pop(queue_, None)
+            subscription = self.clients.pop(queue_, None)
+            if subscription is not None:
+                feed = self.feeds.get(subscription[:2])
+                if feed is not None:
+                    feed.request(demand=True)  # 闲置期从最后一个客户端离开后起算。
 
     def ensure(self, symbol: str, tf: int = DEFAULT_TF_SEC) -> Feed:
-        key = feed_key(symbol, tf)
+        """取得 Feed 并登记真实需求；冷却到期后由采集循环重试，成功才清除失败状态。"""
+        key = feed_key(validate_symbol(symbol), tf)
+        now = time.monotonic()
         with self._lock:
-            if key in self.failed_feeds:
-                raise ValueError(self.failed_feeds[key])
             feed = self.feeds.get(key)
+            if feed is not None:
+                feed.request(demand=True)
+            self._prune(now)
             if feed is None:
                 if len(self.feeds) >= MAX_FEEDS:
                     raise ValueError("订阅合约数量已达上限")
                 feed = Feed(key[0], key[1])
+                feed.request(demand=True)
                 self.feeds[key] = feed
                 self.cmd_q.put(key)
             return feed
 
-    def fail_feed(self, feed: Feed, message: str):
+    def fail_feed(self, feed: Feed, message: str, now=None):
+        """登记订阅冷却；采集循环自行检查截止时间，不跨线程操作 asyncio 定时器。"""
         key = feed_key(feed.symbol, feed.tf)
-        with feed._state_lock:
-            feed.error = message
+        now = time.monotonic() if now is None else now
         with self._lock:
-            if self.feeds.get(key) is feed:
-                self.feeds.pop(key, None)
-            self.failed_feeds[key] = message
+            if self.feeds.get(key) is not feed:
+                return  # 已回收实例的迟到异常不得污染同 key 的新实例。
+            with feed._state_lock:
+                feed.error = message
+                feed.retry_at = now + FAIL_RETRY_SEC
+            self.failed_feeds[key] = {"reason": message, "retry_at": now + FAIL_RETRY_SEC}
+            self._subscribed.pop(key, None)
 
     def status_snapshot(self) -> dict:
         with self._lock:
             return {"status": self.status, "lastError": self.last_error,
                     "feeds": sorted(feed_label(key) for key in self.feeds),
-                    "failedFeeds": {feed_label(k): v for k, v in self.failed_feeds.items()}}
+                    "failedFeeds": {feed_label(k): v["reason"]
+                                    for k, v in self.failed_feeds.items()}}
+
+    def _prune(self, now=None):
+        """回收无人再要的 Feed, 否则 MAX_FEEDS 只增不减, 反复试错合约就会占满池子。
+
+        自动重试不算真实需求；失败 Feed 也按最后一次真实请求起算，避免重试不断续命。
+        """
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            busy = {key[:2] for key in self.clients.values()}
+            for key, feed in list(self.feeds.items()):
+                if key in busy or feed.has_demand(now):
+                    continue
+                if feed.idle_for(now) >= IDLE_EVICT_SEC:
+                    self._forget(key)
+
+    def _forget(self, key: tuple[str, int]):
+        """必须在持有 self._lock 时调用。"""
+        self.failed_feeds.pop(key, None)
+        feed = self.feeds.pop(key, None)
+        self._subscribed.pop(key, None)
+        if feed in self._sdk_feeds:
+            # 只发信号，SDK 的关闭/重建均在采集线程执行。
+            self._rebuild_api.set()
 
     def _set_status(self, status: str, error: str | None = None):
         with self._lock:
@@ -346,6 +454,7 @@ class FeedManager:
         backoff = 1
         while not self._stop.is_set():
             api = None
+            rebuild = False
             try:
                 username = os.getenv("TQ_USER")
                 password = os.getenv("TQ_PASS")
@@ -355,7 +464,9 @@ class FeedManager:
                 api = TqApi(auth=TqAuth(username, password))
                 self._set_status("connected")
                 backoff = 1
-                self._run_api(api)
+                rebuild = self._run_api(api)
+                if rebuild:
+                    self._set_status("connecting")
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
                 self._set_status("error", message)
@@ -364,45 +475,86 @@ class FeedManager:
                 if api is not None:
                     try:
                         api.close()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        print(f"[ingest] 关闭 TqSdk 失败: {exc}", flush=True)
+                self._release_connection()
+                api = None
+            if rebuild:
+                # 主动回收资源不使用故障退避；旧 API 关闭后立即重建仍需保留的订阅。
+                continue
             self._stop.wait(backoff)
             backoff = min(backoff * 2, 30)
 
-    def _run_api(self, api: TqApi):
-        subscribed: set[tuple[str, int]] = set()
+    def _release_connection(self):
+        """只在采集线程关闭 API 后调用，断开 Feed 对旧 SDK 序列的引用。"""
         with self._lock:
-            feeds = list(self.feeds.values())
+            feeds = list(self._sdk_feeds)
+            self._sdk_feeds.clear()
+            self._subscribed.clear()
         for feed in feeds:
-            try:
-                feed.subscribe(api)
-                subscribed.add(feed_key(feed.symbol, feed.tf))
-            except Exception as exc:
-                message = f"合约 {feed_label(feed_key(feed.symbol, feed.tf))} 订阅失败: {exc}"
-                self.fail_feed(feed, message)
-                print(f"[ingest] {message}", flush=True)
+            feed.release_serials()
 
+    def _run_api_attempt(self, api, feed: Feed) -> bool:
+        """单次订阅：按实例核对身份，成功后才解除失败；忽略已回收实例的迟到结果。"""
+        key = feed_key(feed.symbol, feed.tf)
+        with self._lock:
+            if (self.feeds.get(key) is not feed or self._rebuild_api.is_set()
+                    or self._subscribed.get(key) is feed):
+                return False
+            entry = self.failed_feeds.get(key)
+            if entry is not None and time.monotonic() < entry["retry_at"]:
+                return False
+            # 必须在调用 SDK 前标记，部分订阅失败也可能留下 SDK 缓存。
+            self._sdk_feeds.add(feed)
+        try:
+            feed.subscribe(api)
+        except Exception as exc:
+            message = f"合约 {feed_label(key)} 订阅失败: {exc}"
+            self.fail_feed(feed, message)
+            print(f"[ingest] {message}", flush=True)
+            return False
+        with self._lock:
+            if self.feeds.get(key) is not feed:
+                self._rebuild_api.set()
+                return False
+            self._subscribed[key] = feed
+            self.failed_feeds.pop(key, None)
+        return True
+
+    def _sweep_subscriptions(self, api):
+        """唯一的重试入口：每轮检查未订阅实例与冷却时间，无须页面请求或异步定时器。"""
+        with self._lock:
+            pending = [feed for key, feed in self.feeds.items()
+                       if self._subscribed.get(key) is not feed]
+        for feed in pending:
+            if self._stop.is_set() or self._rebuild_api.is_set():
+                break
+            self._run_api_attempt(api, feed)
+
+    def _run_api(self, api: TqApi):
+        """返回 True 请求关闭并重建连接，False 表示停止。SDK 操作均留在本线程。"""
+        with self._lock:
+            self._subscribed.clear()
+            self._rebuild_api.clear()  # 上一个连接已由 _run 关闭并释放。
         while not self._stop.is_set():
-            # 处理新订阅命令(在 ingest 线程内调用 get_* 保证线程安全)
+            self._prune()
+            if self._rebuild_api.is_set():
+                return True
+            # 命令只负责登记新需求，订阅状态统一由 sweep 维护。
             try:
                 while True:
-                    key = self.cmd_q.get_nowait()
-                    if key in subscribed:
-                        continue
-                    with self._lock:
-                        feed = self.feeds.get(key)
-                    if feed is None:
-                        continue
-                    try:
-                        feed.subscribe(api)
-                        subscribed.add(key)
-                    except Exception as exc:
-                        message = f"合约 {feed_label(key)} 订阅失败: {exc}"
-                        self.fail_feed(feed, message)
-                        print(f"[ingest] {message}", flush=True)
+                    self.cmd_q.get_nowait()
             except queue.Empty:
                 pass
+            self._sweep_subscriptions(api)
+            if self._rebuild_api.is_set():
+                return True
+            if self._stop.is_set():
+                break
             api.wait_update(deadline=time.time() + 1)
+            self._prune()
+            if self._rebuild_api.is_set():
+                return True
             with self._lock:
                 feeds = list(self.feeds.values())
                 clients = list(self.clients.values())
@@ -410,28 +562,34 @@ class FeedManager:
             for symbol, tf, ltf, footprint in clients:
                 feed = by_key.get((symbol, tf))
                 if feed is not None:
-                    feed.request(ltf=ltf, footprint=footprint)
+                    feed.request(ltf=ltf, footprint=footprint, demand=False)
             for feed in feeds:
-                if feed.ticks is None or len(feed.ticks) == 0:
+                if self._stop.is_set() or self._rebuild_api.is_set():
+                    break
+                with self._lock:
+                    subscribed = self._subscribed.get(feed_key(feed.symbol, feed.tf)) is feed
+                if not subscribed or feed.ticks is None or len(feed.ticks) == 0:
+                    continue
+                if time.monotonic() < feed.compute_retry_at:
                     continue
                 try:
                     feed.ensure_ltf_subscriptions(api)
-                except Exception as exc:
                     with feed._state_lock:
-                        feed.error = f"小周期 K线订阅失败: {exc}"
-                    continue
-                with feed._state_lock:
-                    needs_recompute = (not feed.snapshots or
-                                       feed._computed_version != feed._demand_version or
-                                       feed.error is not None or
-                                       api.is_changing(feed.ticks) or
-                                       api.is_changing(feed.klines) or
-                                       any(api.is_changing(lower) for lower in feed.lower_klines.values()) or
-                                       api.is_changing(feed.quote, "price_tick"))
-                if needs_recompute:
-                    try:
+                        needs_recompute = (not feed.snapshots or feed.error is not None or
+                                           feed._computed_version != feed._demand_version or
+                                           api.is_changing(feed.ticks) or
+                                           api.is_changing(feed.klines) or
+                                           any(api.is_changing(lower) for lower in feed.lower_klines.values()) or
+                                           api.is_changing(feed.quote, "price_tick"))
+                    if needs_recompute:
                         feed.recompute(self.broadcast)
-                    except Exception as exc:
                         with feed._state_lock:
-                            feed.error = f"指标计算失败: {exc}"
-                        print(f"[ingest] recompute {feed_label(feed_key(feed.symbol, feed.tf))} 出错: {exc}", flush=True)
+                            feed.error = None
+                            feed.compute_retry_at = 0.0
+                except Exception as exc:
+                    # 计算/小周期订阅失败不撤销已成功的主订阅；短暂退避后再次处理。
+                    with feed._state_lock:
+                        feed.error = f"行情处理失败: {exc}"
+                        feed.compute_retry_at = time.monotonic() + COMPUTE_RETRY_SEC
+                    print(f"[ingest] {feed_label(feed_key(feed.symbol, feed.tf))} {feed.error}", flush=True)
+        return self._rebuild_api.is_set() and not self._stop.is_set()

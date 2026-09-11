@@ -23,6 +23,22 @@ app = FastAPI(title="FlowScope")
 manager = FeedManager()
 
 
+def require_feed(symbol: str, tf: int):
+    """校验合约并取得 Feed; 订阅失败且未过冷却期时快速失败(不干等 90 秒)。
+
+    失败不是永久状态: 冷却期一过 FeedManager 会自动重订, 这里只需把剩余等待时间告诉调用方。
+    """
+    try:
+        normalized_symbol = validate_symbol(symbol)
+        feed = manager.ensure(normalized_symbol, tf)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    retry_error = manager.feed_retry_error(feed)
+    if retry_error:
+        raise HTTPException(status_code=400, detail=retry_error)
+    return feed
+
+
 @app.on_event("startup")
 async def _startup():
     manager.start(asyncio.get_running_loop())
@@ -45,24 +61,24 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_
     tf = validate_tf(tf)
     if ltf not in ltf_options(tf):
         ltf = 0
-    try:
-        normalized_symbol = validate_symbol(symbol)
-        feed = manager.ensure(normalized_symbol, tf)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    feed = require_feed(symbol, tf)
 
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         snapshot = feed.snapshot_for(ltf)
         if snapshot is not None:
             return snapshot
+        # 订阅失败(含冷却期内的重试中)都走这里, 不再等到 90 秒超时才回话。
+        retry_error = manager.feed_retry_error(feed)
+        if retry_error:
+            raise HTTPException(status_code=400, detail=retry_error)
         with feed._state_lock:
             if feed.error:
                 raise HTTPException(status_code=400, detail=feed.error)
         if manager.status_snapshot()["status"] == "error":
             break
         await asyncio.sleep(0.2)
-    return {"symbol": normalized_symbol, "cfg": period_cfg(tf), "tf": tf, "ltf": ltf,
+    return {"symbol": feed.symbol, "cfg": period_cfg(tf), "tf": tf, "ltf": ltf,
             "bars": [], "pending": True, "status": manager.status_snapshot()}
 
 
@@ -80,24 +96,23 @@ async def footprint(symbol: str = DEFAULT_SYMBOL, tf: int = DEFAULT_TF_SEC):
     快照未就绪时最多等 90 秒(闭市回填慢)；历史覆盖取决于 tick 窗口和持续采集。
     """
     tf = validate_tf(tf)
-    try:
-        normalized_symbol = validate_symbol(symbol)
-        feed = manager.ensure(normalized_symbol, tf)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    feed = require_feed(symbol, tf)
 
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         snapshot = feed.footprint_snapshot()
         if snapshot is not None:
             return snapshot
+        retry_error = manager.feed_retry_error(feed)
+        if retry_error:
+            raise HTTPException(status_code=400, detail=retry_error)
         with feed._state_lock:
             if feed.error:
                 raise HTTPException(status_code=400, detail=feed.error)
         if manager.status_snapshot()["status"] == "error":
             break
         await asyncio.sleep(0.2)
-    return {"symbol": normalized_symbol, "tickSize": None, "bars": [], "pending": True,
+    return {"symbol": feed.symbol, "tickSize": None, "bars": [], "pending": True,
             "status": manager.status_snapshot()}
 
 
@@ -111,6 +126,9 @@ async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, f
         feed = manager.ensure(symbol, tf)
         if ltf not in ltf_options(tf):
             ltf = 0
+        retry_error = manager.feed_retry_error(feed)
+        if retry_error:
+            raise ValueError(retry_error)
     except ValueError as exc:
         await websocket.close(code=1008, reason=str(exc))
         return

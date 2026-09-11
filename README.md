@@ -78,13 +78,26 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（主图周期 10s /
 
 合约参数只接受字母、数字、点、下划线、短横线和 `@`，用于防止非法订阅与路径穿越。
 
+## 订阅失败会自愈
+
+订阅失败（合约代码打错、闭市或网络抖动导致 `get_quote` 一次性失败）**不是永久状态**，不需要重启服务：
+
+- 失败后进入 **30 秒冷却期**。期间 `/api/history`、`/api/footprint` 与 `WS /ws` 会**立刻失败**并在 message 里写明「(N 秒后自动重试)」，不再让前端干等满 90 秒；`/api/status` 的 `failedFeeds` 也会列出原因。
+- 冷却期一过，行情线程在后续循环**自动重订该合约，不需要页面开着**。失败登记保留到订阅真正成功后才清除；错误合约会继续冷却重试。
+- 计算、历史写入和小周期订阅发生临时异常时，保留已成功的主订阅，**1 秒后重试处理**，不进入主订阅失败名单；重连也不会被这些错误阻止。
+- 前端加载失败后**每 5 秒自动重试**（最多 24 次）。切换周期或数据源会取消旧请求、清除旧定时器并重置预算；迟到的旧响应和错误不会打断新视图的连接。
+- 订阅池（`MAX_FEEDS=32`）按“合约＋主周期”计数：无在线客户端且**闲置满 600 秒**的健康或失败 Feed 会被回收。后台计算和自动重试不延长闲置期，断开最后一个客户端后重新计时。
+- 回收曾访问过 SDK 的 Feed 时，采集线程会**关闭旧 TqApi 并重建仍需保留的订阅**，释放 SDK 持有的行情缓存和连接资源。该过程会短暂重连；JSON 快照与历史缓存保留，恢复后同步更新。重新访问同一合约使用新 Feed 实例，不会被旧订阅标记跳过。
+
+订阅冷却、处理重试和回收时长分别在 `ingest.py` 顶部的 `FAIL_RETRY_SEC`、`COMPUTE_RETRY_SEC`、`IDLE_EVICT_SEC` 里调整。
+
 ## 验证
 
 离线回归测试不需要 TqSdk 账号，历史文件写入临时目录：
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-node --test tests/data-sync.test.js
+node --test tests/data-sync.test.js tests/load-history.test.js
 node --check static/app.js
 ```
 

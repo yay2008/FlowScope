@@ -13,6 +13,20 @@ from indicator import (CFG, DEFAULT_TF_SEC, TF_OPTIONS, bar_ns_for, build_bars,
 from test_data import BASE
 
 
+class Clock:
+    """可推进的单调时钟, 让冷却期/回收期测试与真实等待无关。"""
+
+    def __init__(self, start=1000.0):
+        self.now = float(start)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+        return self.now
+
+
 def frame(rows):
     """rows: (offset_sec, last_price, ask_price1, bid_price1, cumulative_volume)"""
     return pd.DataFrame({
@@ -172,6 +186,7 @@ class ManagerPeriodTests(unittest.TestCase):
         self.assertEqual(ingest.period_cfg(10)["ltfOptions"], [0, 1, 5, 10])
         self.assertEqual(ingest.period_cfg(30)["ltfOptions"], [0, 1, 5, 10, 15, 30])
         self.assertEqual(ingest.period_cfg(10)["tf"], 10)
+
 
 
 if __name__ == "__main__":

@@ -29,6 +29,13 @@ let ws = null;
 let wsGeneration = 0;
 let reconnectTimer = null;
 let loadGeneration = 0;
+let loadController = null;
+let retryTimer = null;
+let retryAttempts = 0;
+// 加载失败后自动重试: 订阅失败是暂时的(冷却期一过后端会自动重订),
+// 所以页面不该停在"加载失败"上等用户手动刷新。
+const RETRY_DELAY_MS = 5000;
+const RETRY_MAX_ATTEMPTS = 24;
 
 $("symbol").value = symbol;
 
@@ -679,7 +686,7 @@ function updateSplitSelection() {
   ltf = FlowData.splitLtf(cvdSource, klineLtf);
   $("ltf").disabled = cvdSource === "tick";
   $("ltf").value = String(klineLtf);
-  loadHistory().catch((error) => { setStatus(false, "加载失败: " + error.message); });
+  loadHistory();
 }
 
 // 拆分粒度选项随主周期收敛: 15/30 在 10s 主周期下既不能整除也不比主周期细, 必须禁用。
@@ -712,7 +719,7 @@ $("ltf").addEventListener("change", (e) => {
 $("tf").addEventListener("change", (e) => {
   tf = Number(e.target.value) === 10 ? 10 : 30;
   applyPeriod();
-  loadHistory().catch((error) => { setStatus(false, "加载失败: " + error.message); });
+  loadHistory();
 });
 $("apply").addEventListener("click", () => {
   const s = $("symbol").value.trim();
@@ -781,7 +788,35 @@ function setStatus(ok, text) {
 
 // ---------- 数据加载与实时推送 ----------
 
-async function loadHistory(generation = ++loadGeneration) {
+function clearLoadRetry() {
+  clearTimeout(retryTimer);
+  retryTimer = null;
+}
+
+function retryAfterError(message, generation) {
+  if (generation !== loadGeneration) return;
+  clearLoadRetry();
+  if (retryAttempts >= RETRY_MAX_ATTEMPTS) {
+    setStatus(false, `${message}（已重试 ${retryAttempts} 次，请检查合约代码后手动刷新）`);
+    return;
+  }
+  retryAttempts += 1;
+  setStatus(false, `${message}（第 ${retryAttempts} 次重试中…）`);
+  retryTimer = setTimeout(() => {
+    if (generation === loadGeneration) loadHistory(generation);
+  }, RETRY_DELAY_MS);
+}
+
+async function loadHistory(generation) {
+  if (generation == null) {
+    generation = ++loadGeneration;  // 用户切换开始新一轮加载；自动重试沿用原 generation。
+    retryAttempts = 0;
+  }
+  if (generation !== loadGeneration) return;
+  clearLoadRetry();
+  if (loadController) loadController.abort();
+  const controller = new AbortController();
+  loadController = controller;
   setStatus(false, "加载中…");
   ++wsGeneration;
   clearTimeout(reconnectTimer);
@@ -792,33 +827,49 @@ async function loadHistory(generation = ++loadGeneration) {
     ws.close();
     ws = null;
   }
-  const resp = await fetch("/api/history?symbol=" + encodeURIComponent(symbol) +
-                           "&ltf=" + ltf + "&tf=" + tf);
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (generation !== loadGeneration) return;
-  if (data.pending) {
-    const ingestStatus = data.status;
-    if (ingestStatus && ingestStatus.status === "error") {
-      setStatus(false, "行情错误: " + (ingestStatus.lastError || "未知错误"));
-    } else {
-      setStatus(false, "等待行情…");
+  try {
+    const resp = await fetch("/api/history?symbol=" + encodeURIComponent(symbol) +
+                             "&ltf=" + ltf + "&tf=" + tf, { signal: controller.signal });
+    if (generation !== loadGeneration) return;
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try {
+        const body = await resp.json();
+        if (body && body.detail) detail = body.detail;
+      } catch (ignored) { /* 非 JSON 错误响应, 保留 HTTP 码 */ }
+      throw new Error(detail);
     }
-    setTimeout(() => {
-      if (generation === loadGeneration) {
-        loadHistory(generation).catch((error) => { setStatus(false, "加载失败: " + error.message); });
+    const data = await resp.json();
+    if (generation !== loadGeneration) return;
+    if (data.pending) {
+      const ingestStatus = data.status;
+      if (ingestStatus && ingestStatus.status === "error") {
+        setStatus(false, "行情错误: " + (ingestStatus.lastError || "未知错误"));
+      } else {
+        setStatus(false, "等待行情…");
       }
-    }, 3000);
-    return;
+      retryTimer = setTimeout(() => {
+        if (generation === loadGeneration) loadHistory(generation);
+      }, 3000);
+      return;
+    }
+    cfg = data.cfg;
+    bars = data.bars;
+    barRevision = -1;
+    fpRevision = -1;
+    applyPeriod();
+    renderAll();
+    chart.timeScale().scrollToRealTime();
+    connectWs();
+    retryAttempts = 0;
+  } catch (error) {
+    // 旧请求即使在响应体解析阶段失败，也不能修改新视图状态或关闭它的 WebSocket。
+    if (generation === loadGeneration && !controller.signal.aborted) {
+      retryAfterError(error.message, generation);
+    }
+  } finally {
+    if (loadController === controller) loadController = null;
   }
-  cfg = data.cfg;
-  bars = data.bars;
-  barRevision = -1;      // 换周期/换粒度后 revision 基准不同, 必须重新对齐
-  fpRevision = -1;
-  applyPeriod();
-  renderAll();
-  chart.timeScale().scrollToRealTime();
-  connectWs();
 }
 
 function onBars(updates) {
@@ -904,4 +955,4 @@ function connectWs() {
   };
 }
 
-loadHistory().catch((e) => { setStatus(false, "加载失败: " + e.message); });
+loadHistory();
