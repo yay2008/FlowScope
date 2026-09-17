@@ -5,10 +5,16 @@ from pathlib import Path
 import pandas as pd
 
 from indicator import BAR_NS, build_bars, build_bars_from_ltf, build_footprint, _classify_ticks
-from history_store import HistoryStore
+from history_store import HistoryStore, _row_line
 
 
 BASE = 1_800_000_000_000_000_000
+TZ_SHIFT = 8 * 3600    # indicator 把 UTC 时间戳 +8h 存成北京时间
+
+
+def bar_time(offset_sec):
+    """第 offset_sec 秒那根 bar 落盘时的 time 值(与 indicator 的时区口径一致)。"""
+    return (BASE + offset_sec * 10**9) // 10**9 + TZ_SHIFT
 
 
 def ticks(offsets=(0, 1, 30, 31, 60), prices=(101, 103, 101, 103, 103), volumes=(100, 110, 120, 130, 140)):
@@ -143,6 +149,121 @@ class DataTests(unittest.TestCase):
             result = store.with_cvd(full)
             self.assertEqual(result.iloc[-1].cvd, 20)
             self.assertEqual(result.iloc[-1].cvdConfirmed, 10)
+
+    def test_completed_and_estimated_share_one_file(self):
+        """完整量与估算量写同一个文件, 靠 source 列区分; 不再产生 _estimated 副本。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            store = HistoryStore(path)
+            k = klines()
+            k["volume"] += 7
+            store.save_completed(build_bars(k, ticks()))          # 三根都没核对通过
+            self.assertEqual(sorted(store.estimates), [bar_time(0), bar_time(30)])
+            store.save_completed(build_bars(klines(), ticks()))   # 第二根核对通过
+            self.assertEqual(sorted(store.values), [bar_time(30)])
+            sources = pd.read_csv(path)["source"].tolist()
+            self.assertIn("partial", sources)
+            self.assertIn("complete", sources)
+            self.assertFalse(Path(folder).joinpath("v3_estimated.csv").exists())
+            # 重启后完整量仍然压过同一时间戳的估算量
+            restarted = HistoryStore(path)
+            self.assertEqual(restarted.values, store.values)
+            self.assertEqual(restarted.merge(build_bars(klines(), ticks())).coverage.tolist(),
+                             ["partial", "complete", "complete"])
+
+    def test_legacy_v3_file_without_source_column_reads_as_complete(self):
+        """既有文件没有 source 列时按 complete 读, 迁移不需要转换脚本。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            path.write_text("time,buy,sell,unknown,buyLegacy,sellLegacy\n"
+                            "1000,10,4,0,9,5\n1001,20,6,0,19,7\n")
+            store = HistoryStore(path)
+            self.assertEqual(store.values, {1000: (10.0, 4.0), 1001: (20.0, 6.0)})
+            self.assertEqual(store.estimates, {})
+            self.assertEqual(store.extra[1000], {"unknown": 0.0, "buyLegacy": 9.0,
+                                                 "sellLegacy": 5.0})
+
+    def test_append_writes_header_once_and_keeps_existing_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            store = HistoryStore(path)
+            store.save_completed(build_bars(klines(), ticks()))
+            store._append([_row_line(99999, 30.0, 8.0, {})])
+            lines = path.read_text().splitlines()
+            self.assertEqual(lines[0], "time,buy,sell,unknown,buyLegacy,sellLegacy,source")
+            self.assertEqual(sum(1 for line in lines if line.startswith("time,")), 1)
+            self.assertEqual(HistoryStore(path).values[99999], (30.0, 8.0))
+
+    def test_append_repairs_file_missing_trailing_newline(self):
+        """手工编辑过的文件最后一行没有换行时, 追加不能把两行粘在一起。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            path.write_text("time,buy,sell,unknown,buyLegacy,sellLegacy,source\n"
+                            "1000,10,4,0,,,complete")      # 故意不带结尾换行
+            store = HistoryStore(path)
+            store._append([_row_line(1001, 20.0, 6.0, {})])
+            reloaded = HistoryStore(path)
+            self.assertEqual(reloaded.values, {1000: (10.0, 4.0), 1001: (20.0, 6.0)})
+
+    def test_refresh_reads_only_appended_bytes(self):
+        """文件被外部追加后 refresh() 补齐内存视图, 无变化时不做任何解析。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            store = HistoryStore(path)
+            store.save_completed(build_bars(klines(), ticks()))
+            self.assertFalse(store.refresh())            # 无变化
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("9999,7,3,0,,\n")           # complete, 对照列留空
+            self.assertTrue(store.refresh())
+            self.assertEqual(store.values[9999], (7.0, 3.0))
+            self.assertFalse(store.refresh())            # 已经读到末尾
+            # 半个行(没有换行)不算数, 补齐后再读
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("10000,8,2,0,,")
+            self.assertFalse(store.refresh())
+            self.assertNotIn(10000, store.values)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("\n")
+            self.assertTrue(store.refresh())
+            self.assertEqual(store.values[10000], (8.0, 2.0))
+
+    def test_refresh_after_truncation_rebuilds_from_scratch(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            store = HistoryStore(path)
+            store.save_completed(build_bars(klines(), ticks()))
+            path.write_text("time,buy,sell,unknown,buyLegacy,sellLegacy,source\n5000,1,1,0,,,complete\n")
+            self.assertTrue(store.refresh())
+            self.assertEqual(store.values, {5000: (1.0, 1.0)})
+            self.assertEqual(store.estimates, {})
+
+    def test_duplicate_rows_use_last_value_and_last_legacy_column(self):
+        """同一时间戳重复行: buy/sell 与对照列都取最后一次出现的值。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            path.write_text("time,buy,sell,unknown,buyLegacy,sellLegacy,source\n"
+                            "1000,10,4,0,9,5,complete\n"
+                            "1000,11,3,0,8,6,complete\n")
+            store = HistoryStore(path)
+            self.assertEqual(store.values[1000], (11.0, 3.0))
+            self.assertEqual(store.extra[1000], {"unknown": 0.0, "buyLegacy": 8.0,
+                                                 "sellLegacy": 6.0})
+
+    def test_legacy_estimated_file_is_read_but_never_rewritten(self):
+        """迁移期兼容: 既有 _estimated.csv 仍被读入, 但不再被写入。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            estimated = Path(folder) / "v3_estimated.csv"
+            estimated.write_text("time,buy,sell,unknown,buyLegacy,sellLegacy\n1001,5,1,0,4,2\n")
+            before = estimated.read_text()
+            k = klines()
+            k["volume"] += 7
+            store = HistoryStore(path)
+            store.save_completed(build_bars(k, ticks()))
+            self.assertEqual(store.estimates[1001], (5.0, 1.0))
+            self.assertEqual(store.estimated_extra[1001], {"unknown": 0.0, "buyLegacy": 4.0,
+                                                           "sellLegacy": 2.0})
+            self.assertEqual(estimated.read_text(), before)
 
 
 if __name__ == "__main__":

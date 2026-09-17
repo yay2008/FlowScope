@@ -4,12 +4,14 @@
 设计要点:
 - wait_update 循环独占一个守护线程; FastAPI 线程经命令队列请求新合约订阅
 - 闭市时初始数据回填不触发 wait_update 返回, 循环用 1s deadline 轮询兼容
-- 每根走完且覆盖完整的 bar 写入按粒度隔离的 v2 CSV；旧 CSV 仅作 legacy 回填。
+- 每根走完且覆盖完整的 bar 追加写入按粒度隔离的 v3 CSV(单文件, 行内 source 列区分
+  完整量/估算量); 旧 CSV 仅作 legacy 回填。
 - tick 窗口最多 10000 条，更早的 buy/sell 靠 CSV 随运行时间累积。
 """
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import queue
 import re
@@ -34,6 +36,16 @@ MAX_TICKS = 10000     # 条数窗口；按 500ms 一条估算约 83 分钟
 MAX_KLINES = 2000     # K线根数窗口(与周期无关): 30s ≈ 2.5 个交易日, 10s ≈ 5.5 小时
 SNAPSHOT_BARS = 800   # 推送给前端的最近 bar 数(与周期无关)
 MAX_FEEDS = 32
+# 一次性 SDK 查询(合约目录、自选报价)的最长等待; 冷启动时可能要排队等采集线程连上。
+JOB_TIMEOUT_SEC = 12.0
+# 单个查询卡住超过这个时长就判定行情连接已不可用(只读缓存对象仍然能读到旧值, 所以
+# 不能靠"有没有数据"判断死活), 此时新请求立刻失败并尽快重建连接。
+JOB_STALL_SEC = 20.0
+# 查询耗时达到 tqsdk 内部 30 秒超时上限, 说明这一次往返根本没回来 —— 直接重建连接。
+JOB_REBUILD_SEC = 30.0
+# 没有行情流时(闭市、无订阅)每隔这么久做一次极短的连接自检。
+# 长连接被静默掐断时 tqsdk 不会报错, 只会让每个取新数据的调用各卡 30 秒 —— 必须主动探活。
+PROBE_INTERVAL_SEC = 60.0
 # 订阅失败不是永久状态: 冷却期结束后自动重订, 避免一次抖动或一次手误把合约锁死到进程重启。
 FAIL_RETRY_SEC = 30
 COMPUTE_RETRY_SEC = 1
@@ -237,6 +249,9 @@ class Feed:
             if ltf == 0:
                 tick_bars = bars
             store = self._store(ltf)
+            # 增量读: 文件被其它进程(离线脚本/另一次运行)追加过时补齐内存视图,
+            # 无变化时只是一次 stat, 不会重解析整个文件。
+            store.refresh()
             bars = store.merge(bars)
             store.save_completed(bars)
             bars = store.with_cvd(bars)
@@ -299,6 +314,9 @@ class FeedManager:
     def __init__(self):
         self.feeds: dict[tuple[str, int], Feed] = {}
         self.cmd_q: queue.Queue[tuple[str, int]] = queue.Queue()
+        # 一次性 SDK 查询(合约目录等): (调用, 结果 Future)。SDK 只能在采集线程碰,
+        # 所以请求方排进队列后阻塞等待, 由采集循环执行并回填结果。
+        self.jobs: queue.Queue[tuple[object, concurrent.futures.Future]] = queue.Queue()
         # 值: (合约, 主周期, 拆分粒度, 是否要足迹)
         self.clients: dict[asyncio.Queue, tuple[str, int, int, bool]] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -314,6 +332,12 @@ class FeedManager:
         self.last_error: str | None = None
         # 订阅失败登记: key -> {reason, retry_at}；仅控制主订阅冷却，不用于跳过计算错误。
         self.failed_feeds: dict[tuple[str, int], dict] = {}
+        # 正在执行的 SDK 调用(查询或自检)的开始时刻; 跨线程读, 用于判定连接卡死。
+        self._busy_since: float | None = None
+        # 最近一次收到行情数据的时刻与最近一次连接自检的时刻。
+        self._last_data_at = time.monotonic()
+        self.last_probe_at = 0.0
+        self.probe_error: str | None = None
 
     def feed_retry_error(self, feed: Feed) -> str | None:
         """失败 Feed 未过冷却期时给出可重试的错误文案; 否则返回 None(可以重订)。"""
@@ -343,7 +367,95 @@ class FeedManager:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=5)
+        self.fail_pending_jobs("行情线程已停止")
         self._set_status("stopped")
+
+    def submit_job(self, fn) -> concurrent.futures.Future:
+        """把一次 SDK 查询排给采集线程, 返回 Future 由调用方等待。
+
+        线程没连上行情源时立刻失败: 这类查询只在真有行情连接时才有意义,
+        让 HTTP 请求干等超时不如直接回退到离线目录。连接卡死(某个调用久不返回)
+        时也立刻失败, 并已被自检标记为需要重建。
+        """
+        with self._lock:
+            if self.status in {"stopped", "error"}:
+                raise RuntimeError(f"行情线程未就绪({self.status})")
+            busy = None if self._busy_since is None else time.monotonic() - self._busy_since
+            if busy is not None and busy >= JOB_STALL_SEC:
+                raise RuntimeError(f"行情连接无响应({busy:.0f} 秒)，正在重建")
+            future: concurrent.futures.Future = concurrent.futures.Future()
+            self.jobs.put((fn, future))
+        return future
+
+    def fail_pending_jobs(self, message: str):
+        """连接断开或线程停止时结算排队中的查询, 避免调用方等到超时。"""
+        while True:
+            try:
+                _, future = self.jobs.get_nowait()
+            except queue.Empty:
+                return
+            future.set_exception(RuntimeError(message))
+
+    async def query(self, fn, timeout: float = JOB_TIMEOUT_SEC):
+        """在采集线程执行一次 SDK 查询并等待结果(HTTP 处理器调用)。
+
+        超时或线程未就绪都抛 RuntimeError, 由调用方决定回退方案;
+        超时后取消 Future, 采集线程到点会跳过它, 不会执行半截。
+        """
+        future = self.submit_job(fn)
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            future.cancel()
+            raise RuntimeError(f"合约查询超时({timeout:.0f} 秒)") from None
+
+    def _run_jobs(self, api):
+        """执行排队中的查询; 单个查询失败只结算它自己, 不影响采集循环。"""
+        while True:
+            try:
+                fn, future = self.jobs.get_nowait()
+            except queue.Empty:
+                return
+            if not future.set_running_or_notify_cancel():
+                continue  # 调用方已经超时/取消
+            started = time.monotonic()
+            self._busy_since = started
+            try:
+                future.set_result(fn(api))
+            except Exception as exc:
+                future.set_exception(exc)
+            finally:
+                self._busy_since = None
+                elapsed = time.monotonic() - started
+                if elapsed >= JOB_REBUILD_SEC:
+                    # 一次往返慢到这个程度只会是连接已经不可用(正常的合约查询是 0.1 秒级),
+                    # 让主循环立刻重建, 不必等下一个自检周期。
+                    print(f"[ingest] 查询耗时 {elapsed:.0f} 秒，判定连接不可用，重建行情连接",
+                          flush=True)
+                    self._rebuild_api.set()
+
+    def _probe_due(self, now: float) -> bool:
+        """行情流安静太久(闭市/无订阅)就该主动问一次连接还在不在。"""
+        return (now - max(self._last_data_at, self.last_probe_at)) >= PROBE_INTERVAL_SEC
+
+    def _run_probe(self, api) -> bool:
+        """极短的合约查询, 只用来确认连接还能收发; 失败即要求重建连接。
+
+        卡死的连接不会报错: 每个取新数据的调用都会各自等满 tqsdk 的 30 秒内部超时,
+        所以这里必须真的发一次往返请求, 而不是看有没有数据。
+        """
+        self._busy_since = time.monotonic()
+        try:
+            list(api.query_quotes(ins_class="CONT", expired=False))
+        except Exception as exc:
+            self.probe_error = f"{type(exc).__name__}: {exc}"
+            print(f"[ingest] 连接自检失败({self.probe_error})，重建行情连接", flush=True)
+            return False
+        finally:
+            self._busy_since = None
+            self.last_probe_at = time.monotonic()
+        self.probe_error = None
+        return True
 
     def add_client(self, queue_: asyncio.Queue, symbol: str, ltf: int, footprint=False,
                    tf: int = DEFAULT_TF_SEC):
@@ -394,11 +506,19 @@ class FeedManager:
             self._subscribed.pop(key, None)
 
     def status_snapshot(self) -> dict:
+        now = time.monotonic()
         with self._lock:
+            busy = None if self._busy_since is None else round(now - self._busy_since, 1)
             return {"status": self.status, "lastError": self.last_error,
                     "feeds": sorted(feed_label(key) for key in self.feeds),
                     "failedFeeds": {feed_label(k): v["reason"]
-                                    for k, v in self.failed_feeds.items()}}
+                                    for k, v in self.failed_feeds.items()},
+                    # 诊断"连接卡死"用: 排队查询数、当前调用已耗时、安静多久、上次自检结果
+                    "jobQueue": self.jobs.qsize(),
+                    "busySec": busy,
+                    "quietSec": round(now - self._last_data_at, 1),
+                    "lastProbeSec": round(now - self.last_probe_at, 1) if self.last_probe_at else None,
+                    "probeError": self.probe_error}
 
     def _prune(self, now=None):
         """回收无人再要的 Feed, 否则 MAX_FEEDS 只增不减, 反复试错合约就会占满池子。
@@ -493,6 +613,8 @@ class FeedManager:
             self._subscribed.clear()
         for feed in feeds:
             feed.release_serials()
+        # 待执行查询绑定在刚关闭的连接上, 一律作废, 否则调用方会等到超时。
+        self.fail_pending_jobs("行情连接已重建")
 
     def _run_api_attempt(self, api, feed: Feed) -> bool:
         """单次订阅：按实例核对身份，成功后才解除失败；忽略已回收实例的迟到结果。"""
@@ -549,8 +671,19 @@ class FeedManager:
             self._sweep_subscriptions(api)
             if self._rebuild_api.is_set():
                 return True
+            # 合约目录等一次性查询在采集线程执行; 它们内部可能自己 wait_update,
+            # 正好顺带刷新主订阅, 所以放在主 wait_update 之前。
+            self._run_jobs(api)
+            if self._rebuild_api.is_set():
+                return True
             if self._stop.is_set():
                 break
+            # 行情流安静太久就主动探一次活: 被静默掐断的连接不会报错, 只会让之后每个取新
+            # 数据的调用各卡 30 秒。自检失败即返回, 由 _run 关掉旧连接重建。
+            if self._probe_due(time.monotonic()) and not self._run_probe(api):
+                return True
+            if self._rebuild_api.is_set():
+                return True
             api.wait_update(deadline=time.time() + 1)
             self._prune()
             if self._rebuild_api.is_set():
@@ -575,12 +708,14 @@ class FeedManager:
                 try:
                     feed.ensure_ltf_subscriptions(api)
                     with feed._state_lock:
+                        changed = (api.is_changing(feed.ticks) or api.is_changing(feed.klines) or
+                                   any(api.is_changing(lower) for lower in feed.lower_klines.values()) or
+                                   api.is_changing(feed.quote, "price_tick"))
                         needs_recompute = (not feed.snapshots or feed.error is not None or
-                                           feed._computed_version != feed._demand_version or
-                                           api.is_changing(feed.ticks) or
-                                           api.is_changing(feed.klines) or
-                                           any(api.is_changing(lower) for lower in feed.lower_klines.values()) or
-                                           api.is_changing(feed.quote, "price_tick"))
+                                           feed._computed_version != feed._demand_version or changed)
+                    if changed:
+                        # 有数据在流动 = 连接肯定是活的, 自检可以往后推
+                        self._last_data_at = time.monotonic()
                     if needs_recompute:
                         feed.recompute(self.broadcast)
                         with feed._state_lock:
