@@ -117,3 +117,16 @@ node --check static/app.js
 ```
 
 访问 `http://127.0.0.1:8765/`。模拟器也会制造 K 线与 tick 分批到达的短暂部分覆盖，用于检查图表恢复；300 秒后自动停止。
+
+## 研究报告（docs/）
+
+`docs/` 下是带日期的指标评估记录，含结论、数字与复跑方式，不是运行时代码：
+
+- `indicator-accuracy-2026-09-16.md` 与 `-addendum.md`：各指标（Delta/CVD/相对量等）在当日日盘的方向准确度、口径敏感性（tick 判向 vs K 线判向）、夜盘开头的数据真空、CVD 背离与累计型指标与价格的相关性。
+- `indicator-evaluation-2026-09-16.md`：同日早盘的冻结快照评估。
+- `ema-wt2-validation-2026-09-16.md` 与 `wt2-ema-regime-test-2026-09-16.md`：EMA 行情分层 × WT2 极值的段级胜率检验，以及"要怎样测才算数"的方法论。
+- `backtest-development-plan.md`：回测功能的开发计划（目标、改造位置、分阶段验收）。
+- `indicator_accuracy_eval.py` / `indicator_recompute.js`：上述报告的复算脚本，逐字移植 `static/app.js` 的前端指标逻辑。
+
+注意：这些报告的复跑脚本把中间产物写在 `.run-tmp/`、`.tmp-test/` 这类临时目录里（已在 `.gitignore` 中，可能被随时清理），复现时需要按报告里的步骤重新生成输入数据。
+
