@@ -25,6 +25,9 @@ let fpBarSpacing = null;   // 进足迹模式前的 barSpacing, 退出时恢复
 let barRevision = -1, fpRevision = -1;
 let watchdog = null;
 let symbol = new URLSearchParams(location.search).get("symbol") || "KQ.m@SHFE.fu";
+// 自选代码(服务端顺序即面板顺序)。常量必须早于合约选择器: picker.load() 会同步渲染
+// 月份行并回调 isFavorite 画 ☆, 声明放后面会踩 let 的暂时性死区。
+let favorites = [];
 let ws = null;
 let wsGeneration = 0;
 let reconnectTimer = null;
@@ -37,7 +40,9 @@ let retryAttempts = 0;
 const RETRY_DELAY_MS = 5000;
 const RETRY_MAX_ATTEMPTS = 24;
 
-$("symbol").value = symbol;
+// 顶栏的合约名是只读展示: 切换合约只走合约选择器, 展示名由 /api/symbol 解析
+// (主连会解析成当前标的月份合约的中文名), 在页面末尾统一发起。
+$("symbol-name").title = symbol;
 
 // ---------- 足迹图自定义 series (lightweight-charts v5 custom series) ----------
 // 数据项: {time, levels: [[price, buy, sell], ...按价格升序]}
@@ -721,9 +726,216 @@ $("tf").addEventListener("change", (e) => {
   applyPeriod();
   loadHistory();
 });
-$("apply").addEventListener("click", () => {
-  const s = $("symbol").value.trim();
-  if (s) location.search = "?symbol=" + encodeURIComponent(s);
+
+// ---------- 合约选择器: 自研二级级联菜单 ----------
+// 组件在 contract-picker.js(一级品种 + 二级月份, 含搜索/键盘/悬停预取), 纯逻辑在 picker-core.js。
+// 选择结果统一写回 URL 的 symbol 参数, 由页面重载完成切换与重连。
+
+function setPickerHint(text, detail) {
+  const hint = $("picker-hint");
+  hint.textContent = text || "";
+  hint.title = detail || "";
+}
+
+// 合约展示名: 只读, 取不到就回退成合约代码, 不阻塞图表加载。
+async function labelOf(target) {
+  try {
+    const data = await fetchJson(`/api/symbol?symbol=${encodeURIComponent(target)}`);
+    if (symbol === target && data && data.label) $("symbol-name").textContent = data.label;
+  } catch (error) {
+    $("symbol-name").textContent = target;
+  }
+}
+
+function switchSymbol(target) {
+  if (!target || target === symbol) return;
+  // 重载前先给出反馈: 新页面的展示位会自己再解析一次。
+  $("symbol-name").textContent = "加载中…";
+  $("symbol-name").title = target;
+  location.search = "?symbol=" + encodeURIComponent(target);
+}
+
+const picker = ContractPicker.create({
+  root: {
+    wrapper: $("picker"),
+    trigger: $("picker-trigger"),
+    popup: $("picker-popup"),
+    search: $("picker-search"),
+    products: $("picker-products"),
+    months: $("picker-months"),
+  },
+  fetchJson,                       // 与自选面板共用同一个把 4xx 详情带出来的取数函数
+  storage: window.localStorage,
+  onPick: switchSymbol,
+  onStatus: setPickerHint,
+  // 行内 ☆: 菜单里直接加/移出自选, 状态由这里持有的 favorites 决定
+  isFavorite: (target) => favorites.includes(target),
+  onToggleFavorite: (target) => changeFavorite(target, !favorites.includes(target)),
+});
+picker.setSymbol(symbol);
+picker.load();
+
+// ---------- 自选(服务端保存, 面板按需轮询轻量报价) ----------
+// 自选代码存在服务端 data/favorites.json, 所有浏览器共用一份;
+// 名称/最新价/涨跌幅来自 /api/watch(只读报价对象, 不订阅 K 线与 tick)。
+
+const WATCH_POLL_MS = 3000;
+const WATCH_COLLAPSED_KEY = "flowscope.watchCollapsed";
+let watchRows = new Map();          // symbol -> 报价行
+let watchTimer = null;
+let watchPending = false;
+
+function readCollapsed() {
+  try {
+    return localStorage.getItem(WATCH_COLLAPSED_KEY) === "1";
+  } catch (error) {
+    return false;   // 隐私模式下 localStorage 可能不可用, 面板默认展开即可
+  }
+}
+
+function setWatchCollapsed(collapsed) {
+  try {
+    localStorage.setItem(WATCH_COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch (error) { /* 折叠状态记不住不影响使用 */ }
+  $("watchlist").classList.toggle("collapsed", collapsed);
+  $("watch-toggle").textContent = collapsed ? "›" : "‹";
+}
+const watchCollapsed = () => $("watchlist").classList.contains("collapsed");
+
+function setWatchHint(text) {
+  $("watch-hint").textContent = text || "";
+}
+
+async function fetchJson(url, options) {
+  const resp = await fetch(url, options);
+  if (!resp.ok) {
+    let detail = `HTTP ${resp.status}`;
+    try {
+      const body = await resp.json();
+      if (body && body.detail) detail = body.detail;
+    } catch (ignored) { /* 非 JSON 错误响应, 保留 HTTP 码 */ }
+    throw new Error(detail);
+  }
+  return resp.json();
+}
+
+// 主连显示成「品种 · 主力月份」, 与选择器口径一致; 具体月份直接用合约中文名。
+const watchName = FlowData.watchLabel;
+
+function renderWatch() {
+  const list = $("watch-items");
+  list.innerHTML = "";
+  for (const code of favorites) {
+    const row = watchRows.get(code) || { symbol: code, name: code };
+    const item = document.createElement("li");
+    item.classList.toggle("active", code === symbol);
+    // 只有「取过报价但没有数据」或已下市才变暗: 还没轮到第一次轮询的行不该看起来是坏的。
+    item.classList.toggle("dead", row.expired === true || (watchRows.has(code) && row.lastPrice == null));
+
+    const top = document.createElement("div");
+    top.className = "watch-top";
+    const name = document.createElement("span");
+    name.className = "watch-name";
+    name.textContent = watchName(row);
+    name.title = `${code}${row.mainSymbol ? " → " + row.mainSymbol : ""}`;
+    const remove = document.createElement("span");
+    remove.className = "watch-remove";
+    remove.textContent = "×";
+    remove.title = "移出自选";
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      changeFavorite(code, false);
+    });
+    top.append(name, remove);
+
+    const bottom = document.createElement("div");
+    bottom.className = "watch-bottom";
+    const label = document.createElement("span");
+    label.className = "watch-code";
+    label.textContent = code.split("@").pop();
+    label.title = code;
+    const price = document.createElement("span");
+    price.textContent = FlowData.formatPrice(row.lastPrice, row.priceDecs);
+    const change = document.createElement("span");
+    const pct = row.changePct;
+    change.className = "watch-chg " + FlowData.changeClass(pct);
+    change.textContent = FlowData.formatChangePct(pct);
+    bottom.append(label, price, change);
+
+    item.append(top, bottom);
+    item.addEventListener("click", () => switchSymbol(code));
+    list.appendChild(item);
+  }
+  if (!favorites.length) setWatchHint("在「选择合约」菜单里点 ☆ 加入自选");
+}
+
+function scheduleWatch(delay = WATCH_POLL_MS) {
+  clearTimeout(watchTimer);
+  watchTimer = null;
+  if (watchCollapsed() || !favorites.length || document.hidden) return;
+  watchTimer = setTimeout(pollWatch, delay);
+}
+
+async function pollWatch() {
+  watchTimer = null;
+  if (watchPending || watchCollapsed() || !favorites.length || document.hidden) return;
+  watchPending = true;
+  try {
+    const data = await fetchJson(`/api/watch?symbols=${encodeURIComponent(favorites.join(","))}`);
+    if (data.source === "live") {
+      watchRows = new Map((data.quotes || []).map((row) => [row.symbol, row]));
+      setWatchHint("");   // 上一次的失败提示到这里就该消失
+    } else {
+      setWatchHint("行情未就绪" + (data.error ? `（${data.error}）` : ""));
+    }
+  } catch (error) {
+    setWatchHint("报价加载失败：" + error.message);
+  } finally {
+    watchPending = false;
+    renderWatch();
+    scheduleWatch();
+  }
+}
+
+async function changeFavorite(code, wanted) {
+  try {
+    const data = await fetchJson(`/api/favorites?symbol=${encodeURIComponent(code)}`,
+                                 { method: wanted ? "POST" : "DELETE" });
+    favorites = data.symbols || [];
+    if (!wanted) watchRows.delete(code);
+    setWatchHint("");
+    setPickerHint("");                 // 上一次"自选已满"之类的提示到这里就该消失
+    renderWatch();
+    picker.refreshFavorites();         // 菜单里的 ☆ 跟着变
+    scheduleWatch(0);
+  } catch (error) {
+    setWatchHint((wanted ? "收藏失败：" : "移出失败：") + error.message);
+    setPickerHint((wanted ? "收藏失败：" : "移出失败：") + error.message);
+  }
+}
+
+async function loadFavorites() {
+  try {
+    const data = await fetchJson("/api/favorites");
+    favorites = data.symbols || [];
+    renderWatch();
+    picker.refreshFavorites();         // 目录可能比自选先到, 到齐后补画一次
+    if (favorites.length) setWatchHint("");
+    scheduleWatch(0);
+  } catch (error) {
+    setWatchHint("自选加载失败：" + error.message);
+  }
+}
+
+setWatchCollapsed(readCollapsed());
+$("watch-toggle").addEventListener("click", () => {
+  setWatchCollapsed(!watchCollapsed());
+  scheduleWatch(0);
+});
+// 页面切到后台就不再轮询, 回来立刻补一次。
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) clearTimeout(watchTimer);
+  else scheduleWatch(0);
 });
 
 // ---------- 足迹图视图切换与数据 ----------
@@ -956,3 +1168,5 @@ function connectWs() {
 }
 
 loadHistory();
+loadFavorites();  // 自选独立: 面板先列出代码, 报价随轮询补齐(合约目录在 picker.load() 里自己拉)
+labelOf(symbol);  // 顶栏合约名: 与图表加载并行, 拿不到就显示代码

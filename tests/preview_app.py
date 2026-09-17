@@ -16,7 +16,73 @@ import pandas as pd
 import uvicorn
 
 import app as server
+import catalog
 import ingest
+
+
+class CatalogApi:
+    """离线预览的合约目录: 用内置常用品种伪造合约服务, 不连 TqSdk。"""
+
+    def __init__(self):
+        self.products = {catalog.cont_symbol(exchange, product): (exchange, product, name)
+                         for exchange, product, name in catalog.FALLBACK_PRODUCTS}
+        self.names = {(exchange, product): name
+                      for exchange, product, name in catalog.FALLBACK_PRODUCTS}
+
+    def _month_name(self, symbol):
+        exchange_id, _, rest = symbol.partition(".")
+        product = rest.rstrip("0123456789")
+        return f"{self.names.get((exchange_id, product), product)}{rest[len(product):]}"
+
+    def _fake_open_interest(self, symbol):
+        """假持仓量: 各品种量级不同、近月最大, 让预览的排序看起来合理(数值无含义)。"""
+        exchange_id, _, rest = symbol.partition(".")
+        product = rest.rstrip("0123456789")
+        digits = rest[len(product):]
+        base = sum(ord(char) for char in f"{exchange_id}.{product}") % 300 * 1000 + 20000
+        month = int(digits) if digits.isdigit() else 2611
+        return max(1000, base - abs(month - 2611) * 700)
+
+    def query_quotes(self, ins_class=None, exchange_id=None, product_id=None, expired=None):
+        if ins_class == "CONT":
+            return list(self.products)
+        if exchange_id and product_id:
+            return [f"{exchange_id}.{product_id}{month}" for month in ("2610", "2611", "2701")]
+        return []
+
+    def query_symbol_info(self, symbols):
+        rows = []
+        for symbol in symbols:
+            known = self.products.get(symbol)
+            rows.append({
+                "instrument_id": symbol,
+                "instrument_name": f"{known[2]}主连" if known else self._month_name(symbol),
+                "underlying_symbol": f"{known[0]}.{known[1]}2611" if known else "",
+                "pre_open_interest": self._fake_open_interest(symbol),
+            })
+        return pd.DataFrame(rows)
+
+    def get_quote(self, symbol):
+        """预览报价: 主周期订阅只需要 price_tick, 自选面板还要看得出涨跌。"""
+        seed = sum(ord(char) for char in symbol)
+        known = self.products.get(symbol)
+        price = 1000 + seed % 4000
+        base = price - (seed % 21 - 10) * 5
+        return SimpleNamespace(
+            price_tick=1.0,
+            instrument_name=f"{known[2]}主连" if known else self._month_name(symbol),
+            ins_class="CONT" if known else "FUTURE",
+            underlying_symbol=f"{known[0]}.{known[1]}2611" if known else "",
+            last_price=float(price),
+            pre_settlement=float(base),
+            pre_close=float(base),
+            open_interest=float((seed % 90 + 10) * 1000),
+            price_decs=0,
+            expired=False,
+        )
+
+    def wait_update(self, deadline=None):
+        return True
 
 
 def tick_rows(first, count):
@@ -37,9 +103,15 @@ def kline_rows(ticks, seconds=30):
 
 
 class PreviewManager(ingest.FeedManager):
+    def __init__(self):
+        super().__init__()
+        # 合约目录查询也走采集线程, 这里用假合约服务作答, 保持预览完全离线。
+        self.catalog_api = CatalogApi()
+
     def _run(self):
         self._set_status("connected")
         while not self._stop.is_set():
+            self._run_jobs(self.catalog_api)
             with self._lock:
                 feeds = list(self.feeds.values())
                 clients = list(self.clients.values())
@@ -91,6 +163,9 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="flowscope-preview-") as directory:
         ingest.DATA_DIR = directory
         server.manager = PreviewManager()
+        # 预置几个自选, 打开页面就能看到面板(写在临时数据目录里, 不碰真实自选)。
+        for symbol in ("KQ.m@SHFE.fu", "KQ.m@DCE.i", "KQ.m@CZCE.TA"):
+            server.favorites.add(symbol)
         runner = uvicorn.Server(uvicorn.Config(server.app, host="127.0.0.1", port=8765, log_level="warning"))
         if args.duration:
             timer = threading.Timer(args.duration, lambda: setattr(runner, "should_exit", True))

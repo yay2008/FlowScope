@@ -7,20 +7,31 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import os
 import time
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
+import ingest
+from catalog import CatalogService
+from favorites import FavoriteStore, FavoritesService, MAX_FAVORITES
 from indicator import CFG, DEFAULT_TF_SEC, ltf_options
 from ingest import FeedManager, period_cfg, validate_symbol, validate_tf
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "KQ.m@SHFE.fu"
+FAVORITES_FILE = "favorites.json"
 
 app = FastAPI(title="FlowScope")
 manager = FeedManager()
+# 用 provider 而不是 manager 实例: 测试与离线预览会替换 app.manager,
+# 目录缓存和自选报价必须跟着当前实例走。
+catalog = CatalogService(lambda: manager)
+# 自选文件落在数据目录里(DATA_DIR 在调用时现取, 便于测试/预览替换)。
+favorites = FavoritesService(lambda: manager,
+                             FavoriteStore(lambda: os.path.join(ingest.DATA_DIR, FAVORITES_FILE)))
 
 
 def require_feed(symbol: str, tf: int):
@@ -86,6 +97,78 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_
 def status():
     """返回行情采集线程状态，便于前端和运维判断 pending 原因。"""
     return manager.status_snapshot()
+
+
+@app.get("/api/symbols")
+async def symbols(exchange: str | None = None, product: str | None = None, refresh: bool = False):
+    """合约选择器的数据源: 品种(主连)目录, 以及指定品种的月份合约。
+
+    - 不带参数: 按交易所分组的全部主连品种, 组内按主力合约持仓量降序, 附当前主力合约代码。
+    - 带 exchange + product: 额外返回该品种未下市月份合约(持仓量降序, 标出主力)。
+    - 查询在采集线程里发给 TqSdk 合约服务并缓存; 行情源不可用时回退到内置常用品种表
+      (`source="fallback"`), 月份列表为空, 页面仍能选到常用主力。
+    """
+    try:
+        return await catalog.payload(exchange=exchange, product=product, refresh=refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/symbol")
+async def symbol_label(symbol: str = DEFAULT_SYMBOL):
+    """顶栏只读展示用的合约名(中文名); 取不到时回退成合约代码。"""
+    try:
+        return await catalog.symbol_label(symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/favorites")
+def favorites_list():
+    """自选合约代码列表(服务端保存, 顺序即面板显示顺序)。"""
+    return {"symbols": favorites.symbols(), "max": MAX_FAVORITES}
+
+
+@app.post("/api/favorites")
+def favorites_add(symbol: str):
+    """收藏一个合约; 幂等, 重复收藏不改变顺序。"""
+    return _favorite_change(favorites.add, symbol)
+
+
+@app.delete("/api/favorites")
+def favorites_remove(symbol: str):
+    """取消收藏。"""
+    return _favorite_change(favorites.remove, symbol)
+
+
+def _favorite_change(action, symbol: str):
+    try:
+        return {"symbols": action(symbol), "max": MAX_FAVORITES}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/watch")
+async def watch(symbols: str = "", refresh: bool = False):
+    """自选面板用的轻量报价快照(最新价/涨跌幅/持仓量), `symbols` 用逗号分隔。
+
+    只读报价对象, 不订阅 K 线与 tick; 行情源不可用时返回空报价 + error,
+    面板仍然列出代码并能点击切换。
+    """
+    wanted = []
+    for item in symbols.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            value = validate_symbol(value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if value not in wanted:
+            wanted.append(value)
+    if len(wanted) > MAX_FAVORITES:
+        raise HTTPException(status_code=400, detail=f"一次最多查询 {MAX_FAVORITES} 个合约")
+    return await favorites.watch(wanted, refresh=refresh)
 
 
 @app.get("/api/footprint")
@@ -178,4 +261,6 @@ async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, f
         manager.remove_client(q)
 
 
+# Windows 注册表可能把 SVG 识别为 image/svg，浏览器需要标准 MIME 类型。
+mimetypes.add_type("image/svg+xml", ".svg")
 app.mount("/", StaticFiles(directory=os.path.join(BASE_DIR, "static"), html=True))

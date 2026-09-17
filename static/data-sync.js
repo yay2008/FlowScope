@@ -32,7 +32,55 @@
     }
     return 0;
   }
-  const api = { mergeBars, diagonalVolumes, cvdCandle, splitLtf, relativeLevel };
+  // 合约选择器的联动依据: KQ.m@SHFE.fu 是主力(主连), SHFE.fu2611 是该品种的具体月份。
+  // 指数(KQ.i@...)、外盘等认不出来的代码返回 null, 由调用方退化成「自定义」。
+  function parseSymbolParts(raw) {
+    const cont = /^KQ\.m@([A-Za-z]+)\.([A-Za-z0-9]+)$/.exec(raw || "");
+    if (cont) return { exchange: cont[1].toUpperCase(), product: cont[2], isCont: true };
+    const month = /^([A-Za-z]+)\.([A-Za-z]+)\d{0,4}$/.exec(raw || "");
+    if (month) return { exchange: month[1].toUpperCase(), product: month[2], isCont: false };
+    return null;
+  }
+  function formatOpenInterest(value) {
+    const n = Number(value) || 0;
+    if (n >= 1e8) return (n / 1e8).toFixed(2) + "亿";
+    if (n >= 1e4) return (n / 1e4).toFixed(1) + "万";
+    return String(Math.round(n));
+  }
+  // 自选面板的一行: 主连写成「品种 · 主力月份」, 具体月份直接用合约中文名。
+  function watchLabel(row) {
+    const name = (row && (row.name || row.symbol)) || "";
+    if (!row || row.insClass !== "CONT") return name;
+    const base = name.replace(/主连$/, "");
+    const month = String(row.mainSymbol || "").split(".")[1];
+    return month ? `${base} · ${month}` : base || name;
+  }
+  function formatPrice(value, decimals) {
+    if (value == null) return "—";
+    return Number(value).toFixed(Number(decimals) || 0);
+  }
+  function formatChangePct(pct) {
+    if (pct == null) return "";
+    return `${pct > 0 ? "+" : ""}${Number(pct).toFixed(2)}%`;
+  }
+  function changeClass(pct) {
+    if (pct == null || pct === 0) return "";
+    return pct > 0 ? "up" : "down";
+  }
+  // 合约选择器的一行: 品种写成「燃油 · fu2611」(带当前主力月份), 月份写成「燃油2611 · 昨仓 42.8万」。
+  function productLabel(product) {
+    const name = (product && (product.name || product.productId)) || "";
+    const month = String((product && product.mainSymbol) || "").split(".")[1] || "";
+    return month ? `${name} · ${month}` : name;
+  }
+  function monthLabel(option) {
+    const name = (option && (option.name || option.symbol)) || "";
+    if (!option || option.openInterest == null) return name;
+    return `${name} · 昨仓 ${formatOpenInterest(option.openInterest)}`;
+  }
+  const api = { mergeBars, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
+                parseSymbolParts, formatOpenInterest, watchLabel, formatPrice,
+                formatChangePct, changeClass, productLabel, monthLabel };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.FlowData = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -1,7 +1,10 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeBars, diagonalVolumes, cvdCandle, splitLtf, relativeLevel } = require("../static/data-sync.js");
+const { mergeBars, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
+        parseSymbolParts, formatOpenInterest, watchLabel, formatPrice,
+        formatChangePct, changeClass, productLabel, monthLabel } =
+  require("../static/data-sync.js");
 
 test("CVD source selects ticks independently of remembered candle granularity", () => {
   for (const seconds of [1, 5, 10, 15, 30]) {
@@ -49,4 +52,55 @@ test("FlowMeter renders an isolated valid CVD bar without a preceding bar", () =
   assert.deepEqual(cvdCandle({time: 60, cvd: -3, delta: -8, cvdOpen: 5}),
     {time: 60, open: 5, high: 5, low: -3, close: -3});
   assert.equal(cvdCandle({time: 90, cvd: null, delta: null}), null);
+});
+
+test("contract picker maps main-continuous and month symbols to the same variety", () => {
+  assert.deepEqual(parseSymbolParts("KQ.m@SHFE.fu"), {exchange: "SHFE", product: "fu", isCont: true});
+  assert.deepEqual(parseSymbolParts("KQ.m@dce.i"), {exchange: "DCE", product: "i", isCont: true});
+  assert.deepEqual(parseSymbolParts("SHFE.fu2611"), {exchange: "SHFE", product: "fu", isCont: false});
+  assert.deepEqual(parseSymbolParts("CZCE.TA701"), {exchange: "CZCE", product: "TA", isCont: false});
+});
+
+test("unrecognised symbols fall back to the custom contract entry", () => {
+  for (const raw of ["KQ.i@SHFE.fu", "KQ.m@SHFE", "SHFE.fu2611x", "", null, undefined, "fu"]) {
+    assert.equal(parseSymbolParts(raw), null);
+  }
+});
+
+test("open interest is abbreviated for the month dropdown", () => {
+  assert.equal(formatOpenInterest(211240), "21.1万");
+  assert.equal(formatOpenInterest(3489), "3489");
+  assert.equal(formatOpenInterest(150000000), "1.50亿");
+  assert.equal(formatOpenInterest(null), "0");
+});
+
+test("watchlist rows label main-continuous contracts with their main month", () => {
+  assert.equal(watchLabel({name: "燃油主连", insClass: "CONT", mainSymbol: "SHFE.fu2611"}), "燃油 · fu2611");
+  assert.equal(watchLabel({name: "燃油主连", insClass: "CONT", mainSymbol: ""}), "燃油");
+  assert.equal(watchLabel({name: "燃油2611", insClass: "FUTURE"}), "燃油2611");
+  assert.equal(watchLabel({symbol: "KQ.m@SHFE.fu"}), "KQ.m@SHFE.fu");
+  assert.equal(watchLabel(null), "");
+});
+
+test("watchlist price and change formatting keeps a placeholder for missing data", () => {
+  assert.equal(formatPrice(4412, 0), "4412");
+  assert.equal(formatPrice(712.25, 2), "712.25");
+  assert.equal(formatPrice(null, 1), "—");
+  assert.equal(formatChangePct(1.234), "+1.23%");
+  assert.equal(formatChangePct(-1.8), "-1.80%");
+  assert.equal(formatChangePct(0), "0.00%");
+  assert.equal(formatChangePct(null), "");
+  assert.equal(changeClass(2), "up");
+  assert.equal(changeClass(-2), "down");
+  assert.equal(changeClass(0), "");
+  assert.equal(changeClass(null), "");
+});
+
+test("contract picker labels show the main month and yesterday's open interest", () => {
+  assert.equal(productLabel({name: "燃油", mainSymbol: "SHFE.fu2611"}), "燃油 · fu2611");
+  assert.equal(productLabel({name: "燃油", mainSymbol: ""}), "燃油");
+  assert.equal(productLabel({productId: "fu"}), "fu");
+  assert.equal(monthLabel({name: "燃油2611", openInterest: 428100}), "燃油2611 · 昨仓 42.8万");
+  assert.equal(monthLabel({name: "燃油2611", openInterest: null}), "燃油2611");
+  assert.equal(monthLabel({symbol: "SHFE.fu2611"}), "SHFE.fu2611");
 });

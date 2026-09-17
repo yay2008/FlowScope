@@ -2,6 +2,8 @@
 import asyncio
 import os
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -9,6 +11,7 @@ from unittest.mock import Mock, patch
 import ingest
 from test_data import ticks
 from test_period import Clock, klines
+from tqsdk import TqTimeoutError
 
 
 class ScriptedApi:
@@ -41,6 +44,10 @@ class ScriptedApi:
 
     def is_changing(self, *args):
         return False
+
+    def query_quotes(self, ins_class=None, expired=None, **kwargs):
+        """连接自检会用到; 返回一个合约即表示"连接还能收发"。"""
+        return ["KQ.m@SHFE.fu"] if ins_class == "CONT" else []
 
     def wait_update(self, **kwargs):
         try:
@@ -266,6 +273,162 @@ class FeedLifecycleTests(unittest.TestCase):
         self.clock.advance(ingest.IDLE_EVICT_SEC + 1)
         self.manager.ensure("SHFE.overflow")
         self.assertEqual(len(self.manager.feeds), 1)
+
+
+class JobQueueTests(unittest.TestCase):
+    """一次性 SDK 查询(合约目录)走采集线程执行, 失败不能拖垮采集循环。"""
+
+    def setUp(self):
+        self.manager = ingest.FeedManager()
+
+    def test_job_runs_and_returns_its_result(self):
+        self.manager.status = "connected"
+        future = self.manager.submit_job(lambda api: f"from {api}")
+        self.manager._run_jobs("ingest")
+        self.assertEqual(future.result(), "from ingest")
+
+    def test_job_is_rejected_while_the_ingest_thread_is_down(self):
+        self.manager.status = "error"
+        with self.assertRaises(RuntimeError):
+            self.manager.submit_job(lambda api: None)
+
+    def test_failing_job_only_fails_itself(self):
+        self.manager.status = "connected"
+        def boom(api):
+            raise OSError("合约服务不可用")
+        broken = self.manager.submit_job(boom)
+        healthy = self.manager.submit_job(lambda api: "ok")
+        self.manager._run_jobs("ingest")
+        self.assertIsInstance(broken.exception(), OSError)
+        self.assertEqual(healthy.result(), "ok")
+
+    def test_cancelled_job_is_not_executed(self):
+        self.manager.status = "connected"
+        calls = []
+        future = self.manager.submit_job(lambda api: calls.append(api))
+        future.cancel()
+        self.manager._run_jobs("ingest")
+        self.assertEqual(calls, [])
+
+    def test_disconnect_settles_pending_jobs_instead_of_leaving_waiters(self):
+        self.manager.status = "connected"
+        future = self.manager.submit_job(lambda api: None)
+        self.manager.fail_pending_jobs("行情连接已重建")
+        self.assertIsInstance(future.exception(), RuntimeError)
+        self.manager.stop()   # 覆盖线程未启动时的停止路径
+
+    def test_async_query_returns_the_result_from_the_ingest_thread(self):
+        self.manager.status = "connected"
+        worker = threading.Thread(target=lambda: (time.sleep(0.05), self.manager._run_jobs("api")))
+        worker.start()
+        try:
+            result = asyncio.run(self.manager.query(lambda api: f"from {api}", timeout=5))
+        finally:
+            worker.join()
+        self.assertEqual(result, "from api")
+
+    def test_async_query_times_out_and_the_job_never_runs(self):
+        self.manager.status = "connected"
+        ran = []
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(self.manager.query(lambda api: ran.append(api), timeout=0.05))
+        self.assertIn("超时", str(caught.exception))
+        self.manager._run_jobs("api")   # 采集线程迟到时只看到已取消的任务
+        self.assertEqual(ran, [])
+
+    def test_async_query_fails_fast_when_the_thread_is_down(self):
+        self.manager.status = "error"
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self.manager.query(lambda api: None, timeout=5))
+
+    def test_busy_seconds_track_the_running_job(self):
+        self.manager.status = "connected"
+        self.assertIsNone(self.manager.status_snapshot()["busySec"])
+        running = threading.Event()
+        release = threading.Event()
+
+        def slow(api):
+            running.set()
+            release.wait(2)
+            return "done"
+
+        worker = threading.Thread(target=lambda: self.manager._run_jobs("api"))
+        future = self.manager.submit_job(slow)
+        worker.start()
+        try:
+            self.assertTrue(running.wait(2))
+            self.assertIsNotNone(self.manager.status_snapshot()["busySec"])
+        finally:
+            release.set()
+            worker.join()
+        self.assertEqual(future.result(), "done")
+        self.assertIsNone(self.manager.status_snapshot()["busySec"])
+        self.assertEqual(self.manager.status_snapshot()["jobQueue"], 0)
+
+    def test_submit_job_fails_fast_while_a_call_is_stuck(self):
+        """连接卡死时不能让每个 HTTP 请求都各等 12 秒。"""
+        self.manager.status = "connected"
+        self.manager._busy_since = time.monotonic() - ingest.JOB_STALL_SEC - 1
+        with self.assertRaises(RuntimeError) as caught:
+            self.manager.submit_job(lambda api: None)
+        self.assertIn("行情连接无响应", str(caught.exception))
+        self.manager._busy_since = None
+
+    def test_a_query_that_hits_the_sdk_timeout_asks_for_a_rebuild(self):
+        """正常合约查询是 0.1 秒级; 慢到 sdk 的 30 秒上限就说明这条连接已经不可用了。"""
+        self.manager.status = "connected"
+        with patch.object(ingest, "JOB_REBUILD_SEC", 0.05):
+            future = self.manager.submit_job(lambda api: (time.sleep(0.08), "done")[1])
+            self.manager._run_jobs("api")
+        self.assertEqual(future.result(), "done")
+        self.assertTrue(self.manager._rebuild_api.is_set())
+        self.assertIsNone(self.manager.status_snapshot()["busySec"])
+
+    def test_fast_jobs_do_not_ask_for_a_rebuild(self):
+        self.manager.status = "connected"
+        future = self.manager.submit_job(lambda api: "done")
+        self.manager._run_jobs("api")
+        self.assertEqual(future.result(), "done")
+        self.assertFalse(self.manager._rebuild_api.is_set())
+
+
+class ProbeTests(unittest.TestCase):
+    """闭市没有行情流时靠主动自检发现"连接被静默掐断"。"""
+
+    def setUp(self):
+        self.manager = ingest.FeedManager()
+
+    def test_probe_is_due_only_after_the_market_has_been_quiet(self):
+        now = time.monotonic()
+        self.manager._last_data_at = now
+        self.manager.last_probe_at = 0.0
+        self.assertFalse(self.manager._probe_due(now))
+        self.assertTrue(self.manager._probe_due(now + ingest.PROBE_INTERVAL_SEC + 1))
+        # 行情在流动时, 即使上次自检很久以前也不必再探
+        self.manager._last_data_at = now
+        self.manager.last_probe_at = now - 10 * ingest.PROBE_INTERVAL_SEC
+        self.assertFalse(self.manager._probe_due(now + 1))
+
+    def test_successful_probe_clears_the_error_and_marks_the_time(self):
+        api = Mock()
+        api.query_quotes.return_value = ["KQ.m@SHFE.fu"]
+        self.assertTrue(self.manager._run_probe(api))
+        self.assertIsNone(self.manager.probe_error)
+        self.assertGreater(self.manager.last_probe_at, 0)
+        self.assertIsNone(self.manager.status_snapshot()["busySec"])
+        self.assertIsNotNone(self.manager.status_snapshot()["lastProbeSec"])
+
+    def test_failed_probe_reports_the_reason_for_a_rebuild(self):
+        api = Mock()
+        api.query_quotes.side_effect = TqTimeoutError("获取合约信息超时")
+        self.assertFalse(self.manager._run_probe(api))
+        self.assertIn("TqTimeoutError", self.manager.probe_error)
+        self.assertEqual(self.manager.status_snapshot()["probeError"], self.manager.probe_error)
+        self.assertIsNone(self.manager.status_snapshot()["busySec"])
+
+    def test_status_reports_quiet_time_for_diagnosis(self):
+        self.manager._last_data_at = time.monotonic() - 123
+        self.assertGreaterEqual(self.manager.status_snapshot()["quietSec"], 120)
 
 
 if __name__ == "__main__":
