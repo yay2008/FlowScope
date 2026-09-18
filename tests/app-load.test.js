@@ -244,3 +244,46 @@ test("顶栏只保留只读展示 : 手填输入框、切换按钮、收藏按�
   assert.ok(!app.includes('$("star")'), "app.js 不应再绑定工具栏收藏按钮");
   assert.match(app, /labelOf\(/, "app.js 应通过 /api/symbol 解析展示名");
 });
+
+test("判向算法开关已移除 : 前端恒读新算法 Lee-Ready", () => {
+  const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
+  assert.ok(!html.includes('id="classify"'), "判向算法下拉框应已移除");
+  const app = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
+  assert.ok(!app.includes('$("classify")'), "app.js 不应再绑定判向算法下拉框");
+  assert.ok(!/classifySource/.test(app), "app.js 不应再保留判向口径状态");
+  // 对照列仍要显示: 删除开关不等于删掉旧算法的观测能力。
+  assert.match(app, /b\.buyLegacy/, "十字光标提示仍应并列显示旧算法买量");
+  assert.match(app, /b\.sellLegacy/, "十字光标提示仍应并列显示旧算法卖量");
+});
+
+test("工具栏默认值与 app.js 初始状态一致", () => {
+  const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
+  const app = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
+  // 下拉框的默认选项写在两处: index.html 的 selected 和 app.js 的初始状态。
+  // 只改一处就会出现"页面显示 A、实际按 B 渲染", 这里把两处钉在一起。
+  const table = [
+    ["tf", /let tf = (\d+)/],
+    ["view", /let view = "([^"]+)"/],
+    ["mode", /let mode = "([^"]+)"/],
+    ["threshtype", /let threshtype = "([^"]+)"/],
+    ["cvd-source", /let cvdSource = "([^"]+)"/],
+    ["ltf", /let klineLtf = (\d+)/],
+  ];
+  for (const [id, pattern] of table) {
+    const htmlDefault = html.match(
+      new RegExp(`id="${id}"[\\s\\S]*?<option value="([^"]+)"[^>]*\\bselected\\b`));
+    assert.ok(htmlDefault, `index.html 的 #${id} 应标出默认选项`);
+    const jsDefault = app.match(pattern);
+    assert.ok(jsDefault, `app.js 应声明 #${id} 对应的初始状态`);
+    assert.equal(htmlDefault[1], jsDefault[1], `#${id} 的 HTML 默认值与 app.js 初始状态不一致`);
+  }
+});
+
+test("阈值默认是 Z-SCORE", () => {
+  const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
+  assert.match(html,
+    /id="threshtype"[\s\S]*?<option value="Z-SCORE"[^>]*\bselected\b/,
+    "阈值下拉框默认应选中 Z-SCORE");
+  const app = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
+  assert.match(app, /let threshtype = "Z-SCORE"/, "app.js 的阈值初始状态应为 Z-SCORE");
+});

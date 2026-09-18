@@ -11,14 +11,13 @@ let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy,
 let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
 let derived = null;   // 派生数组(rolling sma/zscore 等)
 let mode = "cvd";
-let threshtype = "RELATIVE";
+let threshtype = "Z-SCORE";   // 默认 Z-SCORE, 必须与 index.html 里 <select id="threshtype"> 的 selected 选项一致
 let cvdSource = "tick";
 let klineLtf = 10;    // 切回 K线口径时保留上次选择，默认同 Pine 的 10S。
 let ltf = 0;         // 协议：0=tick，正数=实际小周期 K线。
 let tf = 30;         // 主图周期(秒), 10 或 30; 后端按 (symbol, tf) 独立订阅与落盘
 // 各主周期下合法的拆分粒度; 与后端 indicator.ltf_options 同源, 首次拿到 cfg 后以 cfg 为准
 const LTF_BY_TF = { 10: [1, 5, 10], 30: [1, 5, 10, 15, 30] };
-let classifySource = "lr";   // 判向算法: lr=新算法(Lee-Ready), legacy=旧算法(对照)
 let view = "candle";  // 主图视图: candle=K线, footprint=足迹图
 let fpBars = [];      // 足迹 bar: {time, levels: [[price, buy, sell], ...按价格升序]}
 let fpBarSpacing = null;   // 进足迹模式前的 barSpacing, 退出时恢复
@@ -410,12 +409,14 @@ function deriveLw() {
   return { wave, wt2, crvSlope };
 }
 
-// ---------- 判向算法对照 ----------
+// ---------- 判向口径 ----------
 // 后端对同一根 bar 并列输出两套量: buy/sell/unknown 是新算法(Lee-Ready),
-// buyLegacy/sellLegacy 是旧算法。这里只切换"读哪一套", CVD 恒按新算法累计。
-const buyOf = (b) => (classifySource === "legacy" ? b.buyLegacy : b.buy) ?? null;
-const sellOf = (b) => (classifySource === "legacy" ? b.sellLegacy : b.sell) ?? null;
-const deltaOf = (b) => (classifySource === "legacy" ? b.deltaLegacy : b.delta) ?? null;
+// buyLegacy/sellLegacy 是旧算法。前端一律读新算法: 旧算法(快照自身盘口)与当根 K 线
+// 方向一致率只有 ~33%(系统性反向, 见 docs/indicator-accuracy-2026-09-16-addendum.md),
+// 所以工具栏的"判向算法"开关已移除。CVD 本来就恒按新算法累计。
+const buyOf = (b) => b.buy ?? null;
+const sellOf = (b) => b.sell ?? null;
+const deltaOf = (b) => b.delta ?? null;
 
 function derive() {
   const n = bars.length;
@@ -682,11 +683,6 @@ chart.subscribeCrosshairMove((param) => {
 
 $("mode").addEventListener("change", (e) => { mode = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
 $("threshtype").addEventListener("change", (e) => { threshtype = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
-$("classify").addEventListener("change", (e) => {
-  classifySource = e.target.value;
-  renderAll();       // 买卖量参与阈值/均线派生, 换口径要整体重算
-  updateLegend(bars.length - 1);
-});
 function updateSplitSelection() {
   ltf = FlowData.splitLtf(cvdSource, klineLtf);
   $("ltf").disabled = cvdSource === "tick";

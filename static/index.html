@@ -52,7 +52,7 @@
     <select id="threshtype">
       <option value="RELATIVE">RELATIVE</option>
       <option value="SMA">SMA</option>
-      <option value="Z-SCORE">Z-SCORE</option>
+      <option value="Z-SCORE" selected>Z-SCORE</option>
     </select>
   </label>
   <label>CVD口径
@@ -68,12 +68,6 @@
       <option value="10" selected>10s</option>
       <option value="15">15s</option>
       <option value="30">30s(粗略)</option>
-    </select>
-  </label>
-  <label>判向算法
-    <select id="classify" title="新算法按 Lee-Ready 三级判定：比前一盘口 → 价差内比中点 → 逐笔同价沿用；三条都用不上才记“未知”。旧算法为原快照自身盘口口径。两者对同一根 bar 并列记录，可随时切换对照。CVD 恒按新算法累计。">
-      <option value="lr" selected>新算法 Lee-Ready</option>
-      <option value="legacy">旧算法(对照)</option>
     </select>
   </label>
   <span id="status" class="off">连接中…</span>

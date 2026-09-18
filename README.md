@@ -40,9 +40,9 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（主图周期 10s /
 - 拆分粒度随主周期收敛，必须**整除**主周期且不比它更粗：30s 下为 1/5/10/15/30，10s 下只剩 1/5/10（15、30 在前端被禁用）。当前选择若变得非法会自动回落到该周期下最粗的合法粒度。
 - 工具栏「CVD口径」提供两种选择，也同步影响 Delta 与买卖量。默认「TqSdk tick口径」（`ltf=0`），使用 tick 快照盘口**估算**主动方向，此时禁用拆分粒度。快照区间成交量不能还原区间内逐笔成交的方向和价格。
 - tick 口径的主动方向按 **Lee-Ready 三级判定**：① 报价规则——成交价 ≥ **前一** tick 的卖一记买，≤ 前一 tick 的买一记卖（必须用前一档：快照盘口是成交后的最新挂单，一笔吃掉卖一后买一会随即上移，拿自己的盘口比会把主动买判成主动卖）；② 中点规则——价格落在价差内部时，高于中点记买、低于中点记卖；③ 逐笔规则——价格高于上一成交价记买、低于记卖，同价成交（zero tick）沿用已确定方向。三条都用不上才记**未知**，单独成桶，不猜也不沿用。判向状态只在有成交的快照上推进，无成交的报价更新不加量也不改写沿用方向；跨交易日（累计量清零）或快照间隔超过 60 秒的断档会重置状态。完整 Lee-Ready 下未知量天然很少，它兜住的是"毫无判据"的残差。
-- 工具栏「判向算法」可在**新算法 Lee-Ready** 与**旧算法（原快照自身盘口口径）**之间切换。两套结果对同一根 bar 并列记录（`buy/sell/unknown` 与 `buyLegacy/sellLegacy`），切换只改变读数，不需要重算行情。整段窗口的成交总量在三个桶之间守恒：`buy + sell + unknown == observed`。CVD 恒按新算法累计，不随该开关变化。
+- **前端恒读新算法 Lee-Ready**：工具栏原有的「判向算法」开关已移除，不再提供切到旧算法的入口。旧算法（原快照自身盘口口径）结果仍与主列并列落盘，字段是 `buyLegacy/sellLegacy`（另见 `deltaLegacy`），仅供离线对照（`evaluate_indicators.py`）与十字光标提示；旧算法与当根 K 线方向一致率只有约 33%（系统性反向，见 `docs/indicator-accuracy-2026-09-16-addendum.md`），保留开关只会带来误判风险。整段窗口的成交总量在三个桶之间守恒：`buy + sell + unknown == observed`。CVD 恒按新算法累计，与对照列无关。
 - 「TV K线口径」直接订阅 TqSdk 小周期 K 线，按 `close > open` 把该根成交量计为买量，`close < open` 计为卖量，十字线不计入买卖量，再汇总到 30 秒。拆分粒度支持 1s、5s、10s、15s、30s，默认 10s，切回时记住本次页面使用的粒度。该口径没有 tick 判向，未知恒为 0，对照列与主列同值。两种口径的数据源均为 TqSdk；TV 表示 Pine 的计算方法，数据源与累计起点仍可能导致结果与 TradingView 不同（实测差异量与根因见下文《与 TradingView 的差异》）。
-- CVD/Delta 的 RELATIVE 颜色阈值对齐 Pine：正负 Delta 分别除以各自的 20 根均值，严格大于 `[1.5, 2.5, 3.5] × 1.5` 才进入相应等级。
+- 工具栏「阈值」决定成交量与 Delta 的等级分档口径（RELATIVE / SMA / Z-SCORE），默认 **Z-SCORE**（窗口 `zlen=50`，三种口径的档位倍数都取 `cfg.mult`）。CVD/Delta 的 RELATIVE 颜色阈值对齐 Pine：正负 Delta 分别除以各自的 20 根均值，严格大于 `[1.5, 2.5, 3.5] × 1.5` 才进入相应等级。
 - 工具栏「视图」可切换到足迹图（固定 ltf=0 口径）。按原始成交价聚合，价格步长来自合约 `price_tick`；元数据未知时不推断步长，也不显示对角不平衡。稀疏成交档位只与相隔一个实际 tick 的价位比较。每档为 `[价格, 买量, 卖量, 未知量]`，判不出方向的那部分量以中性紫整条压在格子底部，只参与档位总量、不计入左卖右买。
 - 每根 bar 带 `coverage`：`complete` 表示 tick 有前置快照或小周期 K 线根数齐全，且区间量与主周期成交量一致；`partial` 为部分覆盖或数据尚未对齐；`missing` 为无数据；`legacy` 为旧格式历史回填。“完整”指覆盖范围，方向和分价成交量仍是估算。
 - tick 历史写入 `data/{symbol}_{tf}s_ltf0_v3.csv`，K 线口径写入 `data/{symbol}_{tf}s_kline_ltf{ltf}_v3.csv`（`tf` 为主周期秒数），各周期、各口径、各粒度独立；K 线口径不读取旧版本由 tick 拼接小周期的缓存。只保存已完成、覆盖完整的 bar。窗口滚动后的部分数据不会覆盖已确认的完整记录；同一时间的修订追加到文件，重启读取最后一条。**`tf=30` 时文件名与历史完全一致**（`{symbol}_30s_...`），既有 30s 历史无缝沿用；10s 是全新文件，不与 30s 混流。
@@ -106,7 +106,7 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（主图周期 10s /
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-node --test tests/data-sync.test.js tests/load-history.test.js tests/picker-core.test.js tests/contract-picker.test.js
+node --test tests/app-load.test.js tests/data-sync.test.js tests/load-history.test.js tests/picker-core.test.js tests/contract-picker.test.js
 node --check static/app.js
 ```
 
