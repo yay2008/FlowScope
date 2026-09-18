@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from indicator import BAR_NS, build_bars, build_bars_from_ltf, build_footprint, _classify_ticks
-from history_store import HistoryStore, _row_line
+from history_store import HEADER, HistoryStore, _row_line
 
 
 BASE = 1_800_000_000_000_000_000
@@ -172,7 +172,7 @@ class DataTests(unittest.TestCase):
                              ["partial", "complete", "complete"])
 
     def test_legacy_v3_file_without_source_column_reads_as_complete(self):
-        """既有文件没有 source 列时按 complete 读, 迁移不需要转换脚本。"""
+        """既有文件没有 source 列时按 complete 读; 表头在加载时被补齐到当前格式。"""
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "v3.csv"
             path.write_text("time,buy,sell,unknown,buyLegacy,sellLegacy\n"
@@ -182,6 +182,62 @@ class DataTests(unittest.TestCase):
             self.assertEqual(store.estimates, {})
             self.assertEqual(store.extra[1000], {"unknown": 0.0, "buyLegacy": 9.0,
                                                  "sellLegacy": 5.0})
+            self.assertEqual(path.read_text().splitlines()[0], ",".join(HEADER))
+
+    def test_legacy_header_file_is_upgraded_before_appending(self):
+        """旧表头文件被追加新格式行之前先补齐, 否则字段数不一致会让整表读失败。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            path.write_text("time,buy,sell,unknown,buyLegacy,sellLegacy\n1000,10,4,0,9,5\n")
+            store = HistoryStore(path)
+            store._append([_row_line(1001, 20.0, 6.0, {}, "partial")])
+            frame = pd.read_csv(path)                     # 修复前这里抛 ParserError
+            self.assertEqual(frame["source"].tolist(), ["complete", "partial"])
+            restarted = HistoryStore(path)
+            self.assertEqual(restarted.values, {1000: (10.0, 4.0)})
+            self.assertEqual(restarted.estimates, {1001: (20.0, 6.0)})
+            self.assertEqual(restarted.extra[1000], {"unknown": 0.0, "buyLegacy": 9.0,
+                                                     "sellLegacy": 5.0})
+
+    def test_mixed_width_file_is_repaired_on_load(self):
+        """线上故障复现: 旧表头(6 列)后面被追加了新格式(7 列)的行。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            path.write_text("time,buy,sell,unknown,buyLegacy,sellLegacy\n"
+                            "1000,10,4,0,9,5\n"
+                            "1001,20,6,0,19,7,partial\n")
+            store = HistoryStore(path)                    # 修复前这里抛 ParserError
+            self.assertEqual(store.values, {1000: (10.0, 4.0)})
+            self.assertEqual(store.estimates, {1001: (20.0, 6.0)})
+            lines = path.read_text().splitlines()
+            self.assertEqual(lines[0], ",".join(HEADER))
+            self.assertTrue(all(len(line.split(",")) == len(HEADER) for line in lines))
+
+    def test_unparsable_file_falls_back_to_line_reader(self):
+        """pandas 整表失败时退回逐行解析: 能识别的行照常读入(缺列补空), 坏行跳过。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            path.write_text("time,buy,sell,unknown,buyLegacy,sellLegacy,source\n"
+                            "1000,10,4,0,9,5,complete\n"
+                            "1001,20,6,0\n"                    # 缺列 -> pandas 整表失败
+                            "not-a-time,30,8,0,29,9,complete\n"  # 坏行 -> 跳过
+                            "1002,30,8,0,29,9,complete\n")
+            store = HistoryStore(path)
+            self.assertEqual(sorted(store.values), [1000, 1001, 1002])
+            self.assertEqual(store.values[1000], (10.0, 4.0))
+            self.assertEqual(store.values[1001], (20.0, 6.0))
+            self.assertEqual(store.extra[1001], {"unknown": 0.0})   # 缺的两列留空
+
+    def test_incremental_read_tolerates_short_rows(self):
+        """增量读遇到缺列的行不能崩(对照列按空处理)。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            store = HistoryStore(path)
+            store.save_completed(build_bars(klines(), ticks()))
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("9999,7,3\n")                    # 只有三列
+            self.assertTrue(store.refresh())
+            self.assertEqual(store.values[9999], (7.0, 3.0))
 
     def test_append_writes_header_once_and_keeps_existing_rows(self):
         with tempfile.TemporaryDirectory() as folder:

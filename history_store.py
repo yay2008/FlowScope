@@ -13,6 +13,11 @@
 兼容性:
 
 - 既有 ``X_v3.csv`` 若没有 ``source`` 列, 全部按 ``complete`` 读;
+- 但"只按 complete 读"还不够: 这种旧文件的表头只有 6 列, 而当前实现每行多写一个
+  ``source`` 列。若只在文件尾追加新行, 表头与数据行的字段数就不一致, pandas 全量读
+  会在第一条数据行整表失败(``Expected 6 fields in line N, saw 7``)。所以**读到不是
+  当前格式的主文件时先原地补齐**: 补表头、给旧行补 ``complete``, 行序与取值不变,
+  之后照常追加。(``tests/test_data.py`` 里有这条故障的复现用例。)
 - 既有 ``X_v3_estimated.csv`` 仍会被读入(只读), 与主文件取并集, 主文件优先;
   此后不再写它, 也不删它 —— 迁移是纯增量的, 不需要一次性转换脚本。
 
@@ -24,6 +29,7 @@
   pandas 的固定开销反而更贵。历史行的累计和不必重算, 因为新增时间戳都排在末尾。
   无变化时 ``refresh()`` 只是一次 ``stat``。
 """
+import os
 from pathlib import Path
 
 import numpy as np
@@ -128,6 +134,50 @@ class HistoryStore:
         except OSError:
             return 0
 
+    def _upgrade_layout(self):
+        """把表头与当前格式不一致的主文件原地补成当前格式; 返回是否改写过。
+
+        旧版 v3 文件的表头只有 6 列(没有 ``source``), 而当前实现每行多写一个来源列。
+        只往文件尾追加新行会让表头与数据行的字段数不一致, 于是**下次全量读整表失败**
+        (``Expected 6 fields in line N, saw 7``), feed 之后每次重试都在同一处失败。
+        这里先把旧文件补齐: 补表头、给旧行补 ``complete``, 行序与取值都不变。
+        只处理主文件 —— legacy 与旧估算文件是只读来源, 从不追加, 也不该被改写。
+        """
+        header_line = ",".join(HEADER)
+        try:
+            with open(self.path, "r", encoding="utf-8", newline="") as handle:
+                first = handle.readline()
+                if not first or first.rstrip("\r\n") == header_line:
+                    return False
+                handle.seek(0)
+                lines = handle.read().splitlines()
+        except (OSError, UnicodeDecodeError):
+            return False
+        width = len(HEADER)
+        payload = [header_line]
+        for line in lines:
+            if not line.strip() or line.startswith("time,"):
+                continue                       # 空行与重复表头都不是数据
+            fields = line.split(",")
+            if len(fields) > width:
+                fields = fields[:width]
+            elif len(fields) < width:
+                # 旧 6 列行(少来源列)与更短的残行: 补空列, 来源按 complete。
+                fields = fields + [""] * (width - 1 - len(fields)) + [SOURCE_COMPLETE]
+            payload.append(",".join(fields))
+        temp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            with open(temp, "w", encoding="utf-8", newline="") as handle:
+                handle.write("\n".join(payload) + "\n")
+            os.replace(temp, self.path)
+        except OSError:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+            return False
+        return True
+
     def _read_initial(self):
         """完整读一次: legacy -> 旧估算文件 -> 主文件, 后者优先级更高。可反复调用。
 
@@ -144,6 +194,8 @@ class HistoryStore:
             # legacy 文件本来就只有三列, 不解析对照列。
             self._accept_frame(item, default_code=2, want_extras=False)
         self._accept_frame(self.estimated_path, default_code=1)
+        # 旧格式的主文件必须先补齐再读, 否则 pandas 会因字段数不一致整表失败。
+        self._upgrade_layout()
         self._size = self._size_of(self.path)
         if self._size:
             self._accept_frame(self.path)
@@ -167,10 +219,20 @@ class HistoryStore:
 
         ``default_code`` 为主文件以外的只读来源指定来源码(1=partial, 2=legacy);
         主文件始终按 ``source`` 列判定, 没有该列的旧 v3 文件按 complete 处理。
+
+        pandas 的 C 解析器遇到字段数与表头不一致的行会**整表**失败, 而这种坏行
+        (手工编辑、写入中断)不该让 feed 永久卡死, 所以失败时退回逐行解析:
+        能识别的行照常合并, 坏行跳过 —— 与增量读同一套规则。
         """
         if not path.exists():
             return
-        frame = pd.read_csv(path)
+        try:
+            frame = pd.read_csv(path)
+        except (pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+            print(f"[history] {path.name} 解析失败({exc}), 退回逐行读取", flush=True)
+            self._accept(self._batch_from_lines(path, default_code, want_extras),
+                         estimated=default_code == 1)
+            return
         if not {"time", "buy", "sell"}.issubset(frame.columns):
             raise ValueError(f"历史文件缺少列: {path.name}")
         numeric = frame[["time", "buy", "sell"]].apply(pd.to_numeric, errors="coerce")
@@ -187,6 +249,31 @@ class HistoryStore:
                       codes[finite].astype(np.int8),
                       [column[finite] for column in extras] if extras else None),
                      estimated=default_code == 1)
+
+    def _batch_from_lines(self, path, default_code, want_extras):
+        """逐行解析整个文件, 只在 pandas 整表失败时当退路用; 无有效行返回 None。"""
+        times, buys, sells, codes = [], [], [], []
+        extras = [[] for _ in EXTRA_COLUMNS]
+        try:
+            with open(path, "rb") as handle:
+                text = handle.read().decode("utf-8", "replace")
+        except OSError:
+            return None
+        for line in text.splitlines():
+            row = self._parse_line(line)
+            if row is None:
+                continue
+            times.append(row[0])
+            buys.append(row[1])
+            sells.append(row[2])
+            for column, value in zip(extras, row[3]):
+                column.append(_number_or_nan(value))
+            codes.append(row[4] if default_code is None else default_code)
+        if not times:
+            return None
+        return (np.array(times, dtype=np.int64), np.array(buys, dtype=float),
+                np.array(sells, dtype=float), np.array(codes, dtype=np.int8),
+                [np.array(column, dtype=float) for column in extras] if want_extras else None)
 
     def _parse_region(self, path, start, end):
         """增量解析 [start, end) 字节; 返回 (行列表, 实际读到的结束偏移)。
@@ -235,7 +322,10 @@ class HistoryStore:
         source = fields[3 + len(EXTRA_COLUMNS)].strip() if len(fields) > 3 + len(EXTRA_COLUMNS) else ""
         code = 1 if source == SOURCE_PARTIAL else (2 if source == SOURCE_LEGACY else 0)
         # 没有 source 列(旧 v3 文件)或取值未知 -> complete。
-        return timestamp, buy, sell, tuple(fields[3:3 + len(EXTRA_COLUMNS)]), code
+        # 缺列的行补空: 调用方按固定列数取对照列, 短元组会让增量读直接崩。
+        extras = list(fields[3:3 + len(EXTRA_COLUMNS)])
+        extras += [""] * (len(EXTRA_COLUMNS) - len(extras))
+        return timestamp, buy, sell, tuple(extras), code
 
     def _accept(self, batch, estimated=False):
         """把一批行并入内存表: (times, buys, sells, 来源码, 对照列数组或 None)。
