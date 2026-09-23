@@ -7,6 +7,11 @@
   (形如「燃油主连」)与当前主力合约, 再按主力合约的昨日持仓量排序, 让活跃品种排在前面。
 - 月份: 该品种未下市合约, 同样按昨日持仓量降序, 并标出主力(与主连的标的合约一致)。
 
+持仓量的**计边口径**必须归一, 否则菜单和自选面板的数字对不上: 静态查询的
+``pre_open_interest`` 在上期所/能源中心/郑商所/大商所是**双边**计量, 其余交易所是单边;
+而报价对象的 ``open_interest`` 一律是单边。两处都拿单边后, 同一个合约在同一时刻的数字
+才可比(未归一前双边恰好是单边的 2 倍, 整张菜单显示大一倍)。
+
 SDK 不是线程安全的, 所有调用都必须落在采集线程上, 所以这里只有纯函数
 (``build_products`` / ``build_months``); ``CatalogService`` 负责把它们通过
 ``FeedManager.submit_job`` 排进采集线程, 并在 FastAPI 事件循环里等待结果。
@@ -35,6 +40,11 @@ EXCHANGE_NAMES = dict(EXCHANGES)
 EXCHANGE_ORDER = {code: index for index, (code, _) in enumerate(EXCHANGES)}
 CONT_SUFFIX = "主连"
 CONT_PREFIX = "KQ.m@"
+
+# 静态合约查询的 pre_open_interest 是双边计量的交易所(TqSdk ins_schema 的定义)。
+# 其余交易所(中金所/广期所)与报价对象一样是单边, 不需要归一。实测中金所/广期所
+# 静态值 ÷ 报价值 = 1.000, 这四个恰好 = 2.000, 与此列表一致。
+BILATERAL_OPEN_INTEREST_EXCHANGES = frozenset({"SHFE", "INE", "CZCE", "DCE"})
 
 CATALOG_TTL_SEC = 300      # 品种目录(含主力合约映射)的缓存时长
 MONTHS_TTL_SEC = 60        # 月份列表的缓存时长: 持仓量天天变, 歇一会儿就重取
@@ -141,6 +151,23 @@ def _records(info) -> list[dict]:
     return list(info)
 
 
+def exchange_of(symbol: str) -> str:
+    """``SHFE.fu2611`` -> ``SHFE``; 没有交易所前缀时返回空串。"""
+    return symbol.partition(".")[0].strip().upper()
+
+
+def single_side_open_interest(symbol: str, value):
+    """把静态查询的昨日持仓量归一到单边, 便于与报价对象的 ``open_interest`` 直接比较。
+
+    上期所/能源中心/郑商所/大商所双边计量, 除以 2; 其余交易所原样返回。
+    只影响数值大小, 不影响排序(同一品种的缩放系数相同)。
+    """
+    number = _number(value)
+    if exchange_of(symbol) in BILATERAL_OPEN_INTEREST_EXCHANGES:
+        return number / 2
+    return number
+
+
 def product_name(instrument_name: str, product_id: str) -> str:
     """「燃油主连」->「燃油」; 名称缺失时退回品种代码。"""
     name = _text(instrument_name)
@@ -167,7 +194,9 @@ def build_products(api, symbols=None) -> list[dict]:
     wanted = sorted({main for main in mains if main})
     if wanted:
         for row in _records(api.query_symbol_info(wanted)):
-            open_interest[_text(row.get("instrument_id"))] = _number(row.get("pre_open_interest"))
+            symbol = _text(row.get("instrument_id"))
+            open_interest[symbol] = single_side_open_interest(
+                symbol, row.get("pre_open_interest"))
     products = []
     for symbol, main in zip(conts, mains):
         parts = split_cont_symbol(symbol)
@@ -180,7 +209,7 @@ def build_products(api, symbols=None) -> list[dict]:
             "name": product_name(cont_rows.get(symbol, {}).get("instrument_name"), product_id),
             "contSymbol": symbol,
             "mainSymbol": main,
-            # 昨日持仓量: 只用于把活跃品种排到前面, 不当作实时值展示。
+            # 昨日持仓量(单边): 只用于把活跃品种排到前面, 不当作实时值展示。
             "openInterest": open_interest.get(main, 0.0),
         })
     return products
@@ -227,7 +256,8 @@ def build_months(api, exchange_id: str, product_id: str, main_symbol: str = "") 
         months.append({
             "symbol": symbol,
             "name": _text(row.get("instrument_name")) or symbol,
-            "openInterest": _number(row.get("pre_open_interest")),   # 昨日持仓量
+            # 昨日持仓量, 已归一到单边(见 single_side_open_interest)。
+            "openInterest": single_side_open_interest(symbol, row.get("pre_open_interest")),
             "isMain": bool(main_symbol) and symbol == main_symbol,
         })
     months.sort(key=lambda item: item["openInterest"], reverse=True)

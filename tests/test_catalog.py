@@ -89,9 +89,52 @@ class ParseTests(unittest.TestCase):
                 catalog.normalize_exchange(bad)
 
 
+class OpenInterestBasisTests(unittest.TestCase):
+    """静态查询的 pre_open_interest 计边口径: 上期所/能源中心/郑商所/大商所是双边。"""
+
+    def test_bilateral_exchanges_are_halved(self):
+        # 实测: 这四家的静态值恰好是报价值的 2 倍(报价值一律单边)。
+        for symbol in ("SHFE.fu2611", "INE.sc2611", "CZCE.SR701", "DCE.i2601"):
+            with self.subTest(symbol=symbol):
+                self.assertEqual(catalog.single_side_open_interest(symbol, 381862), 190931)
+
+    def test_unilateral_exchanges_are_untouched(self):
+        # 中金所/广期所的静态值本来就是单边, 除以 2 会把数字改错。
+        for symbol in ("CFFEX.IF2612", "GFEX.si2611"):
+            with self.subTest(symbol=symbol):
+                self.assertEqual(catalog.single_side_open_interest(symbol, 161098), 161098)
+
+    def test_unknown_exchange_is_not_scaled(self):
+        """新增交易所时宁可少归一(排序仍对), 也不要凭猜测把数字改错。"""
+        self.assertEqual(catalog.single_side_open_interest("XX.zz2601", 5), 5)
+        self.assertEqual(catalog.single_side_open_interest("", 5), 5)
+        self.assertEqual(catalog.single_side_open_interest("SHFE.fu2611", None), 0.0)
+
+    def test_normalisation_does_not_change_the_ranking(self):
+        """缩放系数对同一品种恒定, 所以按持仓量排序的结果不变。"""
+        api = FakeApi(conts=["KQ.m@SHFE.fu", "KQ.m@DCE.i", "KQ.m@CFFEX.IF"],
+                      pre_open_interest={"SHFE.fu2611": 210000, "DCE.i2601": 320000,
+                                         "CFFEX.IF2612": 90000})
+        products = catalog.build_products(api)
+        catalog.rank_products(products)
+        self.assertEqual([p["productId"] for p in products], ["i", "fu", "IF"])
+
+    def test_catalog_and_watch_report_the_same_basis(self):
+        """菜单里的主力行与自选面板的实时持仓量必须同口径(都是单边), 否则数字看起来打架。
+
+        静态值是双边的(上期所), 归一后应恰好是报价值的量级; 未归一时这里会是 2 倍。
+        """
+        static_value = 381862
+        live_single_side = 190931
+        api = FakeApi(conts=["KQ.m@SHFE.fu"], pre_open_interest={"SHFE.fu2611": static_value})
+        products = catalog.build_products(api)
+        self.assertEqual(products[0]["openInterest"], live_single_side)
+
+
 class BuildTests(unittest.TestCase):
     def test_products_are_sorted_by_open_interest_and_grouped_by_exchange(self):
-        # 排序键取自主力合约(CONT 自身的 pre_open_interest 恒为 0)
+        # 排序键取自主力合约(CONT 自身的 pre_open_interest 恒为 0), 并归一到单边:
+        # SHFE/DCE 减半, 不认识的 XX 原样保留。
         api = FakeApi(conts=["KQ.m@DCE.i", "KQ.m@SHFE.fu", "KQ.m@XX.zz"],
                       pre_open_interest={"SHFE.fu2611": 210000, "DCE.i2601": 320000, "XX.zz2601": 5})
         products = catalog.build_products(api)
@@ -101,7 +144,7 @@ class BuildTests(unittest.TestCase):
                          {"i": "DCE.i2601", "fu": "SHFE.fu2611", "zz": "XX.zz2601"})
         catalog.rank_products(products)
         self.assertEqual([p["productId"] for p in products], ["i", "fu", "zz"])
-        self.assertEqual([int(p["openInterest"]) for p in products], [320000, 210000, 5])
+        self.assertEqual([int(p["openInterest"]) for p in products], [160000, 105000, 5])
         groups = catalog.group_products(products)
         self.assertEqual([g["exchangeId"] for g in groups], ["SHFE", "DCE", "XX"])
         self.assertEqual([p["productId"] for p in groups[0]["products"]], ["fu"])
@@ -122,7 +165,8 @@ class BuildTests(unittest.TestCase):
                          ["SHFE.fu2611", "SHFE.fu2701", "SHFE.fu2610"])
         self.assertEqual([m["isMain"] for m in months], [True, False, False])
         self.assertEqual(months[0]["name"], "燃油2611")
-        self.assertEqual(int(months[0]["openInterest"]), 428100)
+        # 上期所是双边计量, 这里要显示单边值(与自选面板同口径)
+        self.assertEqual(int(months[0]["openInterest"]), 214050)
 
     def test_unknown_exchange_still_shows_up_in_the_groups(self):
         groups = catalog.group_products([{"exchangeId": "AAA", "productId": "x", "name": "X",

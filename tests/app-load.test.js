@@ -94,9 +94,15 @@ function createDocument() {
 
 // ---------- 图表 / 网络 / 存储 stub ----------
 
+// 记录每次 applyOptions: 可见性开关是"状态变量 → series"的唯一通路, 只能从这里观察。
+// 每次 createChartStub() 覆盖它, 所以读取前必须先 runBrowser()。
+let lastAppliedOptions = null;
+
 function createChartStub() {
+  const applied = [];
+  lastAppliedOptions = applied;
   const series = () => ({
-    setData() {}, update() {}, applyOptions() {}, setMarkers() {},
+    setData() {}, update() {}, applyOptions(options) { applied.push(options); }, setMarkers() {},
     createPriceLine() { return { applyOptions() {} }; }, removePriceLine() {},
     priceScale() { return { applyOptions() {} }; },
     setVisibleRange() {}, coordinateToPrice() { return 0; }, priceToCoordinate() { return 0; },
@@ -106,6 +112,7 @@ function createChartStub() {
     applyOptions() {}, resize() {}, timeScale: () => ({
       scrollToRealTime() {}, fitContent() {}, applyOptions() {}, subscribeVisibleLogicalRangeChange() {},
       timeToCoordinate() { return 0; }, coordinateToTime() { return 0; },
+      options: () => ({ barSpacing: 6 }),
     }),
     priceScale: () => ({ applyOptions() {} }),
     panes: () => Array.from({ length: 4 }, () => ({
@@ -268,6 +275,8 @@ test("工具栏默认值与 app.js 初始状态一致", () => {
     ["threshtype", /let threshtype = "([^"]+)"/],
     ["cvd-source", /let cvdSource = "([^"]+)"/],
     ["ltf", /let klineLtf = (\d+)/],
+    ["lw-overlay", /let bandOverlay = "([^"]+)"/],
+    ["band-k", /let bandK = ([\d.]+)/],
   ];
   for (const [id, pattern] of table) {
     const htmlDefault = html.match(
@@ -286,4 +295,235 @@ test("阈值默认是 Z-SCORE", () => {
     "阈值下拉框默认应选中 Z-SCORE");
   const app = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
   assert.match(app, /let threshtype = "Z-SCORE"/, "app.js 的阈值初始状态应为 Z-SCORE");
+});
+
+// ---------- FlowWave 主图叠加带 ----------
+
+// 回归通道的复用函数: 与 app.js 的 linreg 同一个公式, 供下面独立复算用
+function linregAt(values, end, w) {
+  const sx = (w * (w - 1)) / 2;
+  const sxx = (w * (w - 1) * (2 * w - 1)) / 6;
+  let sy = 0, sxy = 0;
+  for (let j = 0; j < w; j++) {
+    const y = values[end - w + 1 + j];
+    sy += y;
+    sxy += j * y;
+  }
+  const slope = (w * sxy - sx * sy) / (w * sxx - sx * sx);
+  return (sy - slope * sx) / w + slope * (w - 1);
+}
+
+function deriveBandInBrowser() {
+  const context = runBrowser();
+  const out = vm.runInContext(`(() => {
+    cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
+    bars = [];
+    let price = 4000;
+    for (let i = 0; i < 120; i++) {
+      price += Math.sin(i / 3) * 4 + (i % 5 === 0 ? 3 : -1);
+      bars.push({ time: 1700000000 + i * 30, open: price - 1, high: price + 2, low: price - 2,
+                  close: price, volume: 100 + (i % 7) * 10, buy: 60, sell: 40, delta: 20,
+                  buyLegacy: 55, sellLegacy: 45, deltaLegacy: 10, cvd: i, coverage: "complete" });
+    }
+    derive();
+    return { close: bars.map((b) => b.close), mid: derived.band.mid, up: derived.band.up,
+             dn: derived.band.dn, state: derived.band.state, wt2: derived.lw.wt2,
+             n: BAND.n, k: bandK, lwOb: LW.ob, lwOs: LW.os };
+  })()`, context);
+  return out;
+}
+
+test("主图叠加带: 中线是收盘价回归线, 上下轨 = 中线 ± k 倍回归残差标准差", () => {
+  const out = deriveBandInBrowser();
+  const { close, mid, up, dn, n, k } = out;
+  // 全部先独立复算一遍, 残差用复算出的中线而不是 app.js 的 mid, 否则是自证
+  const expect = close.map((_, i) => (i >= n - 1 ? linregAt(close, i, n) : null));
+  let checked = 0;
+  for (let i = 0; i < close.length; i++) {
+    if (expect[i] == null) {
+      assert.equal(mid[i], null, `第 ${i} 根预热不足, 中线应为 null`);
+      continue;
+    }
+    // 残差标准差要凑满 n 根残差, 所以带比中线晚 n-1 根才出现(共 2n-1 根预热)
+    if (i < 2 * n - 2) {
+      assert.equal(up[i], null, `第 ${i} 根残差窗口还没凑满, 不该有轨道`);
+      continue;
+    }
+    assert.ok(Math.abs(mid[i] - expect[i]) < 1e-6, `第 ${i} 根中线应等于同窗口回归线末点`);
+    let sum = 0, sum2 = 0;
+    for (let j = i - n + 1; j <= i; j++) {
+      const r = close[j] - expect[j];
+      sum += r;
+      sum2 += r * r;
+    }
+    const mean = sum / n;
+    const sd = Math.sqrt(Math.max(sum2 / n - mean * mean, 0));
+    assert.ok(Math.abs(up[i] - (expect[i] + k * sd)) < 1e-6, `第 ${i} 根上轨口径不一致`);
+    assert.ok(Math.abs(dn[i] - (expect[i] - k * sd)) < 1e-6, `第 ${i} 根下轨口径不一致`);
+    assert.ok(up[i] > mid[i] && mid[i] > dn[i], "轨道必须满足 上轨 > 中线 > 下轨");
+    checked++;
+  }
+  assert.ok(checked >= 50, `至少应能算出 50 根有效的带, 实际 ${checked}`);
+});
+
+test("主图叠加带: 着色状态由 wt2 超买超卖决定", () => {
+  const out = deriveBandInBrowser();
+  const { mid, up, state, wt2, lwOb, lwOs } = out;
+  let tagged = 0;
+  for (let i = 0; i < mid.length; i++) {
+    if (mid[i] == null || up[i] == null) continue;   // 还没形成带的行不参与着色
+    const expect = wt2[i] == null ? 0 : wt2[i] > lwOb ? 1 : wt2[i] < lwOs ? -1 : 0;
+    assert.equal(state[i], expect, `第 ${i} 根的着色状态应跟随 wt2`);
+    if (expect !== 0) tagged++;
+  }
+  assert.ok(tagged > 0, "样本里应至少出现一次超买或超卖着色, 否则这个断言是空跑");
+});
+
+test("主图叠加带: 打点只落在首次越界那一根, 且贴在对应的轨道上", () => {
+  const context = runBrowser();
+  const r = vm.runInContext(`(() => {
+    cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
+    bars = [];
+    let price = 4000;
+    for (let i = 0; i < 160; i++) {
+      price += Math.sin(i / 3) * 4 + (i % 5 === 0 ? 3 : -1);
+      bars.push({ time: 1700000000 + i * 30, open: price - 1, high: price + 2, low: price - 2,
+                  close: price, volume: 100 + (i % 7) * 10, buy: 60, sell: 40, delta: 20 });
+    }
+    derive();
+    const dots = buildBandDots();
+    return { times: bars.map((b) => b.time), wt2: derived.lw.wt2, up: derived.band.up,
+             dn: derived.band.dn, high: dots.high, low: dots.low, ob: LW.ob, os: LW.os };
+  })()`, context);
+
+  const indexOfTime = new Map(r.times.map((t, i) => [t, i]));
+  const crossings = (above) => {   // 独立复算: 每轮只算第一根能打点的 bar(上一根还没带也算这一轮的第一根)
+    const out = [];
+    for (let i = 0; i < r.wt2.length; i++) {
+      const cur = r.wt2[i];
+      if (cur == null || r.up[i] == null) continue;
+      const prev = i > 0 && r.up[i - 1] != null ? r.wt2[i - 1] : null;
+      if (above ? (cur > r.ob && (prev == null || prev <= r.ob))
+                : (cur < r.os && (prev == null || prev >= r.os))) out.push(i);
+    }
+    return out;
+  };
+  const expectHigh = crossings(true);
+  const expectLow = crossings(false);
+  assert.ok(expectHigh.length + expectLow.length > 0, "样本里应至少有一次越界, 否则这个断言是空跑");
+
+  for (const [dots, expect, edge] of [[r.high, expectHigh, r.up], [r.low, expectLow, r.dn]]) {
+    assert.equal(dots.length, expect.length, "打点数量应等于首次越界的次数(连续越界不重复打)");
+    dots.forEach((dot, k) => {
+      const i = indexOfTime.get(dot.time);
+      assert.equal(i, expect[k], `第 ${k} 个点应打在第 ${expect[k]} 根上, 实际 ${i}`);
+      assert.equal(dot.value, edge[i], "点应贴在对应的轨道(上穿贴上轨, 下穿贴下轨)");
+    });
+  }
+  // 连续越界的第二根起不能再打点
+  for (const i of expectHigh) {
+    const again = r.times[i + 1];
+    if (again != null && r.wt2[i + 1] > r.ob) {
+      assert.ok(!r.high.some((d) => d.time === again), `第 ${i + 1} 根仍在超买区, 不该再打点`);
+    }
+  }
+});
+
+test("叠加开关: 打开后主图三个叠加系列可见, 切足迹图强制隐藏, 切回来按开关恢复", () => {
+  const context = runBrowser();
+  const applied = lastAppliedOptions;
+  const toggle = (value) => context.document.getElementById("lw-overlay").handlers.change[0]({ target: { value } });
+  const setView = (value) => context.document.getElementById("view").handlers.change[0]({ target: { value } });
+  const lastThree = () => applied.slice(-3).map((o) => o.visible);
+
+  // stub 里没有真实 <select>, 直接调它的 change 处理器(与浏览器里选项改变走同一条路径)
+  assert.equal(lastThree().every((v) => v === false), true, "默认关: 三个叠加系列都应隐藏");
+
+  toggle("on");
+  assert.equal(lastThree().every((v) => v === true), true, "打开开关后带与两个打点系列都应可见");
+
+  setView("footprint");
+  assert.equal(lastThree().every((v) => v === false), true, "足迹图下叠加必须强制隐藏");
+
+  setView("candle");
+  assert.equal(lastThree().every((v) => v === true), true, "切回 K 线应按开关恢复可见");
+
+  toggle("off");
+  assert.equal(lastThree().every((v) => v === false), true, "关掉开关后应重新隐藏");
+});
+
+test("叠加开关: 「带宽」只在打开时可调(足迹图下不置灰, 因为只是临时藏起来)", () => {
+  const context = runBrowser();
+  const bandK = context.document.getElementById("band-k");
+  const toggle = (value) => context.document.getElementById("lw-overlay").handlers.change[0]({ target: { value } });
+  const setView = (value) => context.document.getElementById("view").handlers.change[0]({ target: { value } });
+
+  assert.equal(bandK.disabled, true, "默认关: 带宽不可调");
+
+  toggle("on");
+  assert.equal(bandK.disabled, false, "打开叠加后带宽可调");
+
+  setView("footprint");
+  assert.equal(bandK.disabled, false, "足迹图只是临时隐藏带, 不该把宽度选择也锁掉");
+
+  toggle("off");
+  assert.equal(bandK.disabled, true, "关掉叠加后重新置灰");
+});
+
+test("带宽 k 可切换: 半宽按 k 线性变化, 非法值回落到默认 2σ", () => {
+  const context = runBrowser();
+  vm.runInContext(`(() => {
+    cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
+    bars = [];
+    let price = 4000;
+    for (let i = 0; i < 120; i++) {
+      price += Math.sin(i / 3) * 4 + (i % 5 === 0 ? 3 : -1);
+      bars.push({ time: 1700000000 + i * 30, open: price - 1, high: price + 2, low: price - 2,
+                  close: price, volume: 100, buy: 60, sell: 40, delta: 20 });
+    }
+    derive();
+  })()`, context);
+
+  const halfWidth = () => vm.runInContext("derived.band.up[100] - derived.band.mid[100]", context);
+  const select = context.document.getElementById("band-k");
+  // 按浏览器的顺序来: 先由控件持有新值, 再带着控件本身触发 change
+  // (处理器会写回 e.target.value, 用假 target 就观察不到这个纠正行为)
+  const setK = (value) => { select.value = value; select.handlers.change[0]({ target: select }); };
+
+  const base = halfWidth();
+  assert.ok(base > 0, "2σ 下第 100 根应有正的半宽(否则这个用例是空跑)");
+
+  setK("2.5");
+  assert.ok(Math.abs(halfWidth() - base * 1.25) < 1e-9, "2.5σ 的半宽应是 2σ 的 1.25 倍");
+  assert.equal(select.value, "2.5", "合法值应写回下拉框");
+
+  setK("1.5");
+  assert.ok(Math.abs(halfWidth() - base * 0.75) < 1e-9, "1.5σ 的半宽应是 2σ 的 0.75 倍");
+
+  setK("9");   // 目录之外的倍数: 不按垃圾值画带, 回落到默认并纠正下拉框显示
+  assert.equal(select.value, "2", "非法值应回落到默认 2σ");
+  assert.ok(Math.abs(halfWidth() - base) < 1e-9, "非法值不得改变带宽");
+});
+
+test("叠加带的 custom series 满足 lightweight-charts 契约", () => {
+  const context = runBrowser();
+  const r = vm.runInContext(`(() => {
+    const s = new BandSeries();
+    const item = { time: 1, mid: 10, up: 12, dn: 8, close: 11, idx: 0 };
+    return {
+      hasDraw: typeof s.renderer().draw === "function",
+      whitespaceNull: s.isWhitespace({ time: 1, mid: null, up: null, dn: null }),
+      whitespaceOk: s.isWhitespace(item),
+      values: s.priceValueBuilder(item),
+      options: s.defaultOptions(),
+    };
+  })()`, context);
+  assert.equal(r.hasDraw, true, "custom series 必须提供 renderer().draw");
+  assert.equal(r.whitespaceNull, true, "缺轨道值的行应作为空白跳过");
+  assert.equal(r.whitespaceOk, false, "有轨道值的行不应被判为空白");
+  assert.equal(r.values.length, 3, "价格轴需要拿到下轨/上轨/中线三个值, 否则带会被裁掉");
+  assert.equal(r.values[0], 8);
+  assert.equal(r.values[1], 12);
+  assert.equal(r.values[2], 10);
+  assert.equal(r.options.lastValueVisible, false);
 });

@@ -208,6 +208,15 @@ body { display: flex; flex-direction: column; }
   color: #9598a1;
 }
 .watch-code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 第三行: 当日成交量/成交额(判断流动性)。比价格行更淡, 不抢主信息的注意力。 */
+.watch-liquidity {
+  color: #6b7180;
+  font-family: Consolas, monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* 涨跌配色按国内行情软件的习惯: 红涨绿跌(K线本身是灰阶, 与足迹图的买卖配色不冲突) */
 .watch-chg.up { color: #f23645; }
 .watch-chg.down { color: #00e676; }

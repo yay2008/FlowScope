@@ -19,6 +19,8 @@ let tf = 30;         // 主图周期(秒), 10 或 30; 后端按 (symbol, tf) 独
 // 各主周期下合法的拆分粒度; 与后端 indicator.ltf_options 同源, 首次拿到 cfg 后以 cfg 为准
 const LTF_BY_TF = { 10: [1, 5, 10], 30: [1, 5, 10, 15, 30] };
 let view = "candle";  // 主图视图: candle=K线, footprint=足迹图
+let bandOverlay = "off";  // 主图是否叠加 FlowWave 回归通道带; 必须与 index.html 里 <select id="lw-overlay"> 的 selected 选项一致
+let bandK = 2;        // 叠加带的带宽倍数 k(回归残差标准差的倍数); 必须与 index.html 里 <select id="band-k"> 的 selected 选项一致
 let fpBars = [];      // 足迹 bar: {time, levels: [[price, buy, sell], ...按价格升序]}
 let fpBarSpacing = null;   // 进足迹模式前的 barSpacing, 退出时恢复
 let barRevision = -1, fpRevision = -1;
@@ -181,6 +183,80 @@ class FootprintSeries {
   destroy() {}
 }
 
+// ---------- FlowWave 主图叠加: 价格回归通道带(custom series) ----------
+// lightweight-charts v5 没有"两条线之间填充"的原生 series, 所以和足迹图一样走 addCustomSeries,
+// 自己在画布上填多边形: 相邻两根 bar 之间画一个梯形(颜色取左端那根的状态), 再描上下轨。
+// 只在时间上真正相邻的 bar 之间连(idx 差 1), 否则会横跨休市拉出一条假带。
+class BandRenderer {
+  constructor() {
+    this._data = null;
+  }
+  update(data) {   // 第二个参数是 series 选项(足迹图用它取 tickSize), 这条带没有可配置项
+    this._data = data;
+  }
+  _color(state, alpha) {   // 与副图配色同源: 超买红 / 超卖绿 / 中性灰
+    if (state > 0) return `rgba(242, 54, 69, ${alpha})`;
+    if (state < 0) return `rgba(0, 230, 118, ${alpha})`;
+    return `rgba(149, 152, 161, ${alpha})`;
+  }
+  draw(target, priceConverter) {
+    if (!this._data || !this._data.bars.length) return;
+    const { bars } = this._data;
+    target.useMediaCoordinateSpace(({ context: ctx }) => {
+      const pts = [];
+      for (let i = 0; i < bars.length; i++) {
+        const d = bars[i].originalData;
+        const yUp = priceConverter(d.up), yDn = priceConverter(d.dn), yMid = priceConverter(d.mid);
+        pts.push(yUp == null || yDn == null
+          ? null
+          : { x: bars[i].x, yUp, yDn, yMid, state: d.state, idx: d.idx });
+      }
+      for (let i = 1; i < pts.length; i++) {          // 带底填充
+        const a = pts[i - 1], b = pts[i];
+        if (!a || !b || b.idx !== a.idx + 1) continue;
+        ctx.fillStyle = this._color(a.state, 0.10);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.yUp); ctx.lineTo(b.x, b.yUp);
+        ctx.lineTo(b.x, b.yDn); ctx.lineTo(a.x, a.yDn);
+        ctx.closePath();
+        ctx.fill();
+      }
+      for (let i = 1; i < pts.length; i++) {          // 上下轨 + 中线
+        const a = pts[i - 1], b = pts[i];
+        if (!a || !b || b.idx !== a.idx + 1) continue;
+        // 触到超买/超卖的段把对应轨线加深(填充仍是淡的), 一眼能看出"价格压在上轨/贴着下轨"
+        const hotUp = a.state > 0 || b.state > 0;
+        const hotDn = a.state < 0 || b.state < 0;
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = this._color(a.state, hotUp ? 0.85 : 0.35);
+        ctx.beginPath(); ctx.moveTo(a.x, a.yUp); ctx.lineTo(b.x, b.yUp); ctx.stroke();
+        ctx.strokeStyle = this._color(a.state, hotDn ? 0.85 : 0.35);
+        ctx.beginPath(); ctx.moveTo(a.x, a.yDn); ctx.lineTo(b.x, b.yDn); ctx.stroke();
+        if (a.yMid != null && b.yMid != null) {
+          ctx.strokeStyle = "rgba(209, 212, 220, 0.35)";
+          ctx.beginPath(); ctx.moveTo(a.x, a.yMid); ctx.lineTo(b.x, b.yMid); ctx.stroke();
+        }
+      }
+    });
+  }
+}
+
+class BandSeries {
+  constructor() {
+    this._renderer = new BandRenderer();
+  }
+  defaultOptions() { return { priceLineVisible: false, lastValueVisible: false }; }
+  renderer() { return this._renderer; }
+  update(data, options) { this._renderer.update(data, options); }
+  priceValueBuilder(plotRow) {
+    // 上下轨可能超出当根 K 线的高低点, 不返回给价格轴就会被裁掉(autoscale 用这里的值)
+    const vals = [plotRow.dn, plotRow.up, plotRow.mid].filter((v) => v != null);
+    return vals.length ? vals : [plotRow.close ?? 0];
+  }
+  isWhitespace(data) { return data.mid == null || data.up == null || data.dn == null; }
+  destroy() {}
+}
+
 // ---------- 图表初始化 ----------
 
 const chart = LightweightCharts.createChart($("chart"), {
@@ -213,6 +289,16 @@ const emaSeries = EMA_PERIODS.map((p, j) =>
   chart.addSeries(LightweightCharts.LineSeries, {
     color: EMA_COLORS[j], lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
   }, 0));
+
+// 主图可选叠加: FlowWave 回归通道带(默认隐藏, 由工具栏「叠加」开关控制)
+const bandSeries = chart.addCustomSeries(new BandSeries(), { visible: false }, 0);
+const bandDotOpts = { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 3,
+                      priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+                      visible: false };
+const bandDotHigh = chart.addSeries(LightweightCharts.LineSeries, { ...bandDotOpts, color: "#f7525f" }, 0);
+const bandDotLow = chart.addSeries(LightweightCharts.LineSeries, { ...bandDotOpts, color: "#00e676" }, 0);
+// 初始可见性由状态变量决定(而不是只靠 series 创建时的 visible:false), 否则默认值一改就会状态与画面不一致
+applyBandVisibility();
 
 // 足迹图 series (pane 0, 默认隐藏; 视图切到足迹图时显示, tickSize 由 /api/footprint 下发)
 const fpSeries = chart.addCustomSeries(new FootprintSeries(), { visible: false, tickSize: 1 }, 0);
@@ -300,6 +386,11 @@ function rollingZ(v, n) {
 // ---------- LSMA × CRVOL 共振计算(参数同 Pine 默认值) ----------
 
 const LW = { n1: 9, n2: 6, n3: 3, n4: 21, ob: 80, os: 20, slopeLen: 10 };
+
+// 主图叠加的回归通道参数: 中线 = linreg(close, n), 上下轨 = 中线 ± k 倍回归残差标准差。
+// 残差标准差取与中线同一个窗口, 用总体标准差(除以 n)。k 由工具栏「带宽」选(kOptions 必须与
+// index.html 的 <option> 一致, 也用来挡非法值); 三档包含率与选型依据见 docs/flowwave_band_probe.py。
+const BAND = { n: 21, kOptions: [1.5, 2, 2.5], kDefault: 2 };
 
 function ema(v, n) {              // ta.ema: 首个非 null 值直接播种
   const out = new Array(v.length).fill(null);
@@ -409,6 +500,39 @@ function deriveLw() {
   return { wave, wt2, crvSlope };
 }
 
+// FlowWave 主图叠加: 价格回归通道。
+// 为什么不能直接把 wave/wt2 画到主图: 它们是 0~100 的振荡值(实测还会溢出到 -14~108), 没有价格量纲,
+// 画到价格轴上必须选一种映射。这里选"轨道由价格自证"的映射 —— 中线仍用同一个 linreg 核, 只把输入
+// 从振荡值换成收盘价, 带宽用回归残差标准差; 于是轨道本身是真实价格(可当动态支撑/压力),
+// 而 wt2 的信息转成两件事: 带的着色状态(state) 与首次越界的打点(buildBandDots)。
+function deriveBand() {
+  const n = bars.length;
+  const close = bars.map((b) => b.close);
+  const mid = linreg(close, BAND.n);
+  const wt2 = derived.lw.wt2;
+  const up = new Array(n).fill(null);
+  const dn = new Array(n).fill(null);
+  const state = new Array(n).fill(0);   // 1=超买(wt2>80), -1=超卖(wt2<20), 0=中性
+  for (let i = 0; i < n; i++) {
+    if (mid[i] == null) continue;
+    let sum = 0, sum2 = 0, ok = true;
+    for (let j = i - BAND.n + 1; j <= i; j++) {
+      if (mid[j] == null) { ok = false; break; }
+      const r = close[j] - mid[j];
+      sum += r;
+      sum2 += r * r;
+    }
+    if (!ok) continue;
+    const mean = sum / BAND.n;
+    const sd = Math.sqrt(Math.max(sum2 / BAND.n - mean * mean, 0));
+    if (sd === 0) continue;   // 21 根完全贴在回归线上(极端平滑/停板), 带宽为 0 时不画
+    up[i] = mid[i] + bandK * sd;
+    dn[i] = mid[i] - bandK * sd;
+    state[i] = wt2[i] == null ? 0 : wt2[i] > LW.ob ? 1 : wt2[i] < LW.os ? -1 : 0;
+  }
+  return { mid, up, dn, state };
+}
+
 // ---------- 判向口径 ----------
 // 后端对同一根 bar 并列输出两套量: buy/sell/unknown 是新算法(Lee-Ready),
 // buyLegacy/sellLegacy 是旧算法。前端一律读新算法: 旧算法(快照自身盘口)与当根 K 线
@@ -460,6 +584,7 @@ function derive() {
   derived = { vol, buy, sell, delta, posd, negd, smaVolN, rvol, rpos, rneg, rbuy, rsell,
               zVol, zRpos, zRneg, zBuy, zSell, crv, emaLines };
   derived.lw = deriveLw();
+  derived.band = deriveBand();
 }
 
 // level: 0=未超阈值, 1..3=超过第 1..3 档
@@ -610,6 +735,7 @@ function renderAll() {
     s.setData(bars.map((b, i) => ({ time: b.time, value: derived.emaLines[j][i] })).filter((p) => p.value != null)));
   renderSuite();
   renderLw();
+  renderBand();
   updateLegend(bars.length - 1);
 }
 
@@ -638,7 +764,64 @@ function updateLast() {
     candleSuite.update(latestCandle?.time === b.time ? latestCandle : { time: b.time });
   }
   renderLw();            // 整体 setData(数据量小)
+  renderBand();          // 同上: 回归通道只影响末尾若干根, 但一样整体重建最省心
   updateLegend(i);
+}
+
+// ---------- FlowWave 主图叠加: 数据与开关 ----------
+
+function buildBandData() {
+  const { mid, up, dn, state } = derived.band;
+  const out = [];
+  for (let i = 0; i < bars.length; i++) {
+    if (mid[i] == null || up[i] == null || dn[i] == null) continue;
+    // idx 用来判断两根在时间上是否相邻: custom series 会把缺口两端的 bar 排在一起, 直接连会画出假带
+    out.push({ time: bars[i].time, mid: mid[i], up: up[i], dn: dn[i], state: state[i],
+               close: bars[i].close, idx: i });
+  }
+  return out;
+}
+
+// 越界打点只打在"首次越界"那一根: 连续越界每根都打会把主图糊满
+// (实测 800 根 fu 30s: 上穿 80 共 22 次、下穿 20 共 15 次, 合计约 4.6% 的 bar, 密度正好)
+// 复算脚本: docs/flowwave_band_probe.py
+function buildBandDots() {
+  const { up, dn } = derived.band;
+  const wt2 = derived.lw.wt2;
+  const high = [], low = [];
+  for (let i = 0; i < bars.length; i++) {
+    if (up[i] == null || dn[i] == null || wt2[i] == null) continue;
+    // 上一根没有带(预热期)时把本根当作这一轮的第一根: 否则在预热期里开始的超买/超卖
+    // 会一根点都打不出来, 而带本身已经按状态着色了, 两者会对不上。
+    const prev = i > 0 && up[i - 1] != null ? wt2[i - 1] : null;
+    if (wt2[i] > LW.ob && (prev == null || prev <= LW.ob)) high.push({ time: bars[i].time, value: up[i] });
+    if (wt2[i] < LW.os && (prev == null || prev >= LW.os)) low.push({ time: bars[i].time, value: dn[i] });
+  }
+  return { high, low };
+}
+
+function renderBand() {
+  if (!derived || !derived.band) return;
+  bandSeries.setData(buildBandData());
+  const { high, low } = buildBandDots();
+  bandDotHigh.setData(high);
+  bandDotLow.setData(low);
+}
+
+// 叠加只在 K 线视图生效: 足迹图本身已经很密, 再叠带会糊成一片; 切回 K 线按开关恢复。
+// 图例与可见性共用这一个判据, 否则会出现"足迹图里图例报着带值、画面上却没有带"。
+function bandShown() {
+  return bandOverlay === "on" && view !== "footprint";
+}
+
+function applyBandVisibility() {
+  const on = bandShown();
+  bandSeries.applyOptions({ visible: on });
+  bandDotHigh.applyOptions({ visible: on });
+  bandDotLow.applyOptions({ visible: on });
+  // 「带宽」只在叠加打开时可调。判据用开关本身而不是 bandShown(): 足迹图下带只是被临时藏起来,
+  // 宽度选择仍然有效, 切回 K 线就用得上, 没必要在这里置灰。
+  $("band-k").disabled = bandOverlay !== "on";
 }
 
 // ---------- 图例 / 工具栏 ----------
@@ -663,11 +846,14 @@ function updateLegend(i) {
   // 判向对照: 同一根 bar 同时给出新算法(买/卖/未知)与旧算法(买/卖)
   const fp = view === "footprint" ? fpBars.find((item) => item.time === b.time) : null;
   const unknown = fp ? fp.levels.reduce((sum, lv) => sum + (lv[3] || 0), 0) : (b.unknown ?? 0);
+  // 叠加带只在"画面上真有带"且这根基线可取时进图例, 免得白占位置
+  const band = bandShown() && derived.band && derived.band.up[i] != null
+    ? `  带:${fmt(derived.band.dn[i])}/${fmt(derived.band.mid[i])}/${fmt(derived.band.up[i])}` : "";
   $("legend").textContent =
     `${t}  O:${fmt(b.open)} H:${fmt(b.high)} L:${fmt(b.low)} C:${fmt(b.close)}  ` +
   `  ${mode.toUpperCase()}:${suiteVal}  Δ:${fmt(deltaOf(b))}  CVD:${fmt(b.cvd)}` +
   `  新买/卖:${fmt(b.buy)}/${fmt(b.sell)} 未知:${fmt(unknown)} 旧买/卖:${fmt(b.buyLegacy)}/${fmt(b.sellLegacy)}` +
-  `  LSMA:${fmt(derived.lw.wave[i], 1)} RVOL:${fmt(d.rvol[i], 2)} 斜率:${fmt(derived.lw.crvSlope[i], 2)}`;
+  `  LSMA:${fmt(derived.lw.wave[i], 1)} RVOL:${fmt(d.rvol[i], 2)} 斜率:${fmt(derived.lw.crvSlope[i], 2)}${band}`;
 }
 
 chart.subscribeCrosshairMove((param) => {
@@ -683,6 +869,22 @@ chart.subscribeCrosshairMove((param) => {
 
 $("mode").addEventListener("change", (e) => { mode = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
 $("threshtype").addEventListener("change", (e) => { threshtype = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
+$("lw-overlay").addEventListener("change", (e) => {
+  bandOverlay = e.target.value === "on" ? "on" : "off";
+  applyBandVisibility();
+  updateLegend(bars.length - 1);
+});
+$("band-k").addEventListener("change", (e) => {
+  const value = parseFloat(e.target.value);
+  bandK = BAND.kOptions.includes(value) ? value : BAND.kDefault;   // 非法值回落到默认, 不按垃圾值画带
+  e.target.value = String(bandK);
+  // 只有带宽变了: 中线/状态/越界点都不受影响, 不必整体 derive(), 重算带即可
+  if (derived && derived.lw) {
+    derived.band = deriveBand();
+    renderBand();
+  }
+  updateLegend(bars.length - 1);
+});
 function updateSplitSelection() {
   ltf = FlowData.splitLtf(cvdSource, klineLtf);
   $("ltf").disabled = cvdSource === "tick";
@@ -857,8 +1059,17 @@ function renderWatch() {
     change.className = "watch-chg " + FlowData.changeClass(pct);
     change.textContent = FlowData.formatChangePct(pct);
     bottom.append(label, price, change);
-
     item.append(top, bottom);
+
+    // 第三行: 当日成交量与成交额, 用来判断流动性。行情未就绪时不占位置。
+    const liquidity = FlowData.liquidityLabel(row);
+    if (liquidity) {
+      const flow = document.createElement("div");
+      flow.className = "watch-liquidity";
+      flow.textContent = liquidity;
+      item.append(flow);
+    }
+
     item.addEventListener("click", () => switchSymbol(code));
     list.appendChild(item);
   }
@@ -961,6 +1172,7 @@ function setView(v) {
   candleSeries.applyOptions({ visible: !isFp });
   emaSeries.forEach((s) => s.applyOptions({ visible: !isFp }));
   fpSeries.applyOptions({ visible: isFp });
+  applyBandVisibility();   // 足迹图下强制隐藏叠加带, 切回 K 线按开关恢复
   if (isFp) {
     fpBarSpacing = chart.timeScale().options().barSpacing;
     chart.timeScale().applyOptions({ barSpacing: 60 });

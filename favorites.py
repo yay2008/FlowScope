@@ -131,7 +131,11 @@ def _number(value):
 
 
 def quote_row(symbol: str, quote) -> dict:
-    """把 Quote 对象压成面板需要的一行; 缺数据的字段留 None, 前端显示占位符。"""
+    """把 Quote 对象压成面板需要的一行; 缺数据的字段留 None, 前端显示占位符。
+
+    ``volume``/``amount`` 是当日累计成交量与成交额(单边口径, 与 ``openInterest`` 同源),
+    用来判断流动性; 取不到就留 None, 不影响其余字段。
+    """
     last = _number(getattr(quote, "last_price", None))
     # 期货涨跌幅惯例是相对昨结算; 拿不到就退回昨收, 两者都拿不到就没有涨跌。
     base = _number(getattr(quote, "pre_settlement", None))
@@ -149,9 +153,17 @@ def quote_row(symbol: str, quote) -> dict:
         "change": change,
         "changePct": change_pct,
         "openInterest": _number(getattr(quote, "open_interest", None)),
+        "volume": _number(getattr(quote, "volume", None)),
+        "amount": _number(getattr(quote, "amount", None)),
         "priceDecs": int(getattr(quote, "price_decs", 0) or 0),
         "expired": bool(getattr(quote, "expired", False)),
     }
+
+
+def _empty_row(symbol: str) -> dict:
+    return {"symbol": symbol, "name": symbol, "insClass": "", "mainSymbol": "", "lastPrice": None,
+            "preSettlement": None, "change": None, "changePct": None, "openInterest": None,
+            "volume": None, "amount": None, "priceDecs": 0, "expired": False}
 
 
 def read_quotes(api, symbols, warm: set[str], wait_sec: float = COLD_WAIT_SEC) -> list[dict]:
@@ -174,12 +186,6 @@ def read_quotes(api, symbols, warm: set[str], wait_sec: float = COLD_WAIT_SEC) -
         warm.update(cold)
     return [quote_row(symbol, quotes[symbol]) if quotes[symbol] is not None else _empty_row(symbol)
             for symbol in symbols]
-
-
-def _empty_row(symbol: str) -> dict:
-    return {"symbol": symbol, "name": symbol, "insClass": "", "mainSymbol": "", "lastPrice": None,
-            "preSettlement": None, "change": None, "changePct": None, "openInterest": None,
-            "priceDecs": 0, "expired": False}
 
 
 class FavoritesService:

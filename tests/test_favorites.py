@@ -53,6 +53,7 @@ def quote(**kwargs):
     fields = {"instrument_name": "", "ins_class": "FUTURE", "underlying_symbol": "",
               "last_price": float("nan"), "pre_settlement": float("nan"),
               "pre_close": float("nan"), "open_interest": float("nan"),
+              "volume": float("nan"), "amount": float("nan"),
               "price_decs": 0, "expired": False}
     fields.update(kwargs)
     return SimpleNamespace(**fields)
@@ -131,8 +132,25 @@ class QuoteRowTests(unittest.TestCase):
         self.assertIsNone(row["lastPrice"])
         self.assertIsNone(row["changePct"])
         self.assertIsNone(row["openInterest"])
+        self.assertIsNone(row["volume"])
+        self.assertIsNone(row["amount"])
         self.assertEqual(row["name"], "SHFE.fu2611")
         json.dumps(row)   # NaN 会让前端 JSON.parse 直接报错, 这里必须能序列化
+
+    def test_turnover_fields_come_through_for_liquidity_comparison(self):
+        """成交量/成交额用来判断流动性, 必须原样透出; 缺数据时留 null。"""
+        row = fav.quote_row("SHFE.fu2611", quote(instrument_name="燃油2611", last_price=4158,
+                                                 volume=556133, amount=23124010140.0))
+        self.assertEqual(row["volume"], 556133)
+        self.assertEqual(row["amount"], 23124010140.0)
+        json.dumps(row)
+
+    def test_empty_row_keeps_the_same_keys_as_a_live_row(self):
+        """取不到报价的空行不能少字段, 否则前端要靠 undefined 兜底。"""
+        empty = fav._empty_row("SHFE.gone")
+        live = fav.quote_row("SHFE.fu2611", quote())
+        self.assertEqual(set(empty) - set(live), {"preSettlement"})
+        self.assertEqual(set(live) - set(empty), {"basePrice"})
 
     def test_main_continuous_keeps_its_underlying(self):
         row = fav.quote_row("KQ.m@SHFE.fu", quote(instrument_name="燃油主连", ins_class="CONT",

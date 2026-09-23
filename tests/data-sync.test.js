@@ -2,7 +2,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { mergeBars, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
-        parseSymbolParts, formatOpenInterest, watchLabel, formatPrice,
+        parseSymbolParts, formatOpenInterest, formatAmount, liquidityLabel,
+        watchLabel, formatPrice,
         formatChangePct, changeClass, productLabel, monthLabel } =
   require("../static/data-sync.js");
 
@@ -94,6 +95,28 @@ test("watchlist price and change formatting keeps a placeholder for missing data
   assert.equal(changeClass(-2), "down");
   assert.equal(changeClass(0), "");
   assert.equal(changeClass(null), "");
+});
+
+test("turnover amount is abbreviated for the watchlist liquidity line", () => {
+  assert.equal(formatAmount(23124010140), "231.2亿");
+  assert.equal(formatAmount(13300924740), "133.0亿");
+  assert.equal(formatAmount(91240000), "9124.0万");
+  assert.equal(formatAmount(4321), "4321");
+  // 缺数据或非正数不显示, 免得面板出现「额 0」这种噪音
+  assert.equal(formatAmount(null), "");
+  assert.equal(formatAmount(undefined), "");
+  assert.equal(formatAmount(0), "");
+  assert.equal(formatAmount(-5), "");
+  assert.equal(formatAmount("abc"), "");
+});
+
+test("liquidity line combines volume and amount and degrades gracefully", () => {
+  assert.equal(liquidityLabel({ volume: 556133, amount: 23124010140 }), "量 55.6万 · 额 231.2亿");
+  assert.equal(liquidityLabel({ volume: 426722 }), "量 42.7万");
+  assert.equal(liquidityLabel({ amount: 13300924740 }), "额 133.0亿");
+  assert.equal(liquidityLabel({}), "");          // 还没轮到第一次轮询: 不占位置
+  assert.equal(liquidityLabel(null), "");
+  assert.equal(liquidityLabel({ volume: 0, amount: null }), "量 0");
 });
 
 test("contract picker labels show the main month and yesterday's open interest", () => {

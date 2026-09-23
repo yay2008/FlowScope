@@ -41,11 +41,31 @@
     if (month) return { exchange: month[1].toUpperCase(), product: month[2], isCont: false };
     return null;
   }
+  // 持仓量/成交量的量级缩写。持仓量在服务端已归一成单边口径(见 catalog.single_side_open_interest),
+  // 所以这里的数字与自选面板的实时持仓量可比。
   function formatOpenInterest(value) {
     const n = Number(value) || 0;
     if (n >= 1e8) return (n / 1e8).toFixed(2) + "亿";
     if (n >= 1e4) return (n / 1e4).toFixed(1) + "万";
     return String(Math.round(n));
+  }
+  // 当日累计成交额(元)压成「23.1亿」这种便于一眼比较的量级写法。
+  function formatAmount(value) {
+    if (value == null) return "";
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    if (n >= 1e8) return (n / 1e8).toFixed(1) + "亿";
+    if (n >= 1e4) return (n / 1e4).toFixed(1) + "万";
+    return String(Math.round(n));
+  }
+  // 自选面板第三行: 当日成交量 + 成交额。两个都取不到就不占位置。
+  function liquidityLabel(row) {
+    if (!row) return "";
+    const parts = [];
+    if (row.volume != null) parts.push(`量 ${formatOpenInterest(row.volume)}`);
+    const amount = formatAmount(row.amount);
+    if (amount) parts.push(`额 ${amount}`);
+    return parts.join(" · ");
   }
   // 自选面板的一行: 主连写成「品种 · 主力月份」, 具体月份直接用合约中文名。
   function watchLabel(row) {
@@ -68,6 +88,7 @@
     return pct > 0 ? "up" : "down";
   }
   // 合约选择器的一行: 品种写成「燃油 · fu2611」(带当前主力月份), 月份写成「燃油2611 · 昨仓 42.8万」。
+  // 「昨仓」是单边口径的昨日持仓量, 与自选面板的实时持仓量(同为单边)可以直接比大小。
   function productLabel(product) {
     const name = (product && (product.name || product.productId)) || "";
     const month = String((product && product.mainSymbol) || "").split(".")[1] || "";
@@ -79,8 +100,8 @@
     return `${name} · 昨仓 ${formatOpenInterest(option.openInterest)}`;
   }
   const api = { mergeBars, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
-                parseSymbolParts, formatOpenInterest, watchLabel, formatPrice,
-                formatChangePct, changeClass, productLabel, monthLabel };
+                parseSymbolParts, formatOpenInterest, formatAmount, liquidityLabel,
+                watchLabel, formatPrice, formatChangePct, changeClass, productLabel, monthLabel };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.FlowData = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
