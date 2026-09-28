@@ -2,7 +2,8 @@
 import numpy as np
 import pandas as pd
 
-from indicator import BAR_NS, TZ_SHIFT_S, _classify_ticks, split_ticks_to_bars, build_footprint
+from indicator import (BAR_NS, TZ_SHIFT_S, _classify_ticks, split_ticks_to_bars, build_footprint,
+                       tick_bar_start)
 
 
 class TickAnalytics:
@@ -73,18 +74,25 @@ class TickAnalytics:
         self.version += 1
         self._hashes = hashes
         # 保留窗口边缘整根 bar 和一个前置 tick，以免裁剪后重算边缘 bar 丢量。
-        cutoff = int(raw.datetime.iloc[0]) // self.bar_ns * self.bar_ns
-        keep = np.flatnonzero(self.frame.datetime.to_numpy() >= cutoff)
+        cutoff = tick_bar_start(raw.datetime.iloc[0], self.bar_ns)
+        keep = np.flatnonzero(self._buckets() >= cutoff)
         if len(keep):
             self.frame = self.frame.iloc[max(0, int(keep[0]) - 1):].reset_index(drop=True)
+
+    def _buckets(self):
+        return tick_bar_start(self.frame.datetime, self.bar_ns).to_numpy()
+
+    def _dirty_tail(self):
+        """首个变化快照所在 bar 的起点, 以及从这根 bar 起的全部快照。"""
+        boundary = tick_bar_start(self.changed_ns, self.bar_ns)
+        return boundary, self.frame[self._buckets() >= boundary]
 
     def aggregate(self, ltf, first_bar_ns):
         cached, version = self._aggregates.get(ltf, (None, -1))
         if cached is None or version < self.version - 1:
             cached = split_ticks_to_bars(self.frame, ltf, classified=self.frame, bar_ns=self.bar_ns)
         elif version != self.version:
-            boundary = self.changed_ns // self.bar_ns * self.bar_ns
-            tail = self.frame[self.frame.datetime >= boundary]
+            boundary, tail = self._dirty_tail()
             fresh = split_ticks_to_bars(tail, ltf, classified=tail, bar_ns=self.bar_ns)
             cached = pd.concat([cached[cached.index < boundary], fresh])
         cached = cached[cached.index >= first_bar_ns]
@@ -96,9 +104,8 @@ class TickAnalytics:
             self._fp = build_footprint(klines, self.frame, tick_size, classified=self.frame,
                                        bar_ns=self.bar_ns)["bars"]
         elif self._fp_version != self.version:
-            boundary = self.changed_ns // self.bar_ns * self.bar_ns
+            boundary, tail = self._dirty_tail()
             boundary_s = boundary // 10**9 + TZ_SHIFT_S
-            tail = self.frame[self.frame.datetime >= boundary]
             fresh = build_footprint(klines, tail, tick_size, classified=tail,
                                     bar_ns=self.bar_ns)["bars"]
             self._fp = [bar for bar in self._fp if bar["time"] < boundary_s] + fresh

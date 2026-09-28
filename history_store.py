@@ -338,6 +338,7 @@ class HistoryStore:
         """
         if batch is None:
             return
+        self._dirty = True
         times, buys, sells, codes, extras = batch
         partial_mask = codes == 1
         legacy_mask = codes == 2
@@ -449,9 +450,14 @@ class HistoryStore:
         return bars
 
     def merge(self, bars):
-        """完整实时观测优先；否则使用已确认记录，最后才使用旧格式估算。"""
+        """完整实时观测优先；否则使用已确认记录，最后才使用旧格式估算。
+
+        换用已保存的记录时对照列也换成它自己的(由 _fill_extra 回填): 实时窗口的对照列
+        只覆盖半根 bar, 与保存的 buy/sell 拼成一行会被 save_completed 当成变化写回。
+        """
         self._ensure_index()
         result = bars.copy()
+        extras = [column for column in EXTRA_COLUMNS if column in result]
         for values, quality in [(self.values, SOURCE_COMPLETE),
                                 (self.estimates, SOURCE_PARTIAL),
                                 (self._legacy, SOURCE_LEGACY)]:
@@ -466,6 +472,7 @@ class HistoryStore:
                 result.loc[mask, "buy"] = times.map(lambda t: values[int(t)][0])
                 result.loc[mask, "sell"] = times.map(lambda t: values[int(t)][1])
                 result.loc[mask, "coverage"] = quality
+                result.loc[mask, extras] = np.nan
         result = self._fill_extra(result)
         result["delta"] = result["buy"] - result["sell"]
         result["deltaLegacy"] = result["buyLegacy"] - result["sellLegacy"]

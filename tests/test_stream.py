@@ -8,9 +8,16 @@ import pandas as pd
 
 import app as server
 import ingest
-from indicator import CFG, BAR_NS, build_bars, split_ticks_to_bars, _classify_ticks
+from indicator import (CFG, BAR_NS, TZ_SHIFT_S, build_bars, build_footprint, split_ticks_to_bars,
+                       _classify_ticks)
 from tick_analytics import TickAnalytics
-from test_data import BASE, ticks, klines
+from test_data import BASE, boundary_ticks, ticks, klines
+
+
+def full_bars(data, ltf=0):
+    """全量重算; 与 aggregate(ltf, BASE) 一样丢掉首根 K 线之前的桶(BASE 上的快照归前一根)。"""
+    bars = split_ticks_to_bars(data, ltf)
+    return bars[bars.index >= BASE]
 
 
 class IncrementalTests(unittest.TestCase):
@@ -22,8 +29,7 @@ class IncrementalTests(unittest.TestCase):
         for count in [2, 30, 31, 35, 60, 80, 100]:
             engine.update(data.iloc[:count])
             for ltf in CFG["ltfOptions"]:
-                expected = split_ticks_to_bars(data.iloc[:count], ltf)
-                pd.testing.assert_frame_equal(engine.aggregate(ltf, BASE), expected)
+                pd.testing.assert_frame_equal(engine.aggregate(ltf, BASE), full_bars(data.iloc[:count], ltf))
 
     def test_latest_tick_correction_replaces_volume_instead_of_adding(self):
         data = ticks()
@@ -81,8 +87,21 @@ class IncrementalTests(unittest.TestCase):
         engine = TickAnalytics()
         for count in range(1, len(data) + 1):
             engine.update(data.iloc[:count])
-            pd.testing.assert_frame_equal(engine.aggregate(0, BASE),
-                                          split_ticks_to_bars(data.iloc[:count], 0))
+            pd.testing.assert_frame_equal(engine.aggregate(0, BASE), full_bars(data.iloc[:count]))
+
+    def test_boundary_aligned_window_roll_matches_full_recompute(self):
+        """窗口左端常恰在 bar 边界上: 裁剪与脏 bar 重算都得按 (start, end] 取快照。"""
+        data = boundary_ticks(240)
+        k = pd.DataFrame({"datetime": [BASE + i * BAR_NS for i in range(4)],
+                          "open": [101.] * 4, "high": [103.] * 4, "low": [101.] * 4,
+                          "close": [102.] * 4, "volume": [0.] * 4})
+        coverage = {int(t) // 10**9 + TZ_SHIFT_S: "partial" for t in k.datetime}
+        engine = TickAnalytics()
+        for stop in [1, 60, 61, 120, 121, 180, 200, 240]:
+            engine.update(data.iloc[max(0, stop - 120):stop])
+            pd.testing.assert_frame_equal(engine.aggregate(0, BASE), full_bars(data.iloc[:stop]))
+            self.assertEqual(engine.footprint(k, 1., coverage)["bars"],
+                             build_footprint(k, data.iloc[:stop], 1., coverage=coverage)["bars"])
 
     def test_tick_gap_starts_new_coverage_boundary(self):
         data = ticks()

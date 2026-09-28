@@ -64,6 +64,19 @@ def ltf_options(tf_sec) -> list[int]:
     return [s for s in CFG["ltfOptions"] if s == 0 or (s <= bar and bar % s == 0)]
 
 
+def tick_bar_start(ns, bar_ns: int):
+    """快照时间(纳秒) -> 所属 bar 的起点; 标量、Series 均可。
+
+    快照 t 归入 (start, start + bar_ns]: 恰好落在边界上的快照记入前一根, 与 TqSdk
+    K 线的切分一致。上期所/能源中心的快照都在 500ms 整点, 每根 bar 都有一个落在边界上,
+    按 [start, end) 分桶会让相邻两根一多一少, 成交量几乎从不与 K 线相等。
+    tqSdk 序列的 datetime 是 float64, 纳秒在这个量级上的分辨率只有 256ns,
+    减 1 之前必须先转 int64。
+    """
+    ns = ns.astype("int64") if hasattr(ns, "astype") else int(ns)
+    return (ns - 1) // bar_ns * bar_ns
+
+
 def _finite(value):
     """None/NaN -> None, 其余转 float"""
     if value is None:
@@ -206,7 +219,8 @@ def split_ticks_to_bars(ticks: pd.DataFrame, ltf_sec: int = 0, *, classified=Non
                         bar_ns: int = BAR_NS) -> pd.DataFrame:
     """tick 序列 -> 每根主周期 bar 的主动买/卖/未知量。
 
-    bar_ns: 主周期宽度(纳秒), 由调用方按 tf 传入(见 bar_ns_for)。
+    bar_ns: 主周期宽度(纳秒), 由调用方按 tf 传入(见 bar_ns_for); 快照按 (start, end]
+            归属(见 tick_bar_start)。
     ltf_sec = 0: 按 tick 快照估算(见 _classify_ticks)。buy/sell/unknown 为新算法
                  (Lee-Ready), buyLegacy/sellLegacy 为旧算法, 同表并列便于对照;
                  恒等式 buy + sell + unknown == observed。
@@ -218,12 +232,12 @@ def split_ticks_to_bars(ticks: pd.DataFrame, ltf_sec: int = 0, *, classified=Non
     columns = ["buy", "sell", "unknown", "buyLegacy", "sellLegacy", "observed"]
     df = _classify_ticks(ticks) if classified is None else classified.copy()
     if df.empty:
-        return pd.DataFrame(columns=columns, index=pd.Index([], name="bar_ns"))
+        return pd.DataFrame(columns=columns, index=pd.Index([], dtype="int64", name="bar_ns"))
 
     if ltf_sec > 0:
         # 小周期聚合(粒度须整除主周期, 小周期不会横跨主周期 bar 边界)
         micro_ns = ltf_sec * 10**9
-        micro = (df["datetime"] // micro_ns) * micro_ns
+        micro = tick_bar_start(df["datetime"], micro_ns)
         g = df.groupby(micro)
         m_open = g["last_price"].first()
         m_close = g["last_price"].last()
@@ -244,7 +258,7 @@ def split_ticks_to_bars(ticks: pd.DataFrame, ltf_sec: int = 0, *, classified=Non
     df["buyLegacy"] = df["dv"].where(df["side"] == 1, 0.0)
     df["sellLegacy"] = df["dv"].where(df["side"] == -1, 0.0)
     df["observed"] = df["dv"]
-    return df.groupby((df["datetime"] // bar_ns) * bar_ns)[columns].sum().rename_axis("bar_ns")
+    return df.groupby(tick_bar_start(df["datetime"], bar_ns))[columns].sum().rename_axis("bar_ns")
 
 
 def build_footprint(klines: pd.DataFrame, ticks: pd.DataFrame, tick_size=None, *, classified=None,
@@ -268,7 +282,7 @@ def build_footprint(klines: pd.DataFrame, ticks: pd.DataFrame, tick_size=None, *
     df["buy"] = df["dv"].where(df["side_lr"] == 1, 0.0)
     df["sell"] = df["dv"].where(df["side_lr"] == -1, 0.0)
     df["unknown"] = df["dv"].where(df["side_lr"] == 0, 0.0)
-    df["bar_ns"] = (df["datetime"] // bar_ns) * bar_ns
+    df["bar_ns"] = tick_bar_start(df["datetime"], bar_ns)
     levels = df.groupby(["bar_ns", "price"])[["buy", "sell", "unknown"]].sum()
     # 500ms 快照常见无成交 tick(dv=0), 过滤零量档位避免 "0×0" 幽灵行;
     # 只判成"未知"的档位仍有成交量, 必须保留, 否则足迹图会静默丢量。
@@ -310,6 +324,8 @@ def build_bars(klines: pd.DataFrame, ticks: pd.DataFrame, ltf_sec: int = 0, *, c
 
     ltf_sec: 买卖量拆分粒度(秒), 0 = 逐 tick 按盘口判定, 见 split_ticks_to_bars
     bar_ns : 主周期宽度(纳秒), 只影响 tick 聚合的分桶; OHLC 仍来自 klines 本身
+    first_tick_ns: 基线快照时间, 它自己的区间量未知。bar 覆盖 (start, end](见 tick_bar_start),
+                   起点不早于基线的 bar 才可能被完整观测。
     """
     k = klines[["datetime", "open", "high", "low", "close", "volume"]].dropna(
         subset=["datetime", "close"])
@@ -326,9 +342,12 @@ def build_bars(klines: pd.DataFrame, ticks: pd.DataFrame, ltf_sec: int = 0, *, c
     if first_tick_ns is None and not classified.empty:
         first_tick_ns = int(classified["datetime"].iloc[0])
     if first_tick_ns is not None:
-        complete = (df["bar_ns"] > first_tick_ns) & np.isclose(df["observed"], df["volume"], rtol=0, atol=1e-6)
+        baseline = df["bar_ns"] >= first_tick_ns
+        complete = baseline & np.isclose(df["observed"], df["volume"], rtol=0, atol=1e-6)
         df.loc[complete, "coverage"] = "complete"
-    df["hasBaseline"] = (df["bar_ns"] > first_tick_ns) & df["observed"].notna() if first_tick_ns is not None else False
+        df["hasBaseline"] = baseline & df["observed"].notna()
+    else:
+        df["hasBaseline"] = False
     df = finalize_bars(df)
     df["time"] = (df["bar_ns"] // 10**9 + TZ_SHIFT_S).astype("int64")
     return df[BAR_COLUMNS]
@@ -363,7 +382,7 @@ def build_bars_from_ltf(klines: pd.DataFrame, lower: pd.DataFrame, ltf_sec: int,
     aggregates = grouped[["buy", "sell", "unknown", "buyLegacy",
                           "sellLegacy", "observed"]].sum().rename_axis("bar_ns")
     result = build_bars(klines, None, ltf_sec, classified=pd.DataFrame(), aggregates=aggregates,
-                        first_tick_ns=int(data.datetime.iloc[0]) - 1 if not data.empty else None,
+                        first_tick_ns=int(data.datetime.iloc[0]) if not data.empty else None,
                         bar_ns=bar_ns)
     if not result.empty:
         # 未覆盖整根主周期（包括最左侧截断和右侧未结束的 bar）保留部分覆盖标记。

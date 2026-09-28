@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from indicator import BAR_NS, build_bars, build_bars_from_ltf, build_footprint, _classify_ticks
+from indicator import (BAR_NS, build_bars, build_bars_from_ltf, build_footprint, _classify_ticks,
+                       split_ticks_to_bars)
 from history_store import HEADER, HistoryStore, _row_line
 
 
@@ -17,7 +18,8 @@ def bar_time(offset_sec):
     return (BASE + offset_sec * 10**9) // 10**9 + TZ_SHIFT
 
 
-def ticks(offsets=(0, 1, 30, 31, 60), prices=(101, 103, 101, 103, 103), volumes=(100, 110, 120, 130, 140)):
+def ticks(offsets=(0.5, 1, 30.5, 31, 60.5), prices=(101, 103, 101, 103, 103), volumes=(100, 110, 120, 130, 140)):
+    """默认快照都不在 bar 边界上, 两种分桶口径结果相同; 边界口径见 BoundaryTests。"""
     return pd.DataFrame({"datetime": [BASE + int(s * 1e9) for s in offsets],
                          "last_price": prices, "ask_price1": prices,
                          "bid_price1": [p - 1 for p in prices], "volume": volumes})
@@ -27,6 +29,44 @@ def klines():
     return pd.DataFrame({"datetime": [BASE + i * BAR_NS for i in range(3)],
                          "open": [101.] * 3, "high": [103.] * 3, "low": [101.] * 3,
                          "close": [103.] * 3, "volume": [20, 20, 10]})
+
+
+def boundary_ticks(count):
+    """上期所式快照: 每 500ms 一条, 恰在整点, 第 60k 条落在 30s bar 边界上。
+
+    区间量第 k 条为 k 手(逐条递增), 否则每根 bar 各含一条边界快照, 两种口径的量会恰好相同。
+    datetime 用 float64, 与 tqSdk 序列一致。
+    """
+    return pd.DataFrame({"datetime": [float(BASE + k * 500_000_000) for k in range(count)],
+                         "last_price": [101. + k % 3 for k in range(count)],
+                         "ask_price1": [102. + k % 3 for k in range(count)],
+                         "bid_price1": [101. + k % 3 for k in range(count)],
+                         "volume": [100. + k * (k + 1) // 2 for k in range(count)]})
+
+
+class BoundaryTests(unittest.TestCase):
+    """快照按 (start, end] 归属: 恰在边界上的一条记入前一根, 与 TqSdk K 线一致。"""
+
+    def test_snapshot_on_boundary_belongs_to_previous_bar(self):
+        data = ticks(offsets=(0.5, 29.5, 30, 30.5, 60))
+        for frame in (data, data.astype({"datetime": float})):
+            bars = split_ticks_to_bars(frame)
+            self.assertEqual(bars.index.tolist(), [BASE, BASE + BAR_NS])
+            self.assertEqual(bars.observed.tolist(), [20., 20.])
+
+    def test_boundary_aligned_snapshots_reconcile_with_klines(self):
+        """首条快照恰在 bar 起点上时, 它只是基线, 这根 bar 仍然完整。"""
+        k = klines()
+        k["volume"] = [sum(range(1, 61)), sum(range(61, 121)), sum(range(121, 181))]
+        bars = build_bars(k, boundary_ticks(181))
+        self.assertEqual(bars.coverage.tolist(), ["complete"] * 3)
+        self.assertTrue(bars.hasBaseline.all())
+
+    def test_footprint_puts_boundary_snapshot_into_previous_bar(self):
+        result = build_footprint(klines(), ticks(offsets=(0.5, 29.5, 30, 30.5, 60)))
+        self.assertEqual([bar["time"] for bar in result["bars"]], [bar_time(0), bar_time(30)])
+        self.assertEqual(result["bars"][0]["levels"], [[101., 0., 10., 0.], [103., 10., 0., 0.]])
+        self.assertEqual(result["bars"][1]["levels"], [[103., 20., 0., 0.]])
 
 
 class DataTests(unittest.TestCase):
@@ -91,6 +131,20 @@ class DataTests(unittest.TestCase):
             merged = store.merge(clipped)
             self.assertEqual(merged.iloc[1].buy, 10)
             self.assertEqual(merged.iloc[1].coverage, "complete")
+
+    def test_replaced_bar_takes_stored_legacy_columns_too(self):
+        """换用已保存记录时对照列一起换; 否则半根 bar 的对照列会被当成变化写回历史。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            store = HistoryStore(path)
+            store.save_completed(build_bars(klines(), ticks()))
+            before = path.read_text()
+            merged = store.merge(build_bars(klines(), ticks().iloc[3:]))
+            bar = merged.iloc[1]
+            self.assertEqual((bar.coverage, bar.buy, bar.sell), ("complete", 10, 10))
+            self.assertEqual((bar.unknown, bar.buyLegacy, bar.sellLegacy, bar.deltaLegacy), (0, 20, 0, 20))
+            store.save_completed(merged)
+            self.assertEqual(path.read_text(), before)
 
     def test_cvd_stays_fixed_after_window_shift_and_restart(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -282,6 +336,19 @@ class DataTests(unittest.TestCase):
                 handle.write("\n")
             self.assertTrue(store.refresh())
             self.assertEqual(store.values[10000], (8.0, 2.0))
+
+    def test_refreshed_rows_enter_the_cvd_accumulation(self):
+        """外部追加的已确认行必须进 CVD 累计, 不能停在追加之前的索引上。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            store = HistoryStore(path)
+            bars = build_bars(klines(), ticks())
+            store.save_completed(bars)
+            before = store.with_cvd(bars).iloc[-1].cvd
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(f"{bar_time(0) - 30},7,2,0,,,complete\n")   # 更早的一根, delta = 5
+            self.assertTrue(store.refresh())
+            self.assertEqual(store.with_cvd(bars).iloc[-1].cvd, before + 5)
 
     def test_refresh_after_truncation_rebuilds_from_scratch(self):
         with tempfile.TemporaryDirectory() as folder:

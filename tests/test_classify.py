@@ -92,7 +92,7 @@ class UnknownBucketTests(unittest.TestCase):
     def test_unknown_volume_kept_out_of_both_sides_but_in_observed(self):
         data = frame([(0, 4285, 4290, 4280, 100),
                       (1, 4285, 4290, 4280, 200)])
-        bar = split_ticks_to_bars(data).iloc[0]
+        bar = split_ticks_to_bars(data).loc[BASE]
         self.assertEqual((bar.buy, bar.sell, bar.unknown, bar.observed), (0., 0., 100., 100.))
         self.assertEqual(bar.buy + bar.sell + bar.unknown, bar.observed)
 
@@ -100,7 +100,7 @@ class UnknownBucketTests(unittest.TestCase):
         """旧算法没有未知桶, 盘口中间且无历史方向时这笔量两侧都不记。"""
         data = frame([(0, 4285, 4290, 4280, 100),
                       (1, 4285, 4290, 4280, 200)])
-        bar = split_ticks_to_bars(data).iloc[0]
+        bar = split_ticks_to_bars(data).loc[BASE]
         self.assertEqual(bar.buyLegacy + bar.sellLegacy, 0.0)
         self.assertEqual(bar.observed, 100.0)
         self.assertEqual(bar.unknown, 100.0)

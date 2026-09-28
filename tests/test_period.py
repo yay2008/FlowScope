@@ -77,9 +77,11 @@ class AggregationTests(unittest.TestCase):
                       (20, 4288, 4288, 4287, 400)])
         ten = split_ticks_to_bars(data, 0, bar_ns=bar_ns_for(10))
         thirty = split_ticks_to_bars(data, 0, bar_ns=bar_ns_for(30))
+        # 0/10/20 秒三条恰在边界上, 各自记入前一根 bar
         self.assertEqual([int(i) for i in ten.index],
-                         [BASE, BASE + 10**10, BASE + 2 * 10**10])
-        self.assertEqual([int(i) for i in thirty.index], [BASE])
+                         [BASE - 10**10, BASE, BASE + 10**10])
+        self.assertEqual(ten.observed.tolist(), [0., 160., 140.])
+        self.assertEqual([int(i) for i in thirty.index], [BASE - 3 * 10**10, BASE])
         # 守恒在两个周期下都成立
         for bars in (ten, thirty):
             self.assertTrue((bars.buy + bars.sell + bars.unknown == bars.observed).all())
@@ -87,7 +89,7 @@ class AggregationTests(unittest.TestCase):
 
     def test_build_bars_joins_the_period_klines_with_period_buckets(self):
         data = frame([(0, 4287, 4287, 4286, 100), (5, 4288, 4288, 4287, 200),
-                      (10, 4289, 4289, 4288, 300)])
+                      (15, 4289, 4289, 4288, 300)])
         bars = build_bars(klines(10, 2), data, 0, bar_ns=bar_ns_for(10))
         self.assertEqual(len(bars), 2)
         # observed 是内部列, 对外只能通过三个桶之和观察
