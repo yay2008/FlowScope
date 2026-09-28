@@ -1,4 +1,5 @@
 """data/ 快照备份: 打包内容、保留规则、到期判定与失败隔离。"""
+import os
 import tempfile
 import unittest
 import zipfile
@@ -74,6 +75,33 @@ class BackupTests(unittest.TestCase):
         scheduler = backup.BackupScheduler(lambda: self.data, lambda: blocker / "backups")
         self.assertIsNone(scheduler.run_once(NOW))
         self.assertIsNotNone(scheduler.status()["error"])
+
+    def test_non_os_error_is_reported_and_does_not_end_the_thread(self):
+        """zipfile 也会抛 ValueError/BadZipFile; 不能让后台线程悄悄退出、状态还显示正常。"""
+        scheduler = backup.BackupScheduler(lambda: self.data, lambda: self.dest)
+        with patch.object(backup, "create_snapshot", side_effect=ValueError("timestamps before 1980")):
+            self.assertIsNone(scheduler.run_once(NOW))
+        self.assertIn("ValueError", scheduler.status()["error"])
+        self.assertIsNotNone(scheduler.run_once(NOW))
+        self.assertIsNone(scheduler.status()["error"])
+
+    def test_snapshot_name_with_impossible_date_is_left_alone(self):
+        self.dest.mkdir()
+        stray = self.dest / "flowscope-data-20261399-250000.zip"
+        stray.write_bytes(b"not ours")
+        scheduler = backup.BackupScheduler(lambda: self.data, lambda: self.dest)
+        self.assertIsNotNone(scheduler.run_once(NOW))
+        with patch.object(backup, "WEEKLY_KEEP", 0):
+            backup.prune(self.dest, NOW + timedelta(days=1000))
+        self.assertEqual(scheduler.status()["count"], 0)
+        self.assertTrue(stray.exists())
+
+    def test_files_older_than_1980_are_still_backed_up(self):
+        """zip 格式存不了 1980 年以前的时间; 某个文件的 mtime 被工具清零时不能让备份从此每次失败。"""
+        os.utime(self.data / "a_v3.csv", (0, 0))
+        path = backup.create_snapshot(self.data, self.dest, NOW)
+        with zipfile.ZipFile(path) as archive:
+            self.assertEqual(archive.read("a_v3.csv"), b"time,buy\n1,2\n")
 
 
 if __name__ == "__main__":

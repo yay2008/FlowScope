@@ -280,7 +280,48 @@ class FeedLifecycleTests(unittest.TestCase):
         self.assertEqual(self.manager.status_snapshot()["collecting"], ["SHFE.pinned@30s"])
         self.manager.set_pinned([])
         self.manager._prune()
+        self.assertIn(key, self.manager.feeds)   # 移出集合只是开始计闲置, 见下一条
+        self.clock.advance(ingest.IDLE_EVICT_SEC)
+        self.manager._prune()
         self.assertNotIn(key, self.manager.feeds)
+
+    def test_unpinned_feed_gets_a_full_idle_period_before_eviction(self):
+        """常驻期间没人看图, 闲置时长从创建起算; 移出集合时若不重新计时, 下一轮就被回收,
+        而回收已订阅的 Feed 要关掉整条连接重建 —— 取消一个自选, 所有图表一起断几秒。"""
+        key = ("SHFE.pinned", 30)
+        self.manager.set_pinned([key])
+        feed = self.manager.feeds[key]
+        self.manager._sdk_feeds.add(feed)
+        self.clock.advance(ingest.IDLE_EVICT_SEC * 3)
+        self.manager.set_pinned([])
+        self.manager._prune()
+        self.assertIs(self.manager.feeds[key], feed)
+        self.assertFalse(self.manager._rebuild_api.is_set())
+        self.clock.advance(ingest.IDLE_EVICT_SEC)
+        self.manager._prune()
+        self.assertNotIn(key, self.manager.feeds)
+        self.assertTrue(self.manager._rebuild_api.is_set())
+
+    def test_subscribed_feeds_expiring_close_together_share_one_rebuild(self):
+        """连着取消几个自选/关几个页面, 回收时只重建一次连接; 没订阅过的 Feed 回收不花钱, 照常到期。"""
+        def ensure(name, subscribed=True):
+            feed = self.manager.ensure(f"SHFE.{name}")
+            if subscribed:
+                self.manager._sdk_feeds.add(feed)
+            return (feed.symbol, 30)
+        first = ensure("first")
+        self.clock.advance(10)
+        idle_only = ensure("idle-only", subscribed=False)
+        self.clock.advance(ingest.EVICT_BATCH_SEC - 10)
+        second = ensure("second")
+        self.clock.advance(1)
+        later = ensure("later")
+        self.clock.advance(ingest.IDLE_EVICT_SEC - ingest.EVICT_BATCH_SEC - 1)
+        self.manager._prune()
+        self.assertNotIn(first, self.manager.feeds)
+        self.assertNotIn(second, self.manager.feeds)
+        self.assertEqual(sorted(self.manager.feeds), sorted([idle_only, later]))
+        self.assertTrue(self.manager._rebuild_api.is_set())
 
     def test_pinned_set_is_capped_and_waits_for_a_free_slot(self):
         keys = [(f"SHFE.pin{index}", 30) for index in range(ingest.MAX_PINNED_FEEDS + 2)]

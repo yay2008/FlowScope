@@ -47,8 +47,13 @@ def snapshots(dest) -> list[tuple[datetime, Path]]:
         return found
     for path in folder.iterdir():
         match = _NAME.match(path.name)
-        if match and path.is_file():
-            found.append((datetime.strptime(match.group(1), _STAMP), path))
+        if not match or not path.is_file():
+            continue
+        try:
+            stamp = datetime.strptime(match.group(1), _STAMP)
+        except ValueError:
+            continue    # 形如快照、日期却不存在(手工改过名), 不是我们写的
+        found.append((stamp, path))
     return sorted(found, reverse=True)
 
 
@@ -65,7 +70,9 @@ def create_snapshot(source, dest, now: datetime | None = None) -> Path:
     root = Path(source)
     own = folder.resolve()
     try:
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        # zip 存不了 1980 年以前的修改时间; 某个文件的 mtime 被清零时按 1980 记, 不让备份从此每次失败。
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED,
+                             strict_timestamps=False) as archive:
             for path in sorted(root.rglob("*")):
                 if (path.is_file() and path.suffix != ".tmp"
                         and own not in path.resolve().parents):
@@ -119,7 +126,9 @@ class BackupScheduler:
                 return None
             path = create_snapshot(self._source(), dest, now)
             prune(dest, now)
-        except OSError as exc:
+        except Exception as exc:
+            # 不只是 OSError: zipfile 也会抛 ValueError 等。漏掉的异常会让后台线程悄悄退出,
+            # 状态接口却还显示没有错误。
             self.last_error = f"{type(exc).__name__}: {exc}"
             print(f"[backup] 备份失败: {self.last_error}", flush=True)
             return None

@@ -55,6 +55,9 @@ FAIL_RETRY_SEC = 30
 COMPUTE_RETRY_SEC = 1
 # 健康和失败 Feed 都按真实需求回收；后台自动重试不延长闲置期。
 IDLE_EVICT_SEC = 600
+# 回收订阅过的 Feed 要关掉整条连接重建(TqSdk 不能单独退订)。有一个到期时, 这么久之内
+# 也会到期的已订阅 Feed 一并回收: 连着取消几个自选、关几个页面只断一次, 不是一个一次。
+EVICT_BATCH_SEC = 60
 SYMBOL_RE = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*(?:@[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)?\Z")
 
 
@@ -503,11 +506,18 @@ class FeedManager:
         """设置常驻采集集合: 关掉所有页面也照常订阅、计算并落盘。
 
         keys 为 (合约, 主周期), 按优先级排列; 超出 MAX_PINNED_FEEDS 的部分不常驻,
-        在状态接口里列出。移出集合的 Feed 回到按真实需求闲置回收的规则。
+        在状态接口里列出。移出集合的 Feed 回到按真实需求闲置回收的规则, 闲置期从移出时起算。
         """
         ordered = list(dict.fromkeys(feed_key(validate_symbol(symbol), tf) for symbol, tf in keys))
         with self._lock:
-            self.pinned = ordered[:MAX_PINNED_FEEDS]
+            pinned = ordered[:MAX_PINNED_FEEDS]
+            # 常驻期间没人看图时闲置时长从创建起算, 早已超过回收期; 不重新计时, 下一轮就会
+            # 被回收, 而回收已订阅的 Feed 要重建整条连接, 所有图表一起断几秒。
+            for key in set(self.pinned) - set(pinned):
+                feed = self.feeds.get(key)
+                if feed is not None:
+                    feed.request(demand=True)
+            self.pinned = pinned
             self.pin_skipped = ordered[MAX_PINNED_FEEDS:]
             self._ensure_pinned()
             return list(self.pinned)
@@ -554,16 +564,21 @@ class FeedManager:
         """回收无人再要的 Feed, 否则 MAX_FEEDS 只增不减, 反复试错合约就会占满池子。
 
         自动重试不算真实需求；失败 Feed 也按最后一次真实请求起算，避免重试不断续命。
-        常驻采集的 Feed 不回收。
+        常驻采集的 Feed 不回收。要回收已订阅的 Feed 时, 把 EVICT_BATCH_SEC 内也会到期的
+        已订阅 Feed 一起回收, 合并成一次连接重建。
         """
         now = time.monotonic() if now is None else now
         with self._lock:
             busy = {key[:2] for key in self.clients.values()} | set(self.pinned)
-            for key, feed in list(self.feeds.items()):
-                if key in busy or feed.has_demand(now):
-                    continue
-                if feed.idle_for(now) >= IDLE_EVICT_SEC:
-                    self._forget(key)
+            idle = {key: feed.idle_for(now) for key, feed in self.feeds.items()
+                    if key not in busy and not feed.has_demand(now)}
+            due = [key for key, seconds in idle.items() if seconds >= IDLE_EVICT_SEC]
+            if any(self.feeds[key] in self._sdk_feeds for key in due):
+                due += [key for key, seconds in idle.items()
+                        if IDLE_EVICT_SEC - EVICT_BATCH_SEC <= seconds < IDLE_EVICT_SEC
+                        and self.feeds[key] in self._sdk_feeds]
+            for key in due:
+                self._forget(key)
 
     def _forget(self, key: tuple[str, int]):
         """必须在持有 self._lock 时调用。"""
