@@ -6,6 +6,8 @@
 - 闭市时初始数据回填不触发 wait_update 返回, 循环用 1s deadline 轮询兼容
 - 每根走完且覆盖完整的 bar 追加写入按粒度隔离的 v3 CSV(单文件, 行内 source 列区分
   完整量/估算量); 旧 CSV 仅作 legacy 回填。
+- 常驻采集集合(set_pinned, 由 app 按默认合约 + 自选设置)不依赖页面、不参与闲置回收;
+  页面临时打开的其它合约按真实需求回收。
 - tick 窗口最多 10000 条，更早的 buy/sell 靠 CSV 随运行时间累积。
 """
 from __future__ import annotations
@@ -36,6 +38,8 @@ MAX_TICKS = 10000     # 条数窗口；按 500ms 一条估算约 83 分钟
 MAX_KLINES = 2000     # K线根数窗口(与周期无关): 30s ≈ 2.5 个交易日, 10s ≈ 5.5 小时
 SNAPSHOT_BARS = 800   # 推送给前端的最近 bar 数(与周期无关)
 MAX_FEEDS = 32
+# 常驻采集(默认合约 + 自选)最多占用的 Feed 数, 其余名额留给页面临时打开的合约。
+MAX_PINNED_FEEDS = MAX_FEEDS // 2
 # 一次性 SDK 查询(合约目录、自选报价)的最长等待; 冷启动时可能要排队等采集线程连上。
 JOB_TIMEOUT_SEC = 12.0
 # 单个查询卡住超过这个时长就判定行情连接已不可用(只读缓存对象仍然能读到旧值, 所以
@@ -332,6 +336,9 @@ class FeedManager:
         self.last_error: str | None = None
         # 订阅失败登记: key -> {reason, retry_at}；仅控制主订阅冷却，不用于跳过计算错误。
         self.failed_feeds: dict[tuple[str, int], dict] = {}
+        # 常驻采集集合(见 set_pinned): 不依赖页面, 不参与闲置回收。
+        self.pinned: list[tuple[str, int]] = []
+        self.pin_skipped: list[tuple[str, int]] = []
         # 正在执行的 SDK 调用(查询或自检)的开始时刻; 跨线程读, 用于判定连接卡死。
         self._busy_since: float | None = None
         # 最近一次收到行情数据的时刻与最近一次连接自检的时刻。
@@ -492,6 +499,26 @@ class FeedManager:
                 self.cmd_q.put(key)
             return feed
 
+    def set_pinned(self, keys) -> list[tuple[str, int]]:
+        """设置常驻采集集合: 关掉所有页面也照常订阅、计算并落盘。
+
+        keys 为 (合约, 主周期), 按优先级排列; 超出 MAX_PINNED_FEEDS 的部分不常驻,
+        在状态接口里列出。移出集合的 Feed 回到按真实需求闲置回收的规则。
+        """
+        ordered = list(dict.fromkeys(feed_key(validate_symbol(symbol), tf) for symbol, tf in keys))
+        with self._lock:
+            self.pinned = ordered[:MAX_PINNED_FEEDS]
+            self.pin_skipped = ordered[MAX_PINNED_FEEDS:]
+            self._ensure_pinned()
+            return list(self.pinned)
+
+    def _ensure_pinned(self):
+        """补建缺失的常驻 Feed; 池子满时留到页面 Feed 回收后的下一轮。"""
+        with self._lock:
+            for key in self.pinned:
+                if key not in self.feeds and len(self.feeds) < MAX_FEEDS:
+                    self.feeds[key] = Feed(*key)
+
     def fail_feed(self, feed: Feed, message: str, now=None):
         """登记订阅冷却；采集循环自行检查截止时间，不跨线程操作 asyncio 定时器。"""
         key = feed_key(feed.symbol, feed.tf)
@@ -513,6 +540,9 @@ class FeedManager:
                     "feeds": sorted(feed_label(key) for key in self.feeds),
                     "failedFeeds": {feed_label(k): v["reason"]
                                     for k, v in self.failed_feeds.items()},
+                    # 常驻采集集合; collectSkipped 是超出名额、只在页面打开时才采集的部分
+                    "collecting": [feed_label(key) for key in self.pinned],
+                    "collectSkipped": [feed_label(key) for key in self.pin_skipped],
                     # 诊断"连接卡死"用: 排队查询数、当前调用已耗时、安静多久、上次自检结果
                     "jobQueue": self.jobs.qsize(),
                     "busySec": busy,
@@ -524,10 +554,11 @@ class FeedManager:
         """回收无人再要的 Feed, 否则 MAX_FEEDS 只增不减, 反复试错合约就会占满池子。
 
         自动重试不算真实需求；失败 Feed 也按最后一次真实请求起算，避免重试不断续命。
+        常驻采集的 Feed 不回收。
         """
         now = time.monotonic() if now is None else now
         with self._lock:
-            busy = {key[:2] for key in self.clients.values()}
+            busy = {key[:2] for key in self.clients.values()} | set(self.pinned)
             for key, feed in list(self.feeds.items()):
                 if key in busy or feed.has_demand(now):
                     continue
@@ -660,6 +691,7 @@ class FeedManager:
             self._rebuild_api.clear()  # 上一个连接已由 _run 关闭并释放。
         while not self._stop.is_set():
             self._prune()
+            self._ensure_pinned()
             if self._rebuild_api.is_set():
                 return True
             # 命令只负责登记新需求，订阅状态统一由 sweep 维护。

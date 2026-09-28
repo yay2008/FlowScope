@@ -232,6 +232,21 @@ class EndpointTests(unittest.TestCase):
         patched = patch.object(server, "favorites", self.service)
         patched.start()
         self.addCleanup(patched.stop)
+        self.manager = ingest.FeedManager()
+        patched = patch.object(server, "manager", self.manager)
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def test_collection_follows_default_symbol_and_favorites(self):
+        """常驻采集 = 默认合约 + 自选, 每个合约两个主周期; 与默认合约重复的自选不重复采集。"""
+        default = [("KQ.m@SHFE.fu", 10), ("KQ.m@SHFE.fu", 30)]
+        server.favorites_add("SHFE.fu2611")
+        self.assertEqual(self.manager.pinned, default + [("SHFE.fu2611", 10), ("SHFE.fu2611", 30)])
+        server.favorites_add("KQ.m@SHFE.fu")
+        self.assertEqual(len(self.manager.pinned), 4)
+        server.favorites_remove("SHFE.fu2611")
+        server.favorites_remove("KQ.m@SHFE.fu")
+        self.assertEqual(self.manager.pinned, default)
 
     def test_add_list_remove_round_trip(self):
         self.assertEqual(server.favorites_list(), {"symbols": [], "max": fav.MAX_FAVORITES})

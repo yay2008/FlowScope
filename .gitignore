@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 data/
+backups/
 .env
 .env.*
 !.env.example

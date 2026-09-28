@@ -265,6 +265,39 @@ class FeedLifecycleTests(unittest.TestCase):
         self.manager._prune()
         self.assertNotIn((feed.symbol, 30), self.manager.feeds)
 
+    def test_pinned_feed_is_collected_and_never_evicted_without_pages(self):
+        """关掉所有页面后常驻合约照常订阅、计算; 移出集合后才回到闲置回收。"""
+        key = ("SHFE.pinned", 30)
+        self.manager.set_pinned([key])
+        feed = self.manager.feeds[key]
+        feed.recompute = Mock()
+        api = ScriptedApi(self.manager, self.clock,
+                          [self.advance(ingest.IDLE_EVICT_SEC + 1), lambda api: None])
+        self.manager._run_api(api)
+        self.assertIs(self.manager.feeds[key], feed)
+        self.assertIs(self.manager._subscribed[key], feed)
+        self.assertGreaterEqual(feed.recompute.call_count, 2)
+        self.assertEqual(self.manager.status_snapshot()["collecting"], ["SHFE.pinned@30s"])
+        self.manager.set_pinned([])
+        self.manager._prune()
+        self.assertNotIn(key, self.manager.feeds)
+
+    def test_pinned_set_is_capped_and_waits_for_a_free_slot(self):
+        keys = [(f"SHFE.pin{index}", 30) for index in range(ingest.MAX_PINNED_FEEDS + 2)]
+        for index in range(ingest.MAX_FEEDS):
+            self.manager.ensure(f"SHFE.page{index}")
+        pinned = self.manager.set_pinned(keys)
+        self.assertEqual(pinned, keys[:ingest.MAX_PINNED_FEEDS])
+        self.assertEqual(self.manager.status_snapshot()["collectSkipped"],
+                         [f"SHFE.pin{index}@30s" for index in (ingest.MAX_PINNED_FEEDS,
+                                                               ingest.MAX_PINNED_FEEDS + 1)])
+        self.assertFalse(any(key in self.manager.feeds for key in pinned))
+        self.clock.advance(ingest.IDLE_EVICT_SEC + 1)
+        self.manager._prune()
+        self.manager._ensure_pinned()
+        self.assertEqual(sorted(self.manager.feeds), sorted(pinned))
+        self.manager.ensure("SHFE.page-after")
+
     def test_full_pool_accepts_new_subscription_after_idle_eviction(self):
         for index in range(ingest.MAX_FEEDS):
             self.manager.ensure(f"SHFE.test{index}")

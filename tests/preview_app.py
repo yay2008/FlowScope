@@ -3,6 +3,7 @@
 仅生成模拟行情，使用临时 CSV；不连接 TqSdk，不读取或改写真实历史。
 """
 import argparse
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -18,6 +19,8 @@ import uvicorn
 import app as server
 import catalog
 import ingest
+from backup import BackupScheduler
+from indicator import tick_bar_start
 
 
 class CatalogApi:
@@ -95,8 +98,7 @@ def tick_rows(first, count):
 
 
 def kline_rows(ticks, seconds=30):
-    width = seconds * 10**9
-    groups = ticks.groupby(ticks.datetime // width * width)
+    groups = ticks.groupby(tick_bar_start(ticks.datetime, seconds * 10**9))
     rows = groups.last_price.ohlc()
     rows["volume"] = groups.size() * 2
     return rows.reset_index()
@@ -123,7 +125,7 @@ class PreviewManager(ingest.FeedManager):
                 else:
                     fresh = tick_rows(int(feed.ticks.id.iloc[-1]) + 1, 1)
                     feed.ticks = pd.concat([feed.ticks, fresh], ignore_index=True).tail(10000)
-                    boundary = int(fresh.datetime.iloc[0]) // feed.bar_ns * feed.bar_ns
+                    boundary = tick_bar_start(int(fresh.datetime.iloc[0]), feed.bar_ns)
                     last = feed.klines.iloc[-1]
                     price = float(fresh.last_price.iloc[0])
                     if int(last.datetime) == boundary:
@@ -161,8 +163,12 @@ if __name__ == "__main__":
     parser.add_argument("--duration", type=int, default=0)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="flowscope-preview-") as directory:
-        ingest.DATA_DIR = directory
+        ingest.DATA_DIR = os.path.join(directory, "data")
+        os.makedirs(ingest.DATA_DIR)
         server.manager = PreviewManager()
+        # 模拟数据的快照必须留在临时目录: 混进真实 backups/ 会被当成最新一份, 推迟真实备份。
+        server.backups = BackupScheduler(lambda: ingest.DATA_DIR,
+                                         lambda: os.path.join(directory, "backups"))
         # 预置几个自选, 打开页面就能看到面板(写在临时数据目录里, 不碰真实自选)。
         for symbol in ("KQ.m@SHFE.fu", "KQ.m@DCE.i", "KQ.m@CZCE.TA"):
             server.favorites.add(symbol)

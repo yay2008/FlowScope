@@ -15,14 +15,17 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 import ingest
+from backup import BackupScheduler
 from catalog import CatalogService
 from favorites import FavoriteStore, FavoritesService, MAX_FAVORITES
-from indicator import CFG, DEFAULT_TF_SEC, ltf_options
+from indicator import CFG, DEFAULT_TF_SEC, TF_OPTIONS, ltf_options
 from ingest import FeedManager, period_cfg, validate_symbol, validate_tf
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "KQ.m@SHFE.fu"
 FAVORITES_FILE = "favorites.json"
+# 常驻采集的主周期: 每个周期的历史各自落盘, 都要在无人看图时继续积累。
+COLLECT_TFS = TF_OPTIONS
 
 app = FastAPI(title="FlowScope")
 manager = FeedManager()
@@ -32,6 +35,7 @@ catalog = CatalogService(lambda: manager)
 # 自选文件落在数据目录里(DATA_DIR 在调用时现取, 便于测试/预览替换)。
 favorites = FavoritesService(lambda: manager,
                              FavoriteStore(lambda: os.path.join(ingest.DATA_DIR, FAVORITES_FILE)))
+backups = BackupScheduler(lambda: ingest.DATA_DIR)
 
 
 def require_feed(symbol: str, tf: int):
@@ -50,15 +54,27 @@ def require_feed(symbol: str, tf: int):
     return feed
 
 
+def collection_keys() -> list[tuple[str, int]]:
+    """常驻采集集合: 默认合约 + 自选(按面板顺序), 每个合约采全部主周期。"""
+    symbols = list(dict.fromkeys([DEFAULT_SYMBOL, *favorites.symbols()]))
+    return [(symbol, tf) for symbol in symbols for tf in COLLECT_TFS]
+
+
+def sync_collection():
+    manager.set_pinned(collection_keys())
+
+
 @app.on_event("startup")
 async def _startup():
     manager.start(asyncio.get_running_loop())
-    manager.ensure(DEFAULT_SYMBOL)
+    sync_collection()
+    backups.start()
 
 
 @app.on_event("shutdown")
 async def _shutdown():
     manager.stop()
+    backups.stop()
 
 
 @app.get("/api/history")
@@ -95,8 +111,8 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_
 
 @app.get("/api/status")
 def status():
-    """返回行情采集线程状态，便于前端和运维判断 pending 原因。"""
-    return manager.status_snapshot()
+    """返回行情采集线程状态(含常驻采集集合)与数据备份状态，便于判断 pending 原因。"""
+    return {**manager.status_snapshot(), "backup": backups.status()}
 
 
 @app.get("/api/symbols")
@@ -125,7 +141,11 @@ async def symbol_label(symbol: str = DEFAULT_SYMBOL):
 
 @app.get("/api/favorites")
 def favorites_list():
-    """自选合约代码列表(服务端保存, 顺序即面板显示顺序)。"""
+    """自选合约代码列表(服务端保存, 顺序即面板显示顺序)。
+
+    顺带同步常驻采集集合: 自选文件被手工改过时, 面板下一次读列表就能跟上。
+    """
+    sync_collection()
     return {"symbols": favorites.symbols(), "max": MAX_FAVORITES}
 
 
@@ -143,9 +163,11 @@ def favorites_remove(symbol: str):
 
 def _favorite_change(action, symbol: str):
     try:
-        return {"symbols": action(symbol), "max": MAX_FAVORITES}
+        symbols = action(symbol)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    sync_collection()
+    return {"symbols": symbols, "max": MAX_FAVORITES}
 
 
 @app.get("/api/watch")
