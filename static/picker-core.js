@@ -88,8 +88,12 @@
       }
       case "Home":
       case "End": {
+        if (state.level === "month") {
+          // 二级按月份数算末项, 不是品种数 —— 否则光标落到列表之外, 高亮消失、回车无效
+          const last = key === "Home" ? 0 : Math.max(0, monthList.length - 1);
+          return { state: { ...state, monthIndex: last }, action: NO_ACTION };
+        }
         const index = key === "Home" ? 0 : Math.max(0, list.length - 1);
-        if (state.level === "month") return { state: { ...state, monthIndex: index }, action: NO_ACTION };
         if (index === state.productIndex) return same;
         return { state: { ...state, productIndex: index }, action: { type: "prefetch", index } };
       }

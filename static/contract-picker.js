@@ -87,13 +87,40 @@
 
     function applyCatalog(data) {
       generation += 1;                                  // 上一份目录的月份请求全部作废
+      // 常见时序: 先用缓存画出菜单, 用户已经 ↑↓ 选到某个品种, 网络目录才到。光标要跟着
+      // 那个品种走(新目录里它可能换了位置), 不能归零 —— 否则紧接着的 Enter 会切到第一个品种。
+      const keepKey = productKey(activeProduct());
+      const keepLevel = level;
+      const keepMonth = monthIndex;
+      // 已经取到的月份也带过去, 否则二级在重取完成前只剩「★ 主力」, 月份光标会落到列表之外。
+      // 只带成功的结果: 取到一半的请求会因为换代被丢弃, 带过去的 loading 状态就永远不会结束。
+      const keepMonths = monthState.get(keepKey);
       monthState = new Map();
+      if (keepMonths && keepMonths.status === "ready" && !keepMonths.error) {
+        monthState.set(keepKey, keepMonths);
+      }
       products = core.flattenGroups((data && data.groups) || []);
       productIndex = 0;
       level = "product";
       monthIndex = 0;
       activeKey = "";
+      if (keepKey) {
+        const index = core.filterProducts(products, query()).findIndex((item) => productKey(item) === keepKey);
+        if (index >= 0) {
+          productIndex = index;
+          level = keepLevel;
+          monthIndex = keepMonth;
+          activeKey = keepKey;                          // 同一品种: followActive 不必再把月份光标归零
+        }
+      }
       applyFilter(false);
+      if (level === "month") {
+        const last = Math.max(0, currentOptions().length - 1);
+        if (monthIndex > last) {
+          monthIndex = last;
+          renderHighlight();
+        }
+      }
       if (data && data.source === "fallback") {
         setStatus("目录: 离线常用品种", data.error || "");
       } else if (data && data.error) {
@@ -160,7 +187,9 @@
       const known = monthState.get(key);
       if (known) {
         // 取失败不是永久状态: 隔一会儿(下次悬停/打开/搜索命中它时)再试一次
-        const retryable = known.status === "error" && now() - (known.at || 0) >= MONTHS_RETRY_MS;
+        // 服务端把月份查询失败(超时、连接无响应)包成 200 + monthsError 返回, 也算失败
+        const failed = known.status === "error" || (known.status === "ready" && known.error);
+        const retryable = failed && now() - (known.at || 0) >= MONTHS_RETRY_MS;
         if (!retryable) return;
       }
       const ticket = generation;

@@ -102,3 +102,16 @@ test("二级上下键移动月份, Esc/Tab 关闭菜单", () => {
   }
   assert.deepEqual(reduceKey(state, "a", PRODUCTS, MONTHS).action, { type: "none" });
 });
+
+test("二级 Home/End 按月份数跳到首尾, 不是按品种数", () => {
+  // 3 个品种、2 个月份: End 若按品种数算会落到下标 2, 超出月份列表
+  const state = { level: "month", productIndex: 0, monthIndex: 0 };
+  const end = reduceKey(state, "End", PRODUCTS, MONTHS);
+  assert.equal(end.state.monthIndex, MONTHS.length - 1);
+  assert.equal(end.state.productIndex, 0);
+  assert.deepEqual(end.action, { type: "none" });
+  const pick = reduceKey(end.state, "Enter", PRODUCTS, MONTHS);
+  assert.deepEqual(pick.action, { type: "pick", symbol: "SHFE.fu2701" });
+  assert.equal(reduceKey(end.state, "Home", PRODUCTS, MONTHS).state.monthIndex, 0);
+  assert.equal(reduceKey(state, "End", PRODUCTS, []).state.monthIndex, 0);   // 空列表不越界
+});

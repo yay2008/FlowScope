@@ -17,6 +17,8 @@ const cfg = {
 };
 
 // ---------------- 与 app.js 完全一致的函数 ----------------
+// (2026-09-28 起 app.js 的 rollingSma/rollingZ 也改为"窗口含 null 即输出 null", 与这里一致;
+//  此前 app.js 把 null 当 0, 本脚本复算的结果与当时页面显示并不相同。)
 function rollingSma(v, n) {
   const out = new Array(v.length).fill(null);
   let s = 0, bad = 0;
@@ -35,9 +37,9 @@ function rollingZ(v, n) {
     if (cnt < n) continue;
     const mean = sum / n;
     let sq = 0;
-    for (let j = i - n + 1; j <= i; j++) { const d = (v[j] == null ? 0 : v[j]) - mean; sq += d * d; }
+    for (let j = i - n + 1; j <= i; j++) { const d = v[j] - mean; sq += d * d; }
     const sd = Math.sqrt(sq / n);
-    out[i] = sd === 0 ? null : ((v[i] == null ? 0 : v[i]) - mean) / sd;
+    out[i] = sd === 0 ? null : (v[i] - mean) / sd;
   }
   return out;
 }

@@ -352,32 +352,34 @@ addPaneLabel(2, "FlowWave");
 
 // ---------- 指标计算(前端, 移植 Volume Suite 阈值逻辑) ----------
 
+// 滚动均值/标准分: 窗口里只要有一根是 null(coverage=missing 的买卖量、预热期的相对值)就输出 null,
+// 与 ta.sma / ta.stdev 的口径一致。缺失不能当 0: 缺口之后的窗口均值会被拉低, 紧跟缺口的 bar
+// 就被判成高档位(实测 SMA 模式缺口后 60 根全部 ≥2 档)。代价是缺口之后要等满一个窗口才重新出档位。
 function rollingSma(v, n) {
   const out = new Array(v.length).fill(null);
-  let s = 0;
+  let s = 0, bad = 0;
   for (let i = 0; i < v.length; i++) {
-    s += v[i] == null ? 0 : v[i];
-    if (i >= n) s -= v[i - n] == null ? 0 : v[i - n];
-    out[i] = i >= n - 1 ? s / n : null;
+    if (v[i] == null) bad++; else s += v[i];
+    if (i >= n) { if (v[i - n] == null) bad--; else s -= v[i - n]; }
+    out[i] = i >= n - 1 && bad === 0 ? s / n : null;
   }
   return out;
 }
 
 function rollingZ(v, n) {
   const out = new Array(v.length).fill(null);
-  let s = 0, s2 = 0;
+  let s = 0, s2 = 0, bad = 0;
   for (let i = 0; i < v.length; i++) {
-    const x = v[i] == null ? 0 : v[i];
-    s += x; s2 += x * x;
+    if (v[i] == null) bad++; else { s += v[i]; s2 += v[i] * v[i]; }
     if (i >= n) {
-      const y = v[i - n] == null ? 0 : v[i - n];
-      s -= y; s2 -= y * y;
+      const y = v[i - n];
+      if (y == null) bad--; else { s -= y; s2 -= y * y; }
     }
-    if (i >= n - 1) {
+    if (i >= n - 1 && bad === 0) {
       const mean = s / n;
       const variance = Math.max(s2 / n - mean * mean, 0);
       const sd = Math.sqrt(variance);
-      out[i] = sd === 0 ? null : ((v[i] == null ? 0 : v[i]) - mean) / sd;
+      out[i] = sd === 0 ? null : (v[i] - mean) / sd;
     }
   }
   return out;
@@ -909,7 +911,9 @@ function applyLtfOptions(options) {
 function applyPeriod() {
   document.title = `FlowScope · ${tf}s`;
   $("tf").value = String(tf);
-  applyLtfOptions(cfg && cfg.ltfOptions);
+  // cfg 是上一次加载的周期下发的: 刚切周期时它还是旧周期的合法粒度(30s 的 15 在 10s 下不合法),
+  // 只有周期对得上才用它, 否则按本地表收敛, 免得带着非法 ltf 去请求。
+  applyLtfOptions(cfg && cfg.tf === tf ? cfg.ltfOptions : null);
 }
 $("cvd-source").addEventListener("change", (e) => {
   cvdSource = e.target.value;
@@ -1104,10 +1108,24 @@ async function pollWatch() {
   }
 }
 
+// 连着点几个 ☆ 时请求并发, 响应可能乱序到达(收藏前服务端要先查一次合约服务, 移出则是即时的,
+// 所以服务端的处理顺序也不一定等于点击顺序): 只采用最后发出的那次的响应, 晚到的旧响应不能把
+// 列表写回旧状态。丢弃过旧响应时, 等这一批请求全部结束再以服务端为准重读一次。
+let favoriteSeq = 0;
+let favoritesInFlight = 0;
+let favoritesStale = false;
+
 async function changeFavorite(code, wanted) {
+  const seq = ++favoriteSeq;
+  favoritesInFlight += 1;
   try {
     const data = await fetchJson(`/api/favorites?symbol=${encodeURIComponent(code)}`,
                                  { method: wanted ? "POST" : "DELETE" });
+    if (seq !== favoriteSeq) {
+      if (!wanted) watchRows.delete(code);
+      favoritesStale = true;
+      return;
+    }
     favorites = data.symbols || [];
     if (!wanted) watchRows.delete(code);
     setWatchHint("");
@@ -1118,12 +1136,19 @@ async function changeFavorite(code, wanted) {
   } catch (error) {
     setWatchHint((wanted ? "收藏失败：" : "移出失败：") + error.message);
     setPickerHint((wanted ? "收藏失败：" : "移出失败：") + error.message);
+  } finally {
+    favoritesInFlight -= 1;
+    if (favoritesInFlight === 0 && favoritesStale) {
+      favoritesStale = false;
+      loadFavorites();
+    }
   }
 }
 
 async function loadFavorites() {
   try {
     const data = await fetchJson("/api/favorites");
+    if (favoritesInFlight) return;     // 读的途中又有新改动: 以那次改动的响应为准
     favorites = data.symbols || [];
     renderWatch();
     picker.refreshFavorites();         // 目录可能比自选先到, 到齐后补画一次

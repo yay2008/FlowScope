@@ -167,8 +167,9 @@ function jsonResponse(payload) {
   return { ok: true, status: 200, json: async () => payload };
 }
 
-function runBrowser() {
+function runBrowser(options = {}) {
   const document = createDocument();
+  const fetchImpl = options.fetch || stubFetch;
   const context = {
     document,
     localStorage: createLocalStorage(),
@@ -188,7 +189,7 @@ function runBrowser() {
     clearInterval: () => {},
     requestAnimationFrame: () => 0,
     cancelAnimationFrame: () => {},
-    fetch: (url) => stubFetch(url),
+    fetch: (url, init) => fetchImpl(url, init),
     WebSocket: class { constructor() { this.readyState = 0; } send() {} close() {} },
     LightweightCharts: {
       createChart: createChartStub,
@@ -526,4 +527,146 @@ test("叠加带的 custom series 满足 lightweight-charts 契约", () => {
   assert.equal(r.values[1], 12);
   assert.equal(r.values[2], 10);
   assert.equal(r.options.lastValueVisible, false);
+});
+
+// ---------- 阈值窗口遇到缺失 bar ----------
+
+test("滚动均值/标准分: 窗口里有一根 null 就输出 null, 不把缺失当 0", () => {
+  const context = runBrowser();
+  const r = {};
+  const raw = vm.runInContext(`(() => {
+    const v = [1, 2, 3, null, 5, 6, 7, 8];
+    return JSON.stringify({ sma: rollingSma(v, 3), z: rollingZ(v, 3) });
+  })()`, context);
+  Object.assign(r, JSON.parse(raw));
+  // 下标 3..5 的窗口都含那根 null
+  assert.deepEqual(r.sma, [null, null, 2, null, null, null, 6, 7]);
+  assert.deepEqual(r.z.slice(0, 6), [null, null, r.z[2], null, null, null]);
+  assert.ok(Math.abs(r.z[2] - Math.sqrt(1.5)) < 1e-12, "完整窗口 [1,2,3] 的末点 z = (3-2)/sqrt(2/3)");
+  assert.ok(Math.abs(r.z[6] - Math.sqrt(1.5)) < 1e-12, "缺口滑出窗口后恢复计算");
+});
+
+test("缺失段之后不会被误判成高档位", () => {
+  // 复现: 新开合约时 tick 窗口只覆盖末尾, 前面的 bar 是 coverage=missing(买卖量为 null)。
+  // 以前 null 被当 0 放进窗口, 缺口后的均值被拉低, 紧跟缺口的 bar 全被判成 2~3 档。
+  const context = runBrowser();
+  const r = vm.runInContext(`(() => {
+    cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
+    bars = [];
+    let seed = 7;
+    const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    for (let i = 0; i < 700; i++) {
+      const missing = i < 600;
+      const buy = missing ? null : 40 + rand() * 40;
+      const sell = missing ? null : 40 + rand() * 40;
+      bars.push({ time: 1700000000 + i * 30, open: 100, high: 101, low: 99, close: 100 + (i % 2),
+                  volume: 100 + rand() * 20, buy, sell, delta: missing ? null : buy - sell,
+                  coverage: missing ? "missing" : "complete" });
+    }
+    derive();
+    const result = {};
+    for (const type of ["Z-SCORE", "SMA", "RELATIVE"]) {
+      threshtype = type;
+      sma300Cache = null;
+      let high = 0;
+      for (let i = 600; i < 660; i++) {
+        for (const kind of ["buy", "sell"]) if (levelOf(kind, i) >= 2) high++;
+      }
+      result[type] = high;
+    }
+    return JSON.stringify(result);
+  })()`, context);
+  assert.deepEqual(JSON.parse(r), { "Z-SCORE": 0, SMA: 0, RELATIVE: 0 });
+});
+
+// ---------- 切周期时的拆分粒度 ----------
+
+function historyRecorder(calls) {
+  return (url) => {
+    const text = String(url);
+    if (text.startsWith("/api/history")) {
+      calls.push(new URLSearchParams(text.slice(text.indexOf("?") + 1)));
+      return new Promise(() => {});   // 让加载停在请求上, 只观察发出的参数
+    }
+    return stubFetch(url);
+  };
+}
+
+test("K 线口径 15s 下从 30s 切到 10s, 请求的粒度先收敛成 10s 的合法值", async () => {
+  const calls = [];
+  const context = runBrowser({ fetch: historyRecorder(calls) });
+  const ltfSelect = context.document.getElementById("ltf");
+  ltfSelect.options = [1, 5, 10, 15, 30].map((value) => ({ value: String(value), disabled: false }));
+  // 上一次加载的是 30s: 服务端下发的 cfg 带着 30s 的合法粒度(含 15)
+  vm.runInContext(`cfg = { tf: 30, ltfOptions: [0, 1, 5, 10, 15, 30] };`, context);
+  context.document.getElementById("cvd-source").handlers.change[0]({ target: { value: "kline" } });
+  ltfSelect.handlers.change[0]({ target: { value: "15" } });
+  assert.equal(calls[calls.length - 1].get("ltf"), "15");
+  context.document.getElementById("tf").handlers.change[0]({ target: { value: "10" } });
+  const last = calls[calls.length - 1];
+  assert.equal(last.get("tf"), "10");
+  assert.equal(last.get("ltf"), "10", "15 不能整除 10, 应回落到 10s 周期下最粗的合法粒度");
+  assert.equal(ltfSelect.options.find((o) => o.value === "15").disabled, true);
+});
+
+// ---------- 自选请求乱序 ----------
+
+test("连点两个 ☆ 时晚到的旧响应不会覆盖新列表", async () => {
+  const pending = [];
+  let server = [];                                   // 服务端的真实自选
+  const context = runBrowser({
+    fetch: (url, init) => {
+      const text = String(url);
+      if (text.startsWith("/api/favorites?")) {
+        return new Promise((resolve) => pending.push({ text, method: init && init.method, resolve }));
+      }
+      if (text === "/api/favorites") return Promise.resolve(jsonResponse({ symbols: server, max: 40 }));
+      return stubFetch(url);
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+  const favorites = () => JSON.parse(vm.runInContext("JSON.stringify(favorites)", context));
+
+  vm.runInContext(`changeFavorite("KQ.m@SHFE.fu", true); changeFavorite("KQ.m@DCE.i", true);`, context);
+  assert.equal(pending.length, 2);
+  // 服务端依次处理完两次收藏; 后发的那次先回来(带着完整列表), 先发的那次后回来
+  server = ["KQ.m@SHFE.fu", "KQ.m@DCE.i"];
+  pending[1].resolve(jsonResponse({ symbols: ["KQ.m@SHFE.fu", "KQ.m@DCE.i"], max: 40 }));
+  await tick();
+  assert.deepEqual(favorites(), ["KQ.m@SHFE.fu", "KQ.m@DCE.i"]);
+  pending[0].resolve(jsonResponse({ symbols: ["KQ.m@SHFE.fu"], max: 40 }));
+  await tick();
+  await tick();
+  assert.deepEqual(favorites(), ["KQ.m@SHFE.fu", "KQ.m@DCE.i"], "旧响应不得把 DCE.i 冲掉");
+});
+
+test("丢弃过旧响应后, 以服务端的当前列表为准重读一次", async () => {
+  // 服务端处理顺序不一定等于点击顺序(收藏要先查合约服务, 移出是即时的): 最后发出的那次
+  // 的响应也可能不是最新状态, 所以这一批请求结束后要重读 /api/favorites。
+  const pending = [];
+  let listReads = 0;
+  const context = runBrowser({
+    fetch: (url, init) => {
+      const text = String(url);
+      if (text.startsWith("/api/favorites?")) {
+        return new Promise((resolve) => pending.push({ resolve }));
+      }
+      if (text === "/api/favorites") {
+        listReads += 1;
+        return Promise.resolve(jsonResponse({ symbols: listReads > 1 ? ["KQ.m@DCE.i"] : [], max: 40 }));
+      }
+      return stubFetch(url);
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+  vm.runInContext(`changeFavorite("KQ.m@DCE.i", true); changeFavorite("KQ.m@SHFE.fu", false);`, context);
+  pending[1].resolve(jsonResponse({ symbols: [], max: 40 }));       // 移出先处理完, 那时 DCE.i 还没加上
+  await tick();
+  pending[0].resolve(jsonResponse({ symbols: ["KQ.m@DCE.i"], max: 40 }));
+  await tick();
+  await tick();
+  assert.equal(listReads, 2, "丢弃过旧响应后应重读一次列表");
+  assert.deepEqual(JSON.parse(vm.runInContext("JSON.stringify(favorites)", context)), ["KQ.m@DCE.i"]);
 });

@@ -299,12 +299,20 @@ test("目录接口失败时用 localStorage 缓存渲染, 且不报错给用户"
   assert.deepEqual(statuses.map(([text]) => text), [""]);
 });
 
-test("没有缓存且目录失败时给出可手填的提示", async () => {
+test("没有缓存且目录失败时给出可手填的提示", async (t) => {
+  // 失败后会按 10 秒间隔自动重试 5 次; 用真定时器这一条要空等 50 秒
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const ticks = async (count = 6) => { for (let i = 0; i < count; i++) await Promise.resolve(); };
   const { picker, statuses } = setup({ fetchJson: () => Promise.reject(new Error("offline")) });
   picker.load();
-  await flush();
+  await ticks();
   assert.equal(statuses[0][0], "合约目录加载失败（1/6），可直接手填合约");
   assert.equal(statuses[0][1], "offline");
+  for (let i = 0; i < 5; i++) {                    // 剩下 5 次重试, 之后不再排定时器
+    t.mock.timers.tick(10000);
+    await ticks();
+  }
+  assert.equal(statuses[statuses.length - 1][0], "合约目录加载失败（6/6），可直接手填合约");
 });
 
 test("月份请求失败时二级只剩★主力可选, 并说明原因", async () => {
@@ -353,6 +361,107 @@ test("月份失败不是永久状态: 冷却期过后重新打开会再试一次
   assert.equal(calls.filter((url) => url.startsWith("/api/symbols?")).length, attempts + 1);
   assert.match(el.months.textContent, /★ 燃油2611/);
   assert.doesNotMatch(el.months.textContent, /暂不可用/);
+});
+
+test("服务端把月份失败包成 200 + monthsError 时, 冷却期过后也会重试", async () => {
+  // catalog.py 捕获超时/连接无响应后照样回 200, 只在 monthsError 里写原因
+  let clock = 1000;
+  let failing = true;
+  const { el, picker, calls } = setup({
+    now: () => clock,
+    fetchJson: (url) => {
+      if (url === "/api/symbols") return Promise.resolve(CATALOG);
+      if (failing) return Promise.resolve({ months: [], monthsError: "RuntimeError: 合约查询超时(12 秒)" });
+      const params = new URLSearchParams(url.slice(url.indexOf("?") + 1));
+      return Promise.resolve(MONTHS[`${params.get("exchange")}.${params.get("product")}`]);
+    },
+  });
+  picker.load();
+  await flush();
+  assert.match(el.months.textContent, /暂不可用（稍后自动重试）：RuntimeError: 合约查询超时/);
+  const attempts = calls.filter((url) => url.startsWith("/api/symbols?")).length;
+  picker.close();
+  picker.open();                                   // 冷却期内不重复打接口
+  await flush();
+  assert.equal(calls.filter((url) => url.startsWith("/api/symbols?")).length, attempts);
+  failing = false;
+  clock += 9000;
+  picker.close();
+  picker.open();
+  await flush();
+  assert.equal(calls.filter((url) => url.startsWith("/api/symbols?")).length, attempts + 1);
+  assert.match(el.months.textContent, /★ 燃油2611/);
+  assert.doesNotMatch(el.months.textContent, /暂不可用/);
+});
+
+test("网络目录晚于缓存到达时, 光标仍停在用户选中的品种上", async () => {
+  // 先用缓存画出菜单, 用户 ↓↓ 选到铁矿石, 网络目录这时才到: 回车必须还是铁矿石
+  const storage = makeStorage({ "flowscope.catalog.v1": JSON.stringify({ at: 1, groups: CATALOG.groups }) });
+  let release;
+  const network = new Promise((resolve) => { release = resolve; });
+  // 新目录里铁矿石前面多了一个品种(下标 2 → 3), 光标要跟着品种走, 既不归零也不停在原下标
+  const coke = { exchangeId: "DCE", productId: "j", name: "焦炭", contSymbol: "KQ.m@DCE.j",
+                 mainSymbol: "DCE.j2701", openInterest: 900000 };
+  const reordered = { ...CATALOG, groups: [CATALOG.groups[0],
+    { ...CATALOG.groups[1], products: [coke, ...CATALOG.groups[1].products] }] };
+  const { el, picker, picked } = setup({
+    storage,
+    fetchJson: (url) => (url === "/api/symbols" ? network : defaultRoutes()(url)),
+  });
+  picker.load();
+  await flush();
+  picker.open();
+  el.search.dispatch("keydown", { key: "ArrowDown" });
+  el.search.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(picker.snapshot().products[picker.snapshot().productIndex].productId, "i");
+  release(reordered);
+  await flush();
+  const state = picker.snapshot();
+  assert.equal(state.productIndex, 3);
+  assert.equal(state.products[state.productIndex].productId, "i");
+  el.search.dispatch("keydown", { key: "Enter" });
+  assert.deepEqual(picked, ["KQ.m@DCE.i"]);
+});
+
+test("网络目录到达时二级月份光标也保持, 回车仍选同一个月份", async () => {
+  const storage = makeStorage({ "flowscope.catalog.v1": JSON.stringify({ at: 1, groups: CATALOG.groups }) });
+  let release;
+  const network = new Promise((resolve) => { release = resolve; });
+  const { el, picker, picked } = setup({
+    storage,
+    fetchJson: (url) => (url === "/api/symbols" ? network : defaultRoutes()(url)),
+  });
+  picker.load();
+  await flush();                                   // 燃油的月份已经取到
+  picker.open();
+  el.search.dispatch("keydown", { key: "ArrowRight" });
+  el.search.dispatch("keydown", { key: "End" });   // 二级末项: 燃油2701
+  release(CATALOG);
+  const state = picker.snapshot();                 // 同步检查: 月份还没重取时光标也不能越界
+  assert.equal(state.level, "month");
+  assert.equal(state.months[state.monthIndex].symbol, "SHFE.fu2701");
+  el.search.dispatch("keydown", { key: "Enter" });
+  await flush();
+  assert.deepEqual(picked, ["SHFE.fu2701"]);
+});
+
+test("网络目录里已经没有当前品种时回到第一项", async () => {
+  const storage = makeStorage({ "flowscope.catalog.v1": JSON.stringify({ at: 1, groups: CATALOG.groups }) });
+  let release;
+  const network = new Promise((resolve) => { release = resolve; });
+  const { el, picker } = setup({
+    storage,
+    fetchJson: (url) => (url === "/api/symbols" ? network : defaultRoutes()(url)),
+  });
+  picker.load();
+  await flush();
+  picker.open();
+  el.search.dispatch("keydown", { key: "End" });
+  release({ ...CATALOG, groups: [CATALOG.groups[0]] });   // 大商所整组没了
+  await flush();
+  const state = picker.snapshot();
+  assert.equal(state.productIndex, 0);
+  assert.equal(state.level, "product");
 });
 
 test("目录接口失败会自动重试, 成功后提示消失", async (t) => {
