@@ -19,6 +19,7 @@ import queue
 import re
 import threading
 import time
+from collections.abc import Mapping, MutableMapping
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -50,6 +51,8 @@ JOB_REBUILD_SEC = 30.0
 # 没有行情流时(闭市、无订阅)每隔这么久做一次极短的连接自检。
 # 长连接被静默掐断时 tqsdk 不会报错, 只会让每个取新数据的调用各卡 30 秒 —— 必须主动探活。
 PROBE_INTERVAL_SEC = 60.0
+# 连接自检查的合约: 只要它在合约服务里存在即可(不订阅行情)。
+PROBE_SYMBOL = "KQ.m@SHFE.fu"
 # 订阅失败不是永久状态: 冷却期结束后自动重订, 避免一次抖动或一次手误把合约锁死到进程重启。
 FAIL_RETRY_SEC = 30
 COMPUTE_RETRY_SEC = 1
@@ -71,6 +74,59 @@ def validate_symbol(symbol: str) -> str:
     if not value or len(value) > 64 or SYMBOL_RE.fullmatch(value) is None:
         raise ValueError("symbol 格式无效")
     return value
+
+
+class UnknownSymbolError(ValueError):
+    """合约服务里查不到这个代码(多半是代码写错)。"""
+
+
+def listed_symbols(api, symbols) -> set[str]:
+    """合约服务里查得到的那部分代码(采集线程里执行, 不订阅行情)。
+
+    这一步必须挡在 get_quote / query_symbol_info 前面: 这两个接口收到不存在的代码时,
+    合约服务回一个报错, tqsdk 抛出 "代码不存在" —— 但**整条连接的数据管道随之停摆**:
+    此后同一连接上任何需要往返的调用(已知合约的新订阅、报价、合约查询)都各自卡到超时。
+    2026-09-28 实测: 查一次 SHFE.fu9999 后, 给 KQ.m@SHFE.fu 订阅 60s K 线等了 85 秒才超时。
+
+    所以这里只用 query_quotes 的过滤条件查: 无效的交易所/品种只返回空列表, 不会让合约
+    服务报错。期货、主连、指数按"交易所 + 品种"查(几十个代码); 期权、股票这类代码形状
+    不是"品种 + 月份"的, 退到整个交易所查(一次几万个代码, 约 0.5 秒)。同一组条件在同一
+    连接上命中 tqsdk 的查询缓存, 重复检查不再往返。主连 KQ.m@... 与指数 KQ.i@... 在合约
+    服务里的交易所是 KQ。结果包含已下市合约: 它们在合约服务里有记录, 订阅不会出错。
+    """
+    found: set[str] = set()
+    for symbol in dict.fromkeys(symbols):
+        exchange_id, product_id, plain = _listing_query(symbol)
+        if not exchange_id:
+            continue
+        if plain:
+            listed = api.query_quotes(exchange_id=exchange_id, product_id=product_id)
+        else:
+            listed = api.query_quotes(exchange_id=exchange_id)
+        if symbol in listed:
+            found.add(symbol)
+    return found
+
+
+_PLAIN_CONTRACT_RE = re.compile(r"([A-Za-z]+)\d*\Z")
+
+
+def _listing_query(symbol: str) -> tuple[str, str, bool]:
+    """合约代码 -> 合约服务的查询条件 (交易所, 品种, 是否"品种 + 月份"形状)。
+
+    SHFE.fu2611 -> (SHFE, fu, True); CZCE.TA701 -> (CZCE, TA, True);
+    KQ.m@SHFE.fu -> (KQ, fu, True); SSE.600000 -> (SSE, "", False)。
+    """
+    head, at, body = symbol.partition("@")
+    exchange_id, _, rest = (body if at else head).partition(".")
+    match = _PLAIN_CONTRACT_RE.match(rest)
+    return ("KQ" if at else exchange_id), (match.group(1) if match else ""), match is not None
+
+
+def ensure_listed(api, symbol: str):
+    """合约服务里查不到就抛 UnknownSymbolError; 必须在 get_quote 之前调用(见 listed_symbols)。"""
+    if symbol not in listed_symbols(api, [symbol]):
+        raise UnknownSymbolError(f"合约 {symbol} 不存在, 请检查代码")
 
 
 def validate_tf(tf) -> int:
@@ -116,6 +172,7 @@ class Feed:
         self.lower_klines = {}
 
     def subscribe(self, api: TqApi):
+        ensure_listed(api, self.symbol)   # 不存在的代码会让 get_quote 弄坏整条连接
         self.quote = api.get_quote(self.symbol)
         self.klines = api.get_kline_serial(self.symbol, self.tf, data_length=MAX_KLINES)
         self.ticks = api.get_tick_serial(self.symbol, data_length=MAX_TICKS)
@@ -301,6 +358,16 @@ class Feed:
             broadcast(message)
 
 
+def _query_cache(api):
+    """tqsdk 保存合约查询结果的表(api._data["symbols"]); 取不到时返回 None。
+
+    这是 tqsdk 的内部结构, 所以只用来清理自检留下的条目, 结构变了就放弃清理, 不影响自检。
+    """
+    data = getattr(api, "_data", None)
+    cache = data.get("symbols") if isinstance(data, Mapping) else None
+    return cache if isinstance(cache, MutableMapping) else None
+
+
 def feed_key(symbol: str, tf: int) -> tuple[str, int]:
     """FeedManager 的订阅标识: 同一合约的不同主周期是各自独立的 Feed。"""
     return (symbol, validate_tf(tf))
@@ -453,10 +520,21 @@ class FeedManager:
 
         卡死的连接不会报错: 每个取新数据的调用都会各自等满 tqsdk 的 30 秒内部超时,
         所以这里必须真的发一次往返请求, 而不是看有没有数据。
+
+        不能用 query_quotes: 同一连接上发过的相同查询, tqsdk 直接返回缓存结果,
+        从第二次起自检不再走网络、永远"成功"(合约目录也发同一个查询)。
+        query_symbol_info 每次都发新请求; 它的结果会留在连接的查询缓存里(约 5KB 一条),
+        所以查完就删掉这一条, 否则每分钟一次的自检会让内存随连接寿命增长。
         """
         self._busy_since = time.monotonic()
         try:
-            list(api.query_quotes(ins_class="CONT", expired=False))
+            before = set(_query_cache(api) or ())
+            rows = api.query_symbol_info([PROBE_SYMBOL])
+            cache = _query_cache(api)
+            for key in set(cache or ()) - before:
+                cache.pop(key, None)
+            if len(rows) != 1:
+                raise RuntimeError(f"自检合约 {PROBE_SYMBOL} 没有返回合约信息")
         except Exception as exc:
             self.probe_error = f"{type(exc).__name__}: {exc}"
             print(f"[ingest] 连接自检失败({self.probe_error})，重建行情连接", flush=True)
@@ -676,6 +754,13 @@ class FeedManager:
             self._sdk_feeds.add(feed)
         try:
             feed.subscribe(api)
+        except UnknownSymbolError as exc:
+            # 代码不存在不是网络抖动, 但也可能是合约服务刚好没数据: 仍按冷却期重试,
+            # 这一步只查合约服务的过滤查询, 不会拖住连接。
+            message = str(exc)
+            self.fail_feed(feed, message)
+            print(f"[ingest] {message}", flush=True)
+            return False
         except Exception as exc:
             message = f"合约 {feed_label(key)} 订阅失败: {exc}"
             self.fail_feed(feed, message)

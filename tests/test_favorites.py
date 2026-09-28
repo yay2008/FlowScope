@@ -22,12 +22,18 @@ class FakeApi:
         self.missing = set(missing)
         self.waits = 0
         self.calls = []
+        self.listings = []
 
     def get_quote(self, symbol):
         self.calls.append(symbol)
         if symbol in self.missing or symbol not in self.quotes:
             raise RuntimeError("合约不存在")
         return self.quotes[symbol]
+
+    def query_quotes(self, exchange_id=None, product_id=None, **kwargs):
+        """"合约是否存在"的过滤查询: 有报价的合约都算存在。"""
+        self.listings.append((exchange_id, product_id))
+        return [symbol for symbol in self.quotes if symbol not in self.missing]
 
     def wait_update(self, deadline=None):
         self.waits += 1
@@ -149,8 +155,7 @@ class QuoteRowTests(unittest.TestCase):
         """取不到报价的空行不能少字段, 否则前端要靠 undefined 兜底。"""
         empty = fav._empty_row("SHFE.gone")
         live = fav.quote_row("SHFE.fu2611", quote())
-        self.assertEqual(set(empty) - set(live), {"preSettlement"})
-        self.assertEqual(set(live) - set(empty), {"basePrice"})
+        self.assertEqual(set(empty), set(live))
 
     def test_main_continuous_keeps_its_underlying(self):
         row = fav.quote_row("KQ.m@SHFE.fu", quote(instrument_name="燃油主连", ins_class="CONT",
@@ -174,6 +179,15 @@ class ReadQuotesTests(unittest.TestCase):
         self.assertEqual(api.waits, 1)
         fav.read_quotes(api, ["SHFE.fu2611"], warm, wait_sec=0)
         self.assertEqual(api.waits, 1)   # 已经热了: 轮询不再打断采集循环
+        self.assertEqual(len(api.listings), 1)   # 也不再重复确认合约是否存在
+
+    def test_unknown_symbol_never_reaches_get_quote(self):
+        """对不存在的代码调 get_quote 会让整条连接停摆(之后每个调用都卡 30 秒),
+        所以自选里混进来的错代码只留空行, get_quote 一次都不调。"""
+        api = FakeApi({"SHFE.fu2611": quote(last_price=4412)})
+        rows = fav.read_quotes(api, ["SHFE.fu9999", "SHFE.fu2611"], set(), wait_sec=0)
+        self.assertEqual(api.calls, ["SHFE.fu2611"])
+        self.assertEqual([row["lastPrice"] for row in rows], [None, 4412])
 
 
 class ServiceTests(unittest.TestCase):
@@ -225,8 +239,10 @@ class EndpointTests(unittest.TestCase):
         paths = patch.object(ingest, "DATA_DIR", self.directory.name)
         paths.start()
         self.addCleanup(paths.stop)
+        api = FakeApi({"KQ.m@SHFE.fu": quote(instrument_name="燃油主连", ins_class="CONT"),
+                       "SHFE.fu2611": quote(instrument_name="燃油2611", last_price=4412)})
         self.service = fav.FavoritesService(
-            lambda: FakeManager({"SHFE.fu2611": quote(instrument_name="燃油2611", last_price=4412)}),
+            lambda: FakeManager(api),
             fav.FavoriteStore(lambda: os.path.join(self.directory.name, "favorites.json")),
             timeout=1.0, wait_sec=0)
         patched = patch.object(server, "favorites", self.service)
@@ -237,12 +253,15 @@ class EndpointTests(unittest.TestCase):
         patched.start()
         self.addCleanup(patched.stop)
 
+    def add(self, symbol):
+        return asyncio.run(server.favorites_add(symbol))
+
     def test_collection_follows_default_symbol_and_favorites(self):
         """常驻采集 = 默认合约 + 自选, 每个合约两个主周期; 与默认合约重复的自选不重复采集。"""
         default = [("KQ.m@SHFE.fu", 10), ("KQ.m@SHFE.fu", 30)]
-        server.favorites_add("SHFE.fu2611")
+        self.add("SHFE.fu2611")
         self.assertEqual(self.manager.pinned, default + [("SHFE.fu2611", 10), ("SHFE.fu2611", 30)])
-        server.favorites_add("KQ.m@SHFE.fu")
+        self.add("KQ.m@SHFE.fu")
         self.assertEqual(len(self.manager.pinned), 4)
         server.favorites_remove("SHFE.fu2611")
         server.favorites_remove("KQ.m@SHFE.fu")
@@ -250,19 +269,34 @@ class EndpointTests(unittest.TestCase):
 
     def test_add_list_remove_round_trip(self):
         self.assertEqual(server.favorites_list(), {"symbols": [], "max": fav.MAX_FAVORITES})
-        self.assertEqual(server.favorites_add("KQ.m@SHFE.fu")["symbols"], ["KQ.m@SHFE.fu"])
-        self.assertEqual(server.favorites_add("SHFE.fu2611")["symbols"],
-                         ["KQ.m@SHFE.fu", "SHFE.fu2611"])
+        self.assertEqual(self.add("KQ.m@SHFE.fu")["symbols"], ["KQ.m@SHFE.fu"])
+        self.assertEqual(self.add("SHFE.fu2611")["symbols"], ["KQ.m@SHFE.fu", "SHFE.fu2611"])
         self.assertEqual(server.favorites_remove("KQ.m@SHFE.fu")["symbols"], ["SHFE.fu2611"])
+
+    def test_nonexistent_symbol_is_refused_before_it_becomes_a_pinned_feed(self):
+        """自选都会常驻订阅; 不存在的代码混进来, 每次重试订阅都会拖停整条连接。"""
+        with self.assertRaises(HTTPException) as caught:
+            self.add("SHFE.fu9999")
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("不存在", caught.exception.detail)
+        self.assertEqual(server.favorites_list()["symbols"], [])
+        self.assertNotIn(("SHFE.fu9999", 30), self.manager.pinned)
+
+    def test_offline_feed_does_not_block_adding_a_favorite(self):
+        """行情源不可用时查不了合约服务: 照常收藏, 订阅时还有同样的检查兜底。"""
+        offline = fav.FavoritesService(lambda: FakeManager(error=RuntimeError("行情线程未就绪")),
+                                       self.service._store, timeout=1.0, wait_sec=0)
+        with patch.object(server, "favorites", offline):
+            self.assertEqual(self.add("SHFE.fu9999")["symbols"], ["SHFE.fu9999"])
 
     def test_bad_symbol_and_full_list_are_client_errors(self):
         with self.assertRaises(HTTPException) as caught:
-            server.favorites_add("SHFE fu!!")
+            self.add("SHFE fu!!")
         self.assertEqual(caught.exception.status_code, 400)
         for index in range(fav.MAX_FAVORITES):
             self.service.add(f"SHFE.t{index:02d}")
         with self.assertRaises(HTTPException):
-            server.favorites_add("SHFE.overflow")
+            self.add("SHFE.fu2611")
 
     def test_watch_validates_and_deduplicates_symbols(self):
         data = asyncio.run(server.watch("KQ.m@SHFE.fu, KQ.m@SHFE.fu ,SHFE.fu2611"))

@@ -25,7 +25,7 @@ import re
 import threading
 import time
 
-from ingest import JOB_TIMEOUT_SEC, validate_symbol
+from ingest import JOB_TIMEOUT_SEC, listed_symbols, validate_symbol
 
 # 交易所展示顺序按国内期货成交量习惯排列, 与交易所代码一一对应。
 EXCHANGES = (
@@ -374,7 +374,15 @@ def resolve_label(api, symbol: str) -> str:
     为什么不直接读 quote 的 ``instrument_name``: 主连的报价对象来自一次 ``get_quote``
     订阅, 冷启动或闭市时可能还没下发; 而 ``query_symbol_info`` 是合约服务的静态查询,
     走的是和品种目录同一条路径。整条链上任何一步拿不到, 就回退到当前已有的名字或代码。
+
+    代码来自 URL, 可能是写错的: 先确认合约服务里有它(见 ingest.listed_symbols),
+    否则 get_quote / query_symbol_info 收到不存在的代码会让整条连接停摆。
     """
+    try:
+        if symbol not in listed_symbols(api, [symbol]):
+            return symbol
+    except Exception:
+        return symbol
     contract = symbol
     if split_cont_symbol(symbol) is not None:
         try:

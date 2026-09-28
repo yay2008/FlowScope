@@ -20,7 +20,7 @@ import os
 import threading
 import time
 
-from ingest import JOB_TIMEOUT_SEC, validate_symbol
+from ingest import JOB_TIMEOUT_SEC, listed_symbols, validate_symbol
 
 MAX_FAVORITES = 40        # 自选上限: 面板一屏能看过来, 也限制轮询的报价数量
 QUOTES_TTL_SEC = 1.5      # 报价快照缓存: 多个页面/标签同时轮询只查一次
@@ -162,7 +162,7 @@ def quote_row(symbol: str, quote) -> dict:
 
 def _empty_row(symbol: str) -> dict:
     return {"symbol": symbol, "name": symbol, "insClass": "", "mainSymbol": "", "lastPrice": None,
-            "preSettlement": None, "change": None, "changePct": None, "openInterest": None,
+            "basePrice": None, "change": None, "changePct": None, "openInterest": None,
             "volume": None, "amount": None, "priceDecs": 0, "expired": False}
 
 
@@ -170,9 +170,15 @@ def read_quotes(api, symbols, warm: set[str], wait_sec: float = COLD_WAIT_SEC) -
     """采集线程里读报价快照(按传入顺序输出, 取不到的留空行)。
 
     ``warm`` 由调用方持有, 记录已经订阅过的合约: 只有新合约才等一次 wait_update。
+    没订阅过的代码先确认合约服务里有(见 ingest.listed_symbols): 对不存在的代码调
+    get_quote 会让整条连接停摆, 而不只是这一行取不到。
     """
+    known = warm | listed_symbols(api, [symbol for symbol in symbols if symbol not in warm])
     quotes = {}
     for symbol in symbols:
+        if symbol not in known:
+            quotes[symbol] = None
+            continue
         try:
             quotes[symbol] = api.get_quote(symbol)
         except Exception:
@@ -207,6 +213,16 @@ class FavoritesService:
 
     def add(self, symbol: str) -> list[str]:
         return self._store.add(symbol)
+
+    async def verify(self, symbol: str) -> bool | None:
+        """合约服务里有没有这个代码: True/False; 行情源不可用、查询失败时返回 None。"""
+        value = validate_symbol(symbol)
+        try:
+            found = await self._manager().query(lambda api: listed_symbols(api, [value]),
+                                                self._timeout)
+        except Exception:
+            return None
+        return value in found
 
     def remove(self, symbol: str) -> list[str]:
         return self._store.remove(symbol)

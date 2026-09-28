@@ -27,6 +27,9 @@ class FakeApi:
         self.quotes = []
 
     def query_quotes(self, ins_class=None, exchange_id=None, product_id=None, expired=None):
+        if ins_class is None:
+            # "合约是否存在"的过滤查询(ingest.listed_symbols): 认识的代码都算存在
+            return [*CONT_NAMES, *CONT_MAINS.values(), *MONTH_NAMES]
         return list(self.conts) if ins_class == "CONT" else list(self.months)
 
     def get_quote(self, symbol):
@@ -225,6 +228,15 @@ class ServiceTests(unittest.TestCase):
         service = catalog.CatalogService(lambda: FakeManager(error=RuntimeError("行情线程未就绪")))
         data = asyncio.run(service.symbol_label("KQ.m@SHFE.fu"))
         self.assertEqual(data, {"symbol": "KQ.m@SHFE.fu", "label": "KQ.m@SHFE.fu"})
+
+    def test_unknown_symbol_label_never_reaches_the_quote_or_info_query(self):
+        """URL 里写错的代码: 对不存在的代码调 get_quote/query_symbol_info 会让整条连接停摆,
+        所以先确认存在, 查不到就直接回退成代码本身。"""
+        api = FakeApi()
+        api.query_symbol_info = None   # 被调用就会 TypeError
+        for symbol in ("SHFE.fu9999", "KQ.m@SHFE.zz"):
+            self.assertEqual(catalog.resolve_label(api, symbol), symbol)
+        self.assertEqual(api.quotes, [])
 
     def test_symbol_label_rejects_malformed_code(self):
         service = catalog.CatalogService(lambda: FakeManager(api=FakeApi()))

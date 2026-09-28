@@ -150,9 +150,20 @@ def favorites_list():
 
 
 @app.post("/api/favorites")
-def favorites_add(symbol: str):
-    """收藏一个合约; 幂等, 重复收藏不改变顺序。"""
-    return _favorite_change(favorites.add, symbol)
+async def favorites_add(symbol: str):
+    """收藏一个合约; 幂等, 重复收藏不改变顺序。
+
+    自选都会常驻订阅, 所以新代码先到合约服务确认存在: 混进一个不存在的代码, 采集线程
+    每次重试订阅都会被它拖住(见 ingest.listed_symbols)。行情源不可用、查不了时照常收藏,
+    订阅时还有同样的检查兜底。
+    """
+    try:
+        value = validate_symbol(symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if value not in favorites.symbols() and await favorites.verify(value) is False:
+        raise HTTPException(status_code=400, detail=f"合约 {value} 不存在, 请检查代码")
+    return _favorite_change(favorites.add, value)
 
 
 @app.delete("/api/favorites")

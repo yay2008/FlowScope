@@ -14,12 +14,23 @@ from test_period import Clock, klines
 from tqsdk import TqTimeoutError
 
 
+class ListedEverything:
+    """query_quotes 的替身结果: 除 unknown 里的代码外, 什么都"查得到"。"""
+
+    def __init__(self, unknown=()):
+        self.unknown = set(unknown)
+
+    def __contains__(self, symbol):
+        return symbol not in self.unknown
+
+
 class ScriptedApi:
-    def __init__(self, manager, clock, actions=(), quote_failures=0, lower_failures=0):
+    def __init__(self, manager, clock, actions=(), quote_failures=0, lower_failures=0, unknown=()):
         self.manager, self.clock = manager, clock
         self.actions = iter(actions)
         self.quote_failures, self.lower_failures = quote_failures, lower_failures
-        self.quote_calls, self.lower_calls = [], []
+        self.unknown = set(unknown)
+        self.quote_calls, self.lower_calls, self.listing_calls = [], [], []
         self.resources = {}
         self.closed = False
 
@@ -45,9 +56,14 @@ class ScriptedApi:
     def is_changing(self, *args):
         return False
 
-    def query_quotes(self, ins_class=None, expired=None, **kwargs):
-        """连接自检会用到; 返回一个合约即表示"连接还能收发"。"""
-        return ["KQ.m@SHFE.fu"] if ins_class == "CONT" else []
+    def query_quotes(self, ins_class=None, expired=None, exchange_id=None, product_id=None, **kwargs):
+        """订阅前的"合约是否存在"检查会用到: 除 unknown 里的代码外, 任何查询都认为存在。"""
+        self.listing_calls.append((exchange_id, product_id))
+        return ListedEverything(self.unknown)
+
+    def query_symbol_info(self, symbols):
+        """连接自检会用到; 返回一行即表示"连接还能收发"。"""
+        return [{"instrument_id": symbol} for symbol in symbols]
 
     def wait_update(self, **kwargs):
         try:
@@ -103,6 +119,18 @@ class FeedLifecycleTests(unittest.TestCase):
         self.assertEqual(self.manager.failed_feeds, {})
         self.assertIs(self.manager._subscribed[(feed.symbol, 30)], feed)
         self.assertEqual(feed.recompute.call_count, 1)
+
+    def test_unknown_symbol_is_rejected_before_get_quote_touches_the_connection(self):
+        """对不存在的代码调 get_quote, 合约服务报错后整条连接停摆(实测后续调用各卡 30~85 秒)。
+        所以订阅前先用过滤查询确认合约存在: 查不到就进冷却期, get_quote 一次都不调。"""
+        feed = self.feed("SHFE.fu9999")
+        api = ScriptedApi(self.manager, self.clock, [self.advance(1)], unknown={"SHFE.fu9999"})
+        self.manager._run_api(api)
+        self.assertEqual(api.quote_calls, [])
+        self.assertEqual(api.listing_calls, [("SHFE", "fu")])
+        self.assertIn("不存在", feed.error)
+        self.assertIn("不存在", self.manager.feed_retry_error(feed))
+        self.assertNotIn((feed.symbol, 30), self.manager._subscribed)
 
     def test_repeated_failure_restarts_cooldown_without_duplicate_attempts(self):
         self.feed()
@@ -485,16 +513,38 @@ class ProbeTests(unittest.TestCase):
 
     def test_successful_probe_clears_the_error_and_marks_the_time(self):
         api = Mock()
-        api.query_quotes.return_value = ["KQ.m@SHFE.fu"]
+        api.query_symbol_info.return_value = [{"instrument_id": ingest.PROBE_SYMBOL}]
         self.assertTrue(self.manager._run_probe(api))
         self.assertIsNone(self.manager.probe_error)
         self.assertGreater(self.manager.last_probe_at, 0)
         self.assertIsNone(self.manager.status_snapshot()["busySec"])
         self.assertIsNotNone(self.manager.status_snapshot()["lastProbeSec"])
 
+    def test_probe_sends_a_fresh_request_instead_of_a_cached_query(self):
+        """query_quotes 的相同查询在同一连接上直接返回缓存(合约目录也发同一个), 自检从第二次起
+        就不再走网络、永远"成功"; query_symbol_info 每次都发新请求。"""
+        api = Mock()
+        api._data = {"symbols": {}}
+        def respond(symbols):
+            api._data["symbols"][f"PYSDK_api_{len(api._data['symbols'])}"] = {"result": {}}
+            return [{"instrument_id": symbol} for symbol in symbols]
+        api.query_symbol_info.side_effect = respond
+        for _ in range(3):
+            self.assertTrue(self.manager._run_probe(api))
+        self.assertEqual(api.query_symbol_info.call_count, 3)
+        api.query_quotes.assert_not_called()
+        # 自检留下的查询结果每次都清掉, 连接活得越久内存也不会越涨
+        self.assertEqual(api._data["symbols"], {})
+
+    def test_probe_without_a_result_row_counts_as_failure(self):
+        api = Mock()
+        api.query_symbol_info.return_value = []
+        self.assertFalse(self.manager._run_probe(api))
+        self.assertIn("没有返回合约信息", self.manager.probe_error)
+
     def test_failed_probe_reports_the_reason_for_a_rebuild(self):
         api = Mock()
-        api.query_quotes.side_effect = TqTimeoutError("获取合约信息超时")
+        api.query_symbol_info.side_effect = TqTimeoutError("获取合约信息超时")
         self.assertFalse(self.manager._run_probe(api))
         self.assertIn("TqTimeoutError", self.manager.probe_error)
         self.assertEqual(self.manager.status_snapshot()["probeError"], self.manager.probe_error)

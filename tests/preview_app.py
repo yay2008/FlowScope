@@ -47,7 +47,8 @@ class CatalogApi:
         return max(1000, base - abs(month - 2611) * 700)
 
     def query_quotes(self, ins_class=None, exchange_id=None, product_id=None, expired=None):
-        if ins_class == "CONT":
+        if ins_class == "CONT" or exchange_id == "KQ":
+            # 主连在合约服务里的交易所是 KQ ("合约是否存在"的检查按 KQ 查)
             return list(self.products)
         if exchange_id and product_id:
             return [f"{exchange_id}.{product_id}{month}" for month in ("2610", "2611", "2701")]
