@@ -125,7 +125,7 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（主图周期 10s /
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-node --test tests/app-load.test.js tests/data-sync.test.js tests/load-history.test.js tests/picker-core.test.js tests/contract-picker.test.js
+node --test tests/app-load.test.js tests/indicators.test.js tests/data-sync.test.js tests/load-history.test.js tests/picker-core.test.js tests/contract-picker.test.js
 node --check static/app.js
 ```
 

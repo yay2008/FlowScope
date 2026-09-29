@@ -6,6 +6,8 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+// 指标常量与纯函数来自 indicators.js; 必须在图表初始化(用到 EMA_PERIODS)之前解构
+const { LW, BAND, EMA_PERIODS, buyOf, sellOf, deltaOf, rollingSma, rollingZ } = FlowIndicators;
 
 let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
 let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
@@ -283,7 +285,6 @@ const candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
 }, 0);
 
 // 主图 EMA 21/55/100/200(金/蓝/青/紫)
-const EMA_PERIODS = [21, 55, 100, 200];
 const EMA_COLORS = ["#f0b90d", "#2962ff", "#009688", "#ab47bc"];
 const emaSeries = EMA_PERIODS.map((p, j) =>
   chart.addSeries(LightweightCharts.LineSeries, {
@@ -350,289 +351,20 @@ function addPaneLabel(paneIndex, text) {
 addPaneLabel(1, "FlowMeter");
 addPaneLabel(2, "FlowWave");
 
-// ---------- 指标计算(前端, 移植 Volume Suite 阈值逻辑) ----------
+// ---------- 指标计算 ----------
+// 纯计算在 indicators.js; 这里只把页面状态(bars/cfg/threshtype/bandK)喂进去,
+// 并保留同名入口给渲染代码用。
 
-// 滚动均值/标准分: 窗口里只要有一根是 null(coverage=missing 的买卖量、预热期的相对值)就输出 null,
-// 与 ta.sma / ta.stdev 的口径一致。缺失不能当 0: 缺口之后的窗口均值会被拉低, 紧跟缺口的 bar
-// 就被判成高档位(实测 SMA 模式缺口后 60 根全部 ≥2 档)。代价是缺口之后要等满一个窗口才重新出档位。
-function rollingSma(v, n) {
-  const out = new Array(v.length).fill(null);
-  let s = 0, bad = 0;
-  for (let i = 0; i < v.length; i++) {
-    if (v[i] == null) bad++; else s += v[i];
-    if (i >= n) { if (v[i - n] == null) bad--; else s -= v[i - n]; }
-    out[i] = i >= n - 1 && bad === 0 ? s / n : null;
-  }
-  return out;
-}
-
-function rollingZ(v, n) {
-  const out = new Array(v.length).fill(null);
-  let s = 0, s2 = 0, bad = 0;
-  for (let i = 0; i < v.length; i++) {
-    if (v[i] == null) bad++; else { s += v[i]; s2 += v[i] * v[i]; }
-    if (i >= n) {
-      const y = v[i - n];
-      if (y == null) bad--; else { s -= y; s2 -= y * y; }
-    }
-    if (i >= n - 1 && bad === 0) {
-      const mean = s / n;
-      const variance = Math.max(s2 / n - mean * mean, 0);
-      const sd = Math.sqrt(variance);
-      out[i] = sd === 0 ? null : (v[i] - mean) / sd;
-    }
-  }
-  return out;
-}
-
-// ---------- LSMA × CRVOL 共振计算(参数同 Pine 默认值) ----------
-
-const LW = { n1: 9, n2: 6, n3: 3, n4: 21, ob: 80, os: 20, slopeLen: 10 };
-
-// 主图叠加的回归通道参数: 中线 = linreg(close, n), 上下轨 = 中线 ± k 倍回归残差标准差。
-// 残差标准差取与中线同一个窗口, 用总体标准差(除以 n)。k 由工具栏「带宽」选(kOptions 必须与
-// index.html 的 <option> 一致, 也用来挡非法值); 三档包含率与选型依据见 docs/flowwave_band_probe.py。
-const BAND = { n: 21, kOptions: [1.5, 2, 2.5], kDefault: 2 };
-
-function ema(v, n) {              // ta.ema: 首个非 null 值直接播种
-  const out = new Array(v.length).fill(null);
-  const a = 2 / (n + 1);
-  let prev = null;
-  for (let i = 0; i < v.length; i++) {
-    if (v[i] == null) continue;
-    prev = prev == null ? v[i] : a * v[i] + (1 - a) * prev;
-    out[i] = prev;
-  }
-  return out;
-}
-
-function rma(v, n) {              // ta.rma: 前 n 个均值播种(Wilder)
-  const out = new Array(v.length).fill(null);
-  let s = 0, prev = null;
-  for (let i = 0; i < v.length; i++) {
-    const x = v[i] == null ? 0 : v[i];
-    s += x;
-    if (i >= n) s -= v[i - n] == null ? 0 : v[i - n];
-    if (i === n - 1) prev = s / n;
-    else if (i > n - 1) prev = (x + (n - 1) * prev) / n;
-    out[i] = i >= n - 1 ? prev : null;
-  }
-  return out;
-}
-
-function rsi(v, n) {              // ta.rsi
-  const up = new Array(v.length).fill(null);
-  const dn = new Array(v.length).fill(null);
-  for (let i = 1; i < v.length; i++) {
-    const c = v[i] - v[i - 1];
-    up[i] = Math.max(c, 0);
-    dn[i] = -Math.min(c, 0);
-  }
-  const ru = rma(up, n), rd = rma(dn, n);
-  return ru.map((u, i) => {
-    const d = rd[i];
-    if (u == null || d == null || (u === 0 && d === 0)) return null;
-    return d === 0 ? 100 : 100 - 100 / (1 + u / d);
-  });
-}
-
-function linreg(v, n) {           // ta.linreg(v, n, 0): 最近 n 点拟合线在末点的取值
-  const out = new Array(v.length).fill(null);
-  const sx = (n * (n - 1)) / 2, sxx = (n * (n - 1) * (2 * n - 1)) / 6;
-  for (let i = n - 1; i < v.length; i++) {
-    let sy = 0, sxy = 0, ok = true;
-    for (let j = 0; j < n; j++) {
-      const y = v[i - n + 1 + j];
-      if (y == null) { ok = false; break; }
-      sy += y; sxy += j * y;
-    }
-    if (!ok) continue;
-    const slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-    out[i] = (sy - slope * sx) / n + slope * (n - 1);
-  }
-  return out;
-}
-
-function smaStrict(v, n) {        // ta.sma: 窗口含 null 则结果为 null
-  const out = new Array(v.length).fill(null);
-  let s = 0, bad = 0;
-  for (let i = 0; i < v.length; i++) {
-    if (v[i] == null) bad++; else s += v[i];
-    if (i >= n) { if (v[i - n] == null) bad--; else s -= v[i - n]; }
-    out[i] = i >= n - 1 && bad === 0 ? s / n : null;
-  }
-  return out;
-}
-
-function deriveLw() {
-  const n = bars.length;
-  const hlc3 = bars.map((b) => (b.high + b.low + b.close) / 3);
-  const vol = bars.map((b) => b.volume || 0);
-
-  // tci = ema((src-ema(src,n1)) / (0.025*ema(|src-ema(src,n1)|,n1)), n2) + 50
-  const e1 = ema(hlc3, LW.n1);
-  const dev = hlc3.map((x, i) => (e1[i] == null ? null : x - e1[i]));
-  const e2 = ema(dev.map((x) => (x == null ? null : Math.abs(x))), LW.n1);
-  const cci = dev.map((x, i) => (x == null || !e2[i] ? null : x / (0.025 * e2[i])));
-  const tci = ema(cci, LW.n2).map((x) => (x == null ? null : x + 50));
-
-  // mf = n3 周期 MFI(典型价用 hlc3)
-  const rmf = hlc3.map((tp, i) => tp * vol[i]);
-  const mf = new Array(n).fill(null);
-  for (let i = LW.n3 - 1; i < n; i++) {
-    let pos = 0, neg = 0;
-    for (let j = Math.max(i - LW.n3 + 1, 1); j <= i; j++) {
-      if (hlc3[j] > hlc3[j - 1]) pos += rmf[j];
-      else if (hlc3[j] < hlc3[j - 1]) neg += rmf[j];
-    }
-    mf[i] = 100 - 100 / (1 + (neg === 0 ? 1e10 : pos / neg));
-  }
-
-  // tradition = avg(tci, mf, rsi3); wave = linreg(wt1, n4) 即 LSMA Main
-  const rsi3 = rsi(hlc3, LW.n3);
-  const wt1 = hlc3.map((_, i) =>
-    tci[i] == null || mf[i] == null || rsi3[i] == null ? null : (tci[i] + mf[i] + rsi3[i]) / 3);
-  const wt2 = smaStrict(wt1, 6);
-  const wave = linreg(wt1, LW.n4);
-
-  // CRVOL 斜率(数据窗口输出): linreg(crvol, slopeLen) 的一阶差分; crvol 复用 derive 的 crv
-  const reg = linreg(derived.crv, LW.slopeLen);
-  const crvSlope = reg.map((x, i) => (x == null || i === 0 || reg[i - 1] == null ? null : x - reg[i - 1]));
-
-  return { wave, wt2, crvSlope };
-}
-
-// FlowWave 主图叠加: 价格回归通道。
-// 为什么不能直接把 wave/wt2 画到主图: 它们是 0~100 的振荡值(实测还会溢出到 -14~108), 没有价格量纲,
-// 画到价格轴上必须选一种映射。这里选"轨道由价格自证"的映射 —— 中线仍用同一个 linreg 核, 只把输入
-// 从振荡值换成收盘价, 带宽用回归残差标准差; 于是轨道本身是真实价格(可当动态支撑/压力),
-// 而 wt2 的信息转成两件事: 带的着色状态(state) 与首次越界的打点(buildBandDots)。
 function deriveBand() {
-  const n = bars.length;
-  const close = bars.map((b) => b.close);
-  const mid = linreg(close, BAND.n);
-  const wt2 = derived.lw.wt2;
-  const up = new Array(n).fill(null);
-  const dn = new Array(n).fill(null);
-  const state = new Array(n).fill(0);   // 1=超买(wt2>80), -1=超卖(wt2<20), 0=中性
-  for (let i = 0; i < n; i++) {
-    if (mid[i] == null) continue;
-    let sum = 0, sum2 = 0, ok = true;
-    for (let j = i - BAND.n + 1; j <= i; j++) {
-      if (mid[j] == null) { ok = false; break; }
-      const r = close[j] - mid[j];
-      sum += r;
-      sum2 += r * r;
-    }
-    if (!ok) continue;
-    const mean = sum / BAND.n;
-    const sd = Math.sqrt(Math.max(sum2 / BAND.n - mean * mean, 0));
-    if (sd === 0) continue;   // 21 根完全贴在回归线上(极端平滑/停板), 带宽为 0 时不画
-    up[i] = mid[i] + bandK * sd;
-    dn[i] = mid[i] - bandK * sd;
-    state[i] = wt2[i] == null ? 0 : wt2[i] > LW.ob ? 1 : wt2[i] < LW.os ? -1 : 0;
-  }
-  return { mid, up, dn, state };
+  return FlowIndicators.deriveBand(bars, derived.lw.wt2, bandK);
 }
-
-// ---------- 判向口径 ----------
-// 后端对同一根 bar 并列输出两套量: buy/sell/unknown 是新算法(Lee-Ready),
-// buyLegacy/sellLegacy 是旧算法。前端一律读新算法: 旧算法(快照自身盘口)与当根 K 线
-// 方向一致率只有 ~33%(系统性反向, 见 docs/indicator-accuracy-2026-09-16-addendum.md),
-// 所以工具栏的"判向算法"开关已移除。CVD 本来就恒按新算法累计。
-const buyOf = (b) => b.buy ?? null;
-const sellOf = (b) => b.sell ?? null;
-const deltaOf = (b) => b.delta ?? null;
 
 function derive() {
-  const n = bars.length;
-  const vol = bars.map((b) => b.volume);
-  const buy = bars.map((b) => buyOf(b));
-  const sell = bars.map((b) => sellOf(b));
-  const delta = bars.map((b) => deltaOf(b));
-  const close = bars.map((b) => b.close);
-  const emaLines = EMA_PERIODS.map((p) => ema(close, p));
-  const posd = delta.map((d) => (d == null ? null : d > 0 ? d : 0));
-  const negd = delta.map((d) => (d == null ? null : d < 0 ? d : 0));
-
-  const smaVol20 = rollingSma(vol, cfg.rellen);
-  const smaVolN = rollingSma(vol, cfg.smalen);
-  const smaPos20 = rollingSma(posd, cfg.rellen);
-  const smaNeg20 = rollingSma(negd, cfg.rellen);
-  const smaBuy20 = rollingSma(buy, cfg.rellen);
-  const smaSell20 = rollingSma(sell, cfg.rellen);
-
-  const rvol = vol.map((v, i) => (smaVol20[i] ? v / smaVol20[i] : null));
-  const rpos = posd.map((v, i) => (v == null || !smaPos20[i] ? null : v / smaPos20[i]));
-  const rneg = negd.map((v, i) => (v == null || !smaNeg20[i] ? null : v / smaNeg20[i]));
-  const rbuy = buy.map((v, i) => (v == null || !smaBuy20[i] ? null : v / smaBuy20[i]));
-  const rsell = sell.map((v, i) => (v == null || !smaSell20[i] ? null : v / smaSell20[i]));
-
-  const zVol = rollingZ(vol, cfg.zlen);
-  const zRpos = rollingZ(rpos, cfg.zlen);
-  const zRneg = rollingZ(rneg, cfg.zlen);
-  const zBuy = rollingZ(buy, cfg.zlen);
-  const zSell = rollingZ(sell, cfg.zlen);
-
-  // CRVOL: 带符号相对量的累计
-  const crv = new Array(n).fill(null);
-  let acc = 0;
-  for (let i = 0; i < n; i++) {
-    if (rvol[i] == null) continue;
-    acc += bars[i].close > bars[i].open ? rvol[i] : -rvol[i];   // 与原指标一致: 十字线算负
-    crv[i] = acc;
-  }
-
-  derived = { vol, buy, sell, delta, posd, negd, smaVolN, rvol, rpos, rneg, rbuy, rsell,
-              zVol, zRpos, zRneg, zBuy, zSell, crv, emaLines };
-  derived.lw = deriveLw();
-  derived.band = deriveBand();
+  derived = FlowIndicators.derive(bars, cfg, bandK);
 }
 
-// level: 0=未超阈值, 1..3=超过第 1..3 档
 function levelOf(kind, i) {
-  const m = cfg.mult;
-  const d = derived;
-  const ge = (x, t) => x != null && t != null && x >= t;
-  if (threshtype === "RELATIVE") {
-    const rel = { vol: d.rvol, posd: d.rpos, negd: d.rneg, buy: d.rbuy, sell: d.rsell }[kind][i];
-    return FlowData.relativeLevel(kind, rel, m);
-  }
-  if (threshtype === "SMA") {
-    const base = { vol: d.vol, posd: d.posd, negd: d.negd, buy: d.buy, sell: d.sell }[kind][i];
-    const smaN = rollingSmaCache(kind, i);
-    if (base == null || smaN == null) return 0;
-    const w = kind === "posd" || kind === "negd" ? [2, 3, 7] : [1, 1, 1];
-    const compareBase = kind === "negd" ? -base : base;
-    const compareSma = kind === "negd" ? -smaN : smaN;
-    if (compareSma <= 0) return 0;
-    if (ge(compareBase, compareSma * (m[2] + 1) * w[2])) return 3;
-    if (ge(compareBase, compareSma * (m[1] + 1) * w[1])) return 2;
-    if (ge(compareBase, compareSma * (m[0] + 1) * w[0])) return 1;
-    return 0;
-  }
-  // Z-SCORE
-  const z = { vol: d.zVol, posd: d.zRpos, negd: d.zRneg, buy: d.zBuy, sell: d.zSell }[kind][i];
-  if (z == null) return 0;
-  if (ge(z, m[2])) return 3;
-  if (ge(z, m[1])) return 2;
-  if (ge(z, m[0])) return 1;
-  return 0;
-}
-
-// SMA 模式需要的 sma300 序列缓存(避免反复 rolling)
-let sma300Cache = null;
-function rollingSmaCache(kind, i) {
-  if (!sma300Cache) {
-    sma300Cache = {
-      vol: rollingSma(derived.vol, cfg.smalen),
-      posd: rollingSma(derived.posd, cfg.smalen),
-      negd: rollingSma(derived.negd, cfg.smalen),
-      buy: rollingSma(derived.buy, cfg.smalen),
-      sell: rollingSma(derived.sell, cfg.smalen),
-    };
-  }
-  return sma300Cache[kind][i];
+  return FlowIndicators.levelOf(derived, cfg, threshtype, kind, i);
 }
 
 function colorFor(up, level) {
@@ -731,7 +463,6 @@ function renderLw() {
 
 function renderAll() {
   derive();
-  sma300Cache = null;
   candleSeries.setData(bars.map(candleOf));
   emaSeries.forEach((s, j) =>
     s.setData(bars.map((b, i) => ({ time: b.time, value: derived.emaLines[j][i] })).filter((p) => p.value != null)));
@@ -744,7 +475,6 @@ function renderAll() {
 // 增量更新最后一根 bar
 function updateLast() {
   derive();
-  sma300Cache = null;
   const i = bars.length - 1;
   const b = bars[i];
   candleSeries.update(candleOf(b));

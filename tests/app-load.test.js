@@ -6,7 +6,7 @@
  * 真实案例: picker.load() 同步渲染月份行并回调 isFavorite() 画 ☆, 而 favorites 那时
  * 还没声明, 于是 "Cannot access 'favorites' before initialization"。
  *
- * 这里按 index.html 的顺序把四个脚本放进同一个 vm 上下文执行一遍, 并对顶层用到的
+ * 这里按 index.html 的顺序把五个脚本放进同一个 vm 上下文执行一遍, 并对顶层用到的
  * DOM / 图表 API 做最小 stub; 之后跑一轮微任务, 让 fetch 的回调也走完。
  */
 const test = require("node:test");
@@ -17,7 +17,7 @@ const vm = require("node:vm");
 
 const ROOT = path.join(__dirname, "..");
 const STATIC = path.join(ROOT, "static");
-const SCRIPTS = ["data-sync.js", "picker-core.js", "contract-picker.js", "app.js"];
+const SCRIPTS = ["data-sync.js", "indicators.js", "picker-core.js", "contract-picker.js", "app.js"];
 
 // ---------- 最小 DOM ----------
 
@@ -211,7 +211,7 @@ function runBrowser(options = {}) {
   return context;
 }
 
-test("四个脚本按 index.html 顺序加载时不抛错", () => {
+test("五个脚本按 index.html 顺序加载时不抛错", () => {
   assert.doesNotThrow(() => runBrowser());
 });
 
@@ -567,7 +567,6 @@ test("缺失段之后不会被误判成高档位", () => {
     const result = {};
     for (const type of ["Z-SCORE", "SMA", "RELATIVE"]) {
       threshtype = type;
-      sma300Cache = null;
       let high = 0;
       for (let i = 600; i < 660; i++) {
         for (const kind of ["buy", "sell"]) if (levelOf(kind, i) >= 2) high++;

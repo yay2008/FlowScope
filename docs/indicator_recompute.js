@@ -1,4 +1,4 @@
-// FlowScope 指标离线复算: 逐字移植 static/app.js 的 derive / deriveLw / levelOf
+// FlowScope 指标离线复算: 逐字移植 static/indicators.js 的 derive / deriveLw / levelOf
 // 用法: node .tmp-test/indicators.js .tmp-test/hist_k10.json
 // 输出: 每根 bar 的 OHLCV + 指标值 + 信号标签(JSONL 到 stdout)
 "use strict";
