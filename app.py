@@ -11,7 +11,7 @@ import mimetypes
 import os
 import time
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 import ingest
@@ -20,6 +20,7 @@ from catalog import CatalogService
 from favorites import FavoriteStore, FavoritesService, MAX_FAVORITES
 from indicator import CFG, DEFAULT_TF_SEC, TF_OPTIONS, ltf_options
 from ingest import FeedManager, period_cfg, validate_symbol, validate_tf
+from paper import DEFAULT_CASH, PaperService, PaperStore
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "KQ.m@SHFE.fu"
@@ -36,6 +37,9 @@ catalog = CatalogService(lambda: manager)
 favorites = FavoritesService(lambda: manager,
                              FavoriteStore(lambda: os.path.join(ingest.DATA_DIR, FAVORITES_FILE)))
 backups = BackupScheduler(lambda: ingest.DATA_DIR)
+# 模拟交易账户同样落在数据目录里, 随定期快照一起备份。
+paper = PaperService(lambda: manager,
+                     PaperStore(lambda: os.path.join(ingest.DATA_DIR, "paper", "account.json")))
 
 
 def require_feed(symbol: str, tf: int):
@@ -66,6 +70,9 @@ def sync_collection():
 
 @app.on_event("startup")
 async def _startup():
+    # 挂单撮合跟着采集循环走: 每轮 wait_update 之后用最新报价检查一次。
+    if paper.on_loop not in manager.loop_hooks:
+        manager.loop_hooks.append(paper.on_loop)
     manager.start(asyncio.get_running_loop())
     sync_collection()
     backups.start()
@@ -230,6 +237,55 @@ async def footprint(symbol: str = DEFAULT_SYMBOL, tf: int = DEFAULT_TF_SEC):
         await asyncio.sleep(0.2)
     return {"symbol": feed.symbol, "tickSize": None, "bars": [], "pending": True,
             "status": manager.status_snapshot()}
+
+
+@app.get("/api/paper")
+async def paper_state(symbol: str = DEFAULT_SYMBOL):
+    """模拟交易面板: 账户、持仓、委托、成交, 以及当前合约(主连换成标的月份)的盘口与交易状态。"""
+    try:
+        return await paper.state(symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/paper/orders")
+async def paper_order(order: dict = Body(...)):
+    """下单: ``{symbol, side: buy|sell, qty, type: market|limit, price?, clientId?}``。
+
+    市价单当场成交或返回 400(对手盘不够、不在交易时段等); 限价单够得着就成交, 否则挂单。
+    同一个 clientId 只下一次, 页面双击或超时重发不会重复成交。
+    """
+    try:
+        return await paper.place(order)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/paper/orders/{order_id}")
+def paper_cancel(order_id: str):
+    """撤掉一笔挂单。"""
+    try:
+        return paper.cancel(order_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/paper/flatten")
+async def paper_flatten(symbol: str):
+    """按市价平掉该合约(主连按当前标的月份)的全部持仓。"""
+    try:
+        return await paper.flatten(symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/paper/reset")
+def paper_reset(cash: float = DEFAULT_CASH):
+    """清空模拟账户(持仓、委托、成交), 以新的初始资金重新开始。"""
+    try:
+        return paper.reset(cash)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.websocket("/ws")

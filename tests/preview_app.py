@@ -3,11 +3,13 @@
 仅生成模拟行情，使用临时 CSV；不连接 TqSdk，不读取或改写真实历史。
 """
 import argparse
+import math
 import os
 from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,6 +21,7 @@ import uvicorn
 import app as server
 import catalog
 import ingest
+import paper
 from backup import BackupScheduler
 from indicator import tick_bar_start
 
@@ -67,26 +70,63 @@ class CatalogApi:
         return pd.DataFrame(rows)
 
     def get_quote(self, symbol):
-        """预览报价: 主周期订阅只需要 price_tick, 自选面板还要看得出涨跌。"""
-        seed = sum(ord(char) for char in symbol)
+        """预览报价: 主周期订阅只需要 price_tick, 自选面板还要看得出涨跌, 模拟交易还要盘口。
+
+        价格与预览 K 线同一水平(都在 3000 附近), 下单后的持仓线、挂单线才落在图上;
+        昨结算按品种错开, 自选面板的涨跌幅各不相同。盘口随时间摆动(见 PreviewQuote)。
+        """
         known = self.products.get(symbol)
-        price = 1000 + seed % 4000
+        seed = sum(ord(char) for char in (f"{known[0]}.{known[1]}" if known else symbol.rstrip("0123456789")))
+        price = 3000
         base = price - (seed % 21 - 10) * 5
-        return SimpleNamespace(
+        return PreviewQuote(
+            price=float(price),
             price_tick=1.0,
             instrument_name=f"{known[2]}主连" if known else self._month_name(symbol),
             ins_class="CONT" if known else "FUTURE",
             underlying_symbol=f"{known[0]}.{known[1]}2611" if known else "",
-            last_price=float(price),
             pre_settlement=float(base),
             pre_close=float(base),
             open_interest=float((seed % 90 + 10) * 1000),
             price_decs=0,
             expired=False,
+            volume_multiple=10,
+            upper_limit=float("nan"),
+            lower_limit=float("nan"),
+            # 全天都是交易时段, 预览随时能下单(周末仍按交易所规则休市)
+            trading_time={"day": [["00:00:00", "24:00:00"]], "night": []},
         )
 
     def wait_update(self, deadline=None):
         return True
+
+
+class PreviewQuote(SimpleNamespace):
+    """与 TqSdk 的报价对象一样就地更新: 最新价随时间在基准价上下摆动, 盘口买一 = 最新价, 卖一高一跳。"""
+
+    @property
+    def last_price(self):
+        return self.price + round(15 * math.sin(time.time() / 20))
+
+    @property
+    def bid_price1(self):
+        return self.last_price
+
+    @property
+    def ask_price1(self):
+        return self.last_price + self.price_tick
+
+    @property
+    def bid_volume1(self):
+        return 5 + int(time.time()) % 20
+
+    @property
+    def ask_volume1(self):
+        return 25 - int(time.time()) % 20
+
+    @property
+    def datetime(self):
+        return paper.beijing_now().strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
 def tick_rows(first, count):
@@ -115,6 +155,7 @@ class PreviewManager(ingest.FeedManager):
         self._set_status("connected")
         while not self._stop.is_set():
             self._run_jobs(self.catalog_api)
+            self._run_loop_hooks(self.catalog_api)   # 模拟交易: 刷新盘口、撮合挂单
             with self._lock:
                 feeds = list(self.feeds.values())
                 clients = list(self.clients.values())

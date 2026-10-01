@@ -77,6 +77,22 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（主图周期 10s /
 
 同一数据目录请只运行一个服务进程，使用默认单 worker 启动方式。
 
+## 模拟交易
+
+页面右侧的「模拟交易」面板可以在当前合约上下单，账户、持仓、委托和成交都记在服务端的 `data/paper/account.json`（整个账户一个文件，临时文件 + `os.replace` 原子替换，随 `data/` 快照一起备份），所有浏览器共用一份。**不走 TqSdk 的交易接口**：TqSim 的账户只在内存里，回收订阅、断线重连都会重建 TqApi、账户随之清零；快期模拟要在采集连接上下单，一个出错的调用就可能拖停整条行情连接。所以 `paper.py` 只**读**报价、自己撮合。
+
+- **合约**：主连不能下单，在 `KQ.m@SHFE.fu` 上下单时换成当时的标的月份合约（如 `SHFE.fu2611`），持仓记在月份合约上。主力换月后旧持仓还在旧合约上，面板的「持仓」里会单独列出；要平它，把 URL 改成那个月份合约再点「平仓」。
+- **净持仓**：每个合约只有一个带符号的手数，反向成交先平后开（反手）；加仓按手数加权均价，减仓不改均价。平仓先平昨再平今。
+- **市价单**：买按卖一、卖按买一，**整笔一次成交**；对手价缺失（涨跌停）或一档量不够整笔就拒单，不做部分成交。
+- **限价单**：下单时已经够得着对手价（买：卖一 ≤ 限价）且一档量够，就按对手价立即成交（可能比限价更好）；否则挂单，之后价格**穿过**限价（买：卖一或最新价 < 限价）才按限价成交，只是碰到不算 —— 看不到排队，碰到就算成交会把结果算得太好。价格必须是最小变动价位的整数倍、不超出涨跌停价。挂单在服务重启后照样有效，由采集循环每轮用最新报价检查。
+- **只在交易时段撮合**：按合约的交易时段（含跨零点的夜盘、周末休市）判断，并要求报价时间落在本时段之内（含开盘前集合竞价）—— 节假日时钟落在时段里、盘口却是上一个交易日的旧值，不能拿来成交。休市时市价单直接拒绝，限价单可以挂。
+- **资金**：开仓（含反手的开仓部分）要求成交后权益仍够付全部保证金，减仓不查。保证金按最新价 × 乘数 × **15%**（`paper.MARGIN_RATE`）估算，不分品种。手续费取 `docs/手续费最低品种排名_*.csv` 里最新的一份（由 `docs/fee_rate_ranking.py` 生成），区分开仓、平昨、平今，查不到的品种按 0 计，面板底部会注明。
+- **同一 clientId 只下一次**：页面每次点击生成一个订单号，双击或超时重发不会重复成交；下单请求超时时，结果以委托与成交记录为准。
+- **图表**：当前合约的成交以箭头标在对应 K 线上（买红、卖绿），持仓均价画实线、挂单价画虚线。
+- 「重置账户」清空持仓、委托与成交，按输入的初始资金重新开始。
+
+报价是 500ms 快照，结果只能当参考：小手数基本可信，大手数、薄盘口会把成交算得太顺利。
+
 ## 数据备份
 
 `data/` 里的买卖量历史无法从 TqSdk 重新生成，丢了就是丢了，所以服务在后台定期给它打快照（`backup.py`）：
@@ -97,6 +113,8 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（主图周期 10s /
 - `GET /api/watch?symbols=A,B,C&refresh=false`：自选面板用的轻量报价快照，每项含 `symbol`/`name`/`insClass`/`mainSymbol`/`lastPrice`/`basePrice`/`change`/`changePct`/`openInterest`/`volume`/`amount`/`priceDecs`/`expired`，取不到的字段是 `null`（NaN 不会是合法 JSON）。`openInterest`/`volume`/`amount` 都是**单边口径**的当日累计值，与菜单的「昨仓」同口径、可直接比较。只读报价对象、不订阅 K 线与 tick，1.5 秒 TTL 内多个页面的轮询只查一次；行情源不可用时返回 `source="unavailable"` 和空 `quotes`，不当作错误。
 - `GET /api/symbol?symbol=KQ.m@SHFE.fu`：顶栏只读展示位用的合约名，返回 `{"symbol", "label"}`。主连先解析出当前标的月份合约再取中文名（`KQ.m@SHFE.fu` → 「燃油2611」，随主力换月变化），月份合约直接取自身名称；查询走合约服务的静态接口（不订阅行情），名字取不到时 `label` 回退成合约代码，所以展示位永远不会空着或报错。代码走与订阅相同的校验，非法返回 400。
 - `GET /api/symbols?exchange=SHFE&product=fu&refresh=false`：合约选择器的数据源。不带参数时返回按交易所分组的全部主连品种（`exchangeId`/`exchangeName`/`productId`/`name`/`contSymbol`/`mainSymbol`/`openInterest`，组内按主力合约昨日持仓量降序）；带 `exchange`+`product` 时额外返回该品种的未下市月份合约（`symbol`/`name`/`openInterest`/`isMain`，同样按昨日持仓量降序）。`openInterest` 是交易所口径的**昨日持仓量**，只用于排序和下拉提示，不是实时值。`source` 为 `live` 或 `fallback`，`fallback` 表示行情源不可用（此时用内置常用品种、月份为空，`error`/`monthsError` 给出原因）；`refresh=true` 跳过缓存。查询全部是静态合约查询（不订阅行情）并在采集线程执行、带超时兜底，页面不会因为合约服务慢而卡住。
+- `GET /api/paper?symbol=...`：模拟交易面板的数据：`account`（`initialCash`/`cash`/`equity`/`floatPnl`/`margin`/`available`/`realizedPnl`/`fees`/`marginRate`）、`positions`、`orders`（全部挂单 + 最近 10 笔已结束的委托）、`trades`（最近 50 笔）、`contract`（主连解析成的标的月份合约）、`quote`（该合约盘口，含 `open`/`reason` 表示能否成交）、`contractTrades`（该合约的成交，供图表标记）、`fee`（该品种费率，查不到为 `null`）。第一次看某个代码时先到合约服务确认存在；查不到在 `error` 里说明，30 秒内不再重查。
+- `POST /api/paper/orders`，JSON `{symbol, side: "buy"|"sell", qty, type: "market"|"limit", price?, clientId?}`：下单，返回委托。市价单当场成交，否则 400 并说明原因；限价单能成交就成交，否则挂单。`DELETE /api/paper/orders/{id}` 撤单；`POST /api/paper/flatten?symbol=...` 按市价平掉该合约全部持仓；`POST /api/paper/reset?cash=1000000` 重置账户。
 - `WS /ws?symbol=...&ltf=0&tf=30&footprint=false`：先注册订阅，再发送 `snapshot` 完整快照，随后发送带版本号的 `bars` 批量增量，包含最新 bar 和历史修订。`footprint=true` 还会接收 `footprints` 或 `footprint_snapshot`；两种数据分别跟踪版本号。所有消息都带 `symbol`/`tf`（`bars` 另带 `ltf`），前端据此过滤，不同周期不会互相串消息。
 - 每次 WebSocket 重连都重新同步完整快照。慢客户端队列溢出时以 1013 关闭连接，前端自动重连补齐；15 秒无业务消息时发送包含行情源状态的 `ping`。
 
@@ -125,7 +143,7 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（主图周期 10s /
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-node --test tests/app-load.test.js tests/indicators.test.js tests/data-sync.test.js tests/load-history.test.js tests/picker-core.test.js tests/contract-picker.test.js
+node --test tests/app-load.test.js tests/indicators.test.js tests/data-sync.test.js tests/load-history.test.js tests/picker-core.test.js tests/contract-picker.test.js tests/paper-panel.test.js
 node --check static/app.js
 ```
 

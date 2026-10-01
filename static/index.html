@@ -98,6 +98,45 @@
     <ul id="watch-items"></ul>
   </aside>
   <div id="chart"></div>
+  <aside id="trade">
+    <div id="trade-head">
+      <button id="trade-toggle" title="折叠/展开模拟交易面板">›</button>
+      <span>模拟交易</span>
+    </div>
+    <div id="trade-body">
+      <div id="trade-contract">加载中…</div>
+      <div class="trade-book">
+        <span class="trade-dim">卖一</span><span id="trade-ask">—</span><span id="trade-ask-vol" class="trade-dim"></span>
+        <span class="trade-dim">买一</span><span id="trade-bid">—</span><span id="trade-bid-vol" class="trade-dim"></span>
+      </div>
+      <div class="trade-form">
+        <label>手数<input id="trade-qty" type="number" min="1" max="500" step="1" value="1"></label>
+        <label>类型<select id="trade-type">
+          <option value="market" selected>市价</option>
+          <option value="limit">限价</option>
+        </select></label>
+        <label id="trade-price-row" hidden>价格<input id="trade-price" type="number" min="0" step="any"></label>
+      </div>
+      <div class="trade-actions">
+        <button id="trade-buy" class="trade-buy" title="市价: 按卖一价整笔成交; 限价: 卖一不高于限价就立即成交, 否则挂单">买入</button>
+        <button id="trade-sell" class="trade-sell" title="市价: 按买一价整笔成交; 限价: 买一不低于限价就立即成交, 否则挂单">卖出</button>
+      </div>
+      <button id="trade-flatten" class="trade-flatten" title="按市价平掉当前合约的全部持仓">平仓</button>
+      <div id="trade-msg" class="trade-msg"></div>
+      <div class="trade-section">持仓</div>
+      <div id="trade-position" class="trade-grid"></div>
+      <div class="trade-section">账户</div>
+      <div id="trade-account" class="trade-grid"></div>
+      <div class="trade-section">委托</div>
+      <ul id="trade-orders" class="trade-list"></ul>
+      <div class="trade-section">成交</div>
+      <ul id="trade-trades" class="trade-list"></ul>
+      <div class="trade-foot">
+        <span id="trade-note"></span>
+        <button id="trade-reset" title="清空持仓、委托与成交, 以新的初始资金重新开始">重置账户</button>
+      </div>
+    </div>
+  </aside>
 </div>
 <script src="vendor/lightweight-charts.standalone.production.js"></script>
 <script>window.LightweightCharts || document.write('<script src="https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js"><\/script>')</script>
@@ -105,6 +144,7 @@
 <script src="indicators.js"></script>
 <script src="picker-core.js"></script>
 <script src="contract-picker.js"></script>
+<script src="paper-panel.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

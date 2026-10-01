@@ -351,6 +351,14 @@ function addPaneLabel(paneIndex, text) {
 addPaneLabel(1, "FlowMeter");
 addPaneLabel(2, "FlowWave");
 
+// 模拟交易叠加: 成交标记(买红上箭头 / 卖绿下箭头)与持仓均价、挂单价格线, 挂在 K 线上。
+// 数据来自右侧交易面板的轮询(见文件后部「模拟交易」一节)。
+const tradeMarkers = LightweightCharts.createSeriesMarkers(candleSeries, []);
+let paperState = null;
+let paperMarkerKey = "";
+let paperLineKey = "";
+let paperLines = [];
+
 // ---------- 指标计算 ----------
 // 纯计算在 indicators.js; 这里只把页面状态(bars/cfg/threshtype/bandK)喂进去,
 // 并保留同名入口给渲染代码用。
@@ -469,6 +477,7 @@ function renderAll() {
   renderSuite();
   renderLw();
   renderBand();
+  renderPaperOverlays();   // bar 集合变了(切周期/补历史), 成交标记要重新对齐到 bar
   updateLegend(bars.length - 1);
 }
 
@@ -899,6 +908,40 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) clearTimeout(watchTimer);
   else scheduleWatch(0);
 });
+
+// ---------- 模拟交易(右侧面板; 撮合与账户在服务端 paper.py) ----------
+// 面板自己轮询 /api/paper; 每次拿到新数据后在这里重画 K 线上的成交标记与价格线,
+// 内容没变就不动图表(轮询是每秒一次)。
+
+function renderPaperOverlays() {
+  if (!paperState) return;
+  const markers = PaperPanel.buildMarkers(paperState.contractTrades, bars);
+  const markerKey = JSON.stringify(markers);
+  if (markerKey !== paperMarkerKey) {
+    tradeMarkers.setMarkers(markers);
+    paperMarkerKey = markerKey;
+  }
+  const lines = PaperPanel.priceLines(paperState);
+  const lineKey = JSON.stringify(lines);
+  if (lineKey === paperLineKey) return;
+  paperLines.forEach((line) => candleSeries.removePriceLine(line));
+  paperLines = lines.map((line) => candleSeries.createPriceLine({
+    price: line.price, color: line.color, title: line.title, lineWidth: 1, axisLabelVisible: true,
+    lineStyle: line.style === "dashed" ? LightweightCharts.LineStyle.Dashed : LightweightCharts.LineStyle.Solid,
+  }));
+  paperLineKey = lineKey;
+}
+
+const paperPanel = PaperPanel.create({
+  byId: $,
+  fetchJson,
+  getSymbol: () => symbol,
+  onState: (state) => {
+    paperState = state;
+    renderPaperOverlays();
+  },
+});
+paperPanel.start();
 
 // ---------- 足迹图视图切换与数据 ----------
 

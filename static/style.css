@@ -220,3 +220,118 @@ body { display: flex; flex-direction: column; }
 /* 涨跌配色按国内行情软件的习惯: 红涨绿跌(K线本身是灰阶, 与足迹图的买卖配色不冲突) */
 .watch-chg.up { color: #f23645; }
 .watch-chg.down { color: #00e676; }
+
+/* ---------- 模拟交易面板(右侧, 与自选面板对称) ---------- */
+#trade {
+  display: flex;
+  flex-direction: column;
+  width: 236px;
+  flex-shrink: 0;
+  min-height: 0;
+  background: #1e222d;
+  border-left: 1px solid #2a2e39;
+  font-size: 12px;
+}
+#trade.collapsed { width: 28px; }
+#trade.collapsed #trade-head span,
+#trade.collapsed #trade-body { display: none; }
+
+#trade-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px 5px 4px;
+  color: #f0b90d;
+  font-weight: 600;
+  font-size: 13px;
+}
+#trade-head button {
+  background: transparent;
+  border: none;
+  color: #9598a1;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+}
+#trade-body { overflow-y: auto; flex: 1; min-height: 0; padding: 0 10px 10px; }
+
+#trade-contract { color: #d1d4dc; padding: 2px 0 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#trade-contract.closed { color: #9598a1; }
+.trade-dim { color: #9598a1; }
+.trade-book {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 2px 8px;
+  font-family: Consolas, monospace;
+  padding: 4px 6px;
+  background: #131722;
+  border-radius: 4px;
+}
+.trade-book > span:nth-child(3n + 2) { text-align: right; }
+
+.trade-form { display: flex; flex-wrap: wrap; gap: 6px 8px; padding: 8px 0 6px; }
+.trade-form label { display: flex; align-items: center; gap: 4px; color: #9598a1; }
+.trade-form label[hidden] { display: none; }
+.trade-form input, .trade-form select {
+  background: #131722;
+  color: #d1d4dc;
+  border: 1px solid #2a2e39;
+  border-radius: 4px;
+  padding: 3px 4px;
+  font: inherit;
+}
+#trade-qty { width: 52px; }
+#trade-price { width: 96px; }
+
+.trade-actions { display: flex; gap: 6px; }
+.trade-actions button, .trade-flatten, .trade-foot button, .trade-cancel {
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  color: #fff;
+}
+.trade-actions button { flex: 1; padding: 7px 4px; font-weight: 600; font-family: Consolas, "Microsoft YaHei", monospace; }
+/* 国内习惯: 红买绿卖 */
+.trade-buy { background: #d7303f; }
+.trade-sell { background: #089981; }
+.trade-actions button:hover:not(:disabled) { filter: brightness(1.12); }
+.trade-flatten { width: 100%; margin-top: 6px; padding: 5px 4px; background: #363c4e; }
+.trade-flatten:hover:not(:disabled) { background: #434a60; }
+#trade button:disabled { opacity: 0.4; cursor: default; }
+
+.trade-msg { min-height: 16px; padding: 4px 0 0; color: #9598a1; word-break: break-all; }
+.trade-msg.ok { color: #66bb6a; }
+.trade-msg.error { color: #f7525f; }
+
+.trade-section {
+  margin-top: 8px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid #2a2e39;
+  color: #9598a1;
+  font-weight: 600;
+}
+.trade-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  padding-top: 4px;
+  font-family: Consolas, "Microsoft YaHei", monospace;
+}
+.trade-grid > span:nth-child(2n) { text-align: right; }
+
+.trade-list { list-style: none; margin: 0; padding: 4px 0 0; color: #9598a1; font-family: Consolas, "Microsoft YaHei", monospace; }
+.trade-list li { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
+.trade-list li > span:nth-child(2) { flex: 1; text-align: right; }
+.trade-list li.done { opacity: 0.6; }
+.trade-cancel { background: #363c4e; padding: 0 6px; }
+.trade-cancel:hover { background: #434a60; }
+
+.trade-foot { display: flex; align-items: center; gap: 6px; margin-top: 10px; color: #6b7180; font-size: 11px; }
+#trade-note { flex: 1; }
+.trade-foot button { background: transparent; color: #9598a1; border: 1px solid #2a2e39; padding: 2px 6px; }
+.trade-foot button:hover { color: #d1d4dc; border-color: #3a4152; }
+
+/* 盈亏与多空: 红盈绿亏, 红多绿空 */
+#trade .up { color: #f23645; }
+#trade .down { color: #00e676; }

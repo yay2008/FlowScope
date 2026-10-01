@@ -6,7 +6,7 @@
  * 真实案例: picker.load() 同步渲染月份行并回调 isFavorite() 画 ☆, 而 favorites 那时
  * 还没声明, 于是 "Cannot access 'favorites' before initialization"。
  *
- * 这里按 index.html 的顺序把五个脚本放进同一个 vm 上下文执行一遍, 并对顶层用到的
+ * 这里按 index.html 的顺序把全部脚本放进同一个 vm 上下文执行一遍, 并对顶层用到的
  * DOM / 图表 API 做最小 stub; 之后跑一轮微任务, 让 fetch 的回调也走完。
  */
 const test = require("node:test");
@@ -17,7 +17,7 @@ const vm = require("node:vm");
 
 const ROOT = path.join(__dirname, "..");
 const STATIC = path.join(ROOT, "static");
-const SCRIPTS = ["data-sync.js", "indicators.js", "picker-core.js", "contract-picker.js", "app.js"];
+const SCRIPTS = ["data-sync.js", "indicators.js", "picker-core.js", "contract-picker.js", "paper-panel.js", "app.js"];
 
 // ---------- 最小 DOM ----------
 
@@ -97,16 +97,21 @@ function createDocument() {
 // 记录每次 applyOptions: 可见性开关是"状态变量 → series"的唯一通路, 只能从这里观察。
 // 每次 createChartStub() 覆盖它, 所以读取前必须先 runBrowser()。
 let lastAppliedOptions = null;
+// 模拟交易叠加画到图上的价格线与成交标记(同样每次 createChartStub() 重置)。
+let createdPriceLines = [];
+let markerCalls = [];
 
 function createChartStub() {
   const applied = [];
   lastAppliedOptions = applied;
   const series = () => ({
     setData() {}, update() {}, applyOptions(options) { applied.push(options); }, setMarkers() {},
-    createPriceLine() { return { applyOptions() {} }; }, removePriceLine() {},
+    createPriceLine(options) { createdPriceLines.push(options); return { applyOptions() {} }; }, removePriceLine() {},
     priceScale() { return { applyOptions() {} }; },
     setVisibleRange() {}, coordinateToPrice() { return 0; }, priceToCoordinate() { return 0; },
   });
+  createdPriceLines = [];
+  markerCalls = [];
   const chart = {
     addSeries: series, addCustomSeries: series, removeSeries() {},
     applyOptions() {}, resize() {}, timeScale: () => ({
@@ -160,7 +165,25 @@ function stubFetch(url) {
   if (path === "/api/symbol") return Promise.resolve(symbolResponse());
   if (path === "/api/favorites") return Promise.resolve(jsonResponse({ symbols: [], max: 40 }));
   if (path === "/api/history") return Promise.resolve(jsonResponse({ symbol: "KQ.m@SHFE.fu", cfg: null, bars: [] }));
+  if (path === "/api/paper") return Promise.resolve(jsonResponse(paperResponse()));
   return Promise.resolve(catalogResponse());
+}
+
+// 模拟交易面板的最小可用形状: 有一笔持仓和一笔挂单, 顺带走一遍标记与价格线的绘制。
+function paperResponse() {
+  return {
+    symbol: "KQ.m@SHFE.fu", contract: "SHFE.fu2611", error: null, fee: null, feeSource: null,
+    quote: { contract: "SHFE.fu2611", name: "燃油2611", ask: 3001, bid: 3000, askVolume: 5, bidVolume: 7,
+             last: 3000, priceTick: 1, priceDecs: 0, open: true, reason: "", datetime: "2026-09-30 10:00:00" },
+    account: { initialCash: 1000000, cash: 1000000, equity: 1000100, floatPnl: 100, margin: 4500,
+               available: 995600, realizedPnl: 0, fees: 0, marginRate: 0.15 },
+    positions: [{ contract: "SHFE.fu2611", qty: 1, avgPrice: 2990, last: 3000, floatPnl: 100, margin: 4500 }],
+    orders: [{ id: "O2", contract: "SHFE.fu2611", side: "sell", qty: 1, type: "limit", price: 3050,
+               status: "open", createdAt: "2026-09-30 10:00:01" }],
+    trades: [{ id: "T1", contract: "SHFE.fu2611", side: "buy", qty: 1, price: 2990, open: 1, close: 0,
+               pnl: 0, fee: 0, position: 1, time: 1790762400, at: "2026-09-30 10:00:00" }],
+    contractTrades: [],
+  };
 }
 
 function jsonResponse(payload) {
@@ -199,6 +222,7 @@ function runBrowser(options = {}) {
       CandlestickSeries: "CandlestickSeries",
       LineSeries: "LineSeries",
       HistogramSeries: "HistogramSeries",
+      createSeriesMarkers: () => ({ setMarkers(markers) { markerCalls.push(markers); } }),
     },
   };
   context.window = context;
@@ -222,6 +246,20 @@ test("合约选择器加载完成后自选状态可用(isFavorite 不踩暂时�
   assert.ok(picker, "ContractPicker 应挂在全局");
   // 目录已经画过一次月份(含 ☆), 再强制重绘一次也必须能取到自选状态
   assert.doesNotThrow(() => context.document.getElementById("picker-months"));
+});
+
+test("模拟交易面板加载后在 K 线上画出持仓均价与挂单价格线", async () => {
+  const context = runBrowser();
+  // vm 里的 setTimeout 是空操作, 面板的定时轮询不会自己跑: 直接调一次它的刷新入口
+  await vm.runInContext("paperPanel.refresh()", context);
+  const titles = createdPriceLines.map((line) => line.title).filter(Boolean);
+  assert.ok(titles.includes("多1 均价"), `应画出持仓均价线, 实际 ${JSON.stringify(titles)}`);
+  assert.ok(titles.includes("卖1 挂单"), `应画出挂单价格线, 实际 ${JSON.stringify(titles)}`);
+  assert.ok(markerCalls.length > 0, "应把成交标记交给图表(即使这次为空)");
+  const byId = (id) => context.document.getElementById(id);
+  assert.equal(byId("trade-buy").textContent, "买入 3001");
+  assert.equal(byId("trade-flatten").textContent, "平仓 多1");
+  assert.equal(byId("trade-buy").disabled, false);
 });
 
 test("favorites 在顶层声明完毕后才可能为真值", () => {

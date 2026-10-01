@@ -415,6 +415,9 @@ class FeedManager:
         self._last_data_at = time.monotonic()
         self.last_probe_at = 0.0
         self.probe_error: str | None = None
+        # 每轮 wait_update 之后在采集线程里调用的回调 fn(api)(模拟交易撮合挂单等)。
+        # 回调只读已订阅的报价; 耗时同样计入 _busy_since, 卡住时连接自检照样能发现。
+        self.loop_hooks: list = []
 
     def feed_retry_error(self, feed: Feed) -> str | None:
         """失败 Feed 未过冷却期时给出可重试的错误文案; 否则返回 None(可以重订)。"""
@@ -510,6 +513,19 @@ class FeedManager:
                     print(f"[ingest] 查询耗时 {elapsed:.0f} 秒，判定连接不可用，重建行情连接",
                           flush=True)
                     self._rebuild_api.set()
+
+    def _run_loop_hooks(self, api):
+        """执行循环回调; 单个回调出错只打印, 不影响采集。"""
+        for hook in list(self.loop_hooks):
+            if self._stop.is_set() or self._rebuild_api.is_set():
+                return
+            self._busy_since = time.monotonic()
+            try:
+                hook(api)
+            except Exception as exc:
+                print(f"[ingest] 循环回调失败: {type(exc).__name__}: {exc}", flush=True)
+            finally:
+                self._busy_since = None
 
     def _probe_due(self, now: float) -> bool:
         """行情流安静太久(闭市/无订阅)就该主动问一次连接还在不在。"""
@@ -859,4 +875,5 @@ class FeedManager:
                         feed.error = f"行情处理失败: {exc}"
                         feed.compute_retry_at = time.monotonic() + COMPUTE_RETRY_SEC
                     print(f"[ingest] {feed_label(feed_key(feed.symbol, feed.tf))} {feed.error}", flush=True)
+            self._run_loop_hooks(api)
         return self._rebuild_api.is_set() and not self._stop.is_set()
