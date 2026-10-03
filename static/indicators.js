@@ -1,4 +1,4 @@
-/* 指标计算: 滚动统计、Volume Suite 阈值分档、LSMA × CRVOL 共振、FlowWave 回归通道。
+/* 指标计算: 滚动统计、Volume Suite 阈值分档、LSMA × CRVOL 共振、FlowWave 回归通道、WaveTrend。
  *
  * 纯函数, 不碰 DOM 与图表, 浏览器与 Node 回归测试共用(与 data-sync.js 同样的写法)。
  * 状态(bars / cfg / threshtype / 带宽 k)全部由调用方传入, 模块内不留全局状态。
@@ -18,6 +18,13 @@
 
   // 主图 EMA 周期
   const EMA_PERIODS = [21, 55, 100, 200];
+
+  // WaveTrend 参数(docs/WaveTrend.pine 的默认输入): 通道长度 / 平均长度 / 信号长度, 两档超买超卖线,
+  // 背离枢轴左右各 pivot 根, 主图参考线换算用的价格通道长度 mapLen(同原版叠加的 Display Length 200)
+  const WT = { chLen: 10, avgLen: 21, sigLen: 4, ob1: 60, ob2: 53, os2: -53, os1: -60, pivot: 5, mapLen: 200 };
+  WT.upper = (WT.ob1 + WT.ob2) / 2;   // 56.5: 强信号与超买区的分界(原版 upperThreshold)
+  WT.lower = (WT.os1 + WT.os2) / 2;   // -56.5
+  WT.warmup = 3 * WT.avgLen + WT.chLen;   // 73: osc 冷启动屏蔽的根数, 依据见 deriveWt
 
   // ---------- 判向口径 ----------
   // 后端对同一根 bar 并列输出两套量: buy/sell/unknown 是新算法(Lee-Ready),
@@ -124,20 +131,28 @@
 
   const smaStrict = rollingSma;     // ta.sma: 窗口含 null 则结果为 null, 与 rollingSma 同一口径
 
+  // LazyBear 通道指数: (src - ema(src,n)) / (k * ema(|src - ema(src,n)|, n))。
+  // LSMA × CRVOL 的 tci 用 k=0.025, WaveTrend 用 k=0.015。分母为 0 时输出 null(同 Pine 除零得 na):
+  // ema 首根播种成自身, 所以第一根的偏离恒为 0, 振荡值从第二根才开始有。
+  function channelIndex(src, n, k) {
+    const esa = ema(src, n);
+    const dev = src.map((x, i) => (x == null || esa[i] == null ? null : x - esa[i]));
+    const d = ema(dev.map((x) => (x == null ? null : Math.abs(x))), n);
+    return dev.map((x, i) => (x == null || !d[i] ? null : x / (k * d[i])));
+  }
+
+  const hlc3Of = (bars) => bars.map((b) => (b.high + b.low + b.close) / 3);
+
   // ---------- LSMA × CRVOL 共振 ----------
 
   // crv: derive 里算好的 CRVOL 累计序列(斜率复用它)
   function deriveLw(bars, crv) {
     const n = bars.length;
-    const hlc3 = bars.map((b) => (b.high + b.low + b.close) / 3);
+    const hlc3 = hlc3Of(bars);
     const vol = bars.map((b) => b.volume || 0);
 
-    // tci = ema((src-ema(src,n1)) / (0.025*ema(|src-ema(src,n1)|,n1)), n2) + 50
-    const e1 = ema(hlc3, LW.n1);
-    const dev = hlc3.map((x, i) => (e1[i] == null ? null : x - e1[i]));
-    const e2 = ema(dev.map((x) => (x == null ? null : Math.abs(x))), LW.n1);
-    const cci = dev.map((x, i) => (x == null || !e2[i] ? null : x / (0.025 * e2[i])));
-    const tci = ema(cci, LW.n2).map((x) => (x == null ? null : x + 50));
+    // tci = ema(channelIndex(src, n1, 0.025), n2) + 50
+    const tci = ema(channelIndex(hlc3, LW.n1, 0.025), LW.n2).map((x) => (x == null ? null : x + 50));
 
     // mf = n3 周期 MFI(典型价用 hlc3)
     const rmf = hlc3.map((tp, i) => tp * vol[i]);
@@ -197,6 +212,89 @@
     return { mid, up, dn, state };
   }
 
+  // ---------- WaveTrend (LazyBear, DGT 改版 vX; 移植自 docs/WaveTrend.pine) ----------
+
+  // osc = ema(channelIndex(hlc3, chLen, 0.015), avgLen), sig = sma(osc, sigLen)。
+  // 没有移植: 原版的「对比品种」(request.security 取另一个合约, 页面一次只加载一个合约)与右上角 Dashboard。
+  function deriveWt(bars) {
+    const n = bars.length;
+    // 冷启动屏蔽: ema 链从首根播种, 头几根的分母 d 还没长起来, osc 会冲到几百。TradingView 上历史够长,
+    // 这一段在屏幕外; 这里窗口只有几百根, 不屏蔽会把 osc 的纵轴撑开, 窗口滑动时左端的值也会跟着变。
+    // 实测 120 组随机游走, 冷启动序列与已收敛序列相差 ≤1 最坏要 69 根, 所以取 WT.warmup = 73 根。
+    const osc = ema(channelIndex(hlc3Of(bars), WT.chLen, 0.015), WT.avgLen)
+      .map((x, i) => (i < WT.warmup ? null : x));
+    const sig = smaStrict(osc, WT.sigLen);
+
+    // 交叉(ta.crossover / ta.crossunder), 按原版标签分强弱: 金叉在 lower 以下 = 强(3)、0 以下 = 普通(2)、
+    // 0 以上 = 弱(1, 顺势); 死叉镜像, 记负数。原版恰好等于阈值或 0 时不打标签, 浮点振荡值上碰不到, 这里并入相邻档。
+    const cross = new Array(n).fill(0);
+    for (let i = 1; i < n; i++) {
+      const a = osc[i], b = sig[i], pa = osc[i - 1], pb = sig[i - 1];
+      if (a == null || b == null || pa == null || pb == null) continue;
+      if (a > b && pa <= pb) cross[i] = a < WT.lower ? 3 : a < 0 ? 2 : 1;
+      else if (a < b && pa >= pb) cross[i] = a > WT.upper ? -3 : a > 0 ? -2 : -1;
+    }
+
+    // 背离: osc 的枢轴(ta.pivotlow/pivothigh, 左右各 pivot 根, 严格低于/高于两侧)要等右侧走完才确认,
+    // 所以事件属于确认那根 i, 枢轴本身在 i - pivot。每个枢轴都和上一个同向枢轴比:
+    //   RB 常规看涨: 价格低点更低 + osc 低点更高      HB 隐藏看涨: 价格低点更高 + osc 低点更低
+    //   RS 常规看跌: 价格高点更高 + osc 高点更低      HS 隐藏看跌: 价格高点更低 + osc 高点更高
+    const L = WT.pivot;
+    // 主图上连的是两个枢轴的价格(低点连 low、高点连 high), osc 值留着给测试与调试核对
+    const divs = [];   // {at, from, to, fromPrice, toPrice, fromOsc, toOsc, kind}
+    let prevLow = null, prevHigh = null;
+    for (let i = 2 * L; i < n; i++) {
+      const c = i - L, v = osc[c];
+      if (v == null) continue;
+      let isLow = true, isHigh = true;
+      for (let j = c - L; j <= c + L && (isLow || isHigh); j++) {
+        if (j === c) continue;
+        if (osc[j] == null) { isLow = isHigh = false; break; }
+        if (osc[j] <= v) isLow = false;
+        if (osc[j] >= v) isHigh = false;
+      }
+      const add = (prev, price, kind) => divs.push({ at: i, from: prev.idx, to: c, fromPrice: prev.price, toPrice: price,
+                                                      fromOsc: prev.osc, toOsc: v, kind });
+      if (isLow) {
+        const price = bars[c].low;
+        if (prevLow) {
+          if (price < prevLow.price && v > prevLow.osc) add(prevLow, price, "RB");
+          if (price > prevLow.price && v < prevLow.osc) add(prevLow, price, "HB");
+        }
+        prevLow = { idx: c, price, osc: v };
+      }
+      if (isHigh) {
+        const price = bars[c].high;
+        if (prevHigh) {
+          if (price > prevHigh.price && v < prevHigh.osc) add(prevHigh, price, "RS");
+          if (price < prevHigh.price && v > prevHigh.osc) add(prevHigh, price, "HS");
+        }
+        prevHigh = { idx: c, price, osc: v };
+      }
+    }
+
+    // 主图参考线换算用的价格通道: 每根取最近 mapLen 根(开头不足就取已有的)的最高价 / 最低价, 只看当根及以前
+    const hi = new Array(n).fill(null), lo = new Array(n).fill(null);
+    for (let i = 0; i < n; i++) {
+      let h = -Infinity, l = Infinity;
+      for (let j = Math.max(0, i - WT.mapLen + 1); j <= i; j++) {
+        if (bars[j].high > h) h = bars[j].high;
+        if (bars[j].low < l) l = bars[j].low;
+      }
+      hi[i] = h;
+      lo[i] = l;
+    }
+
+    return { osc, sig, cross, divs, hi, lo };
+  }
+
+  // 振荡值 v 换算成第 i 根上的价格(主图参考线用): 以 hi/lo 通道为尺, ±ob1(60) 落在通道上下沿, 0 落在中线。
+  // 每根的通道不同, 所以同一个振荡值(如超买线 60)画出来是一条随通道起伏的曲线, 不是水平线。
+  function wtPrice(wt, i, v) {
+    if (v == null || wt.hi[i] == null) return null;
+    return (wt.hi[i] + wt.lo[i]) / 2 + (v / WT.ob1) * (wt.hi[i] - wt.lo[i]) / 2;
+  }
+
   // ---------- Volume Suite 派生序列与分档 ----------
 
   // cfg: 后端下发的 mult/rellen/smalen/zlen; bandK: 叠加带的带宽倍数
@@ -243,6 +341,7 @@
                       zVol, zRpos, zRneg, zBuy, zSell, crv, emaLines };
     derived.lw = deriveLw(bars, crv);
     derived.band = deriveBand(bars, derived.lw.wt2, bandK);
+    derived.wt = deriveWt(bars);
     return derived;
   }
 
@@ -298,9 +397,9 @@
   }
 
   const api = {
-    LW, BAND, EMA_PERIODS, buyOf, sellOf, deltaOf,
-    rollingSma, rollingZ, ema, rma, rsi, linreg, smaStrict,
-    deriveLw, deriveBand, derive, levelOf,
+    LW, BAND, WT, EMA_PERIODS, buyOf, sellOf, deltaOf,
+    rollingSma, rollingZ, ema, rma, rsi, linreg, smaStrict, channelIndex,
+    deriveLw, deriveBand, deriveWt, wtPrice, derive, levelOf,
   };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.FlowIndicators = api;

@@ -1,13 +1,13 @@
 /* FlowScope 前端
  * 数据: GET /api/history 拉历史快照, WS /ws 收增量 bar
- * 渲染: lightweight-charts v5, 三个 pane: K线 / Volume Suite / LSMA×CRVOL
+ * 渲染: lightweight-charts v5, 三个 pane: K线(可叠加 WaveTrend) / Volume Suite / LSMA×CRVOL
  * 阈值与配色按 Volume Suite (By Leviathan) 口径在前端实时计算
  */
 "use strict";
 
 const $ = (id) => document.getElementById(id);
 // 指标常量与纯函数来自 indicators.js; 必须在图表初始化(用到 EMA_PERIODS)之前解构
-const { LW, BAND, EMA_PERIODS, buyOf, sellOf, deltaOf, rollingSma, rollingZ } = FlowIndicators;
+const { LW, BAND, WT, EMA_PERIODS, buyOf, sellOf, deltaOf, rollingSma, rollingZ } = FlowIndicators;
 
 let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
 let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
@@ -21,8 +21,18 @@ let tf = 30;         // 主图周期(秒), 10 或 30; 后端按 (symbol, tf) 独
 // 各主周期下合法的拆分粒度; 与后端 indicator.ltf_options 同源, 首次拿到 cfg 后以 cfg 为准
 const LTF_BY_TF = { 10: [1, 5, 10], 30: [1, 5, 10, 15, 30] };
 let view = "candle";  // 主图视图: candle=K线, footprint=足迹图
-let bandOverlay = "off";  // 主图是否叠加 FlowWave 回归通道带; 必须与 index.html 里 <select id="lw-overlay"> 的 selected 选项一致
 let bandK = 2;        // 叠加带的带宽倍数 k(回归残差标准差的倍数); 必须与 index.html 里 <select id="band-k"> 的 selected 选项一致
+let wtSignal = "strong";  // 主图 WaveTrend 的交叉箭头: strong=只标强交叉(原版默认) / all=全部 / none=不标; 必须与 index.html 里 <select id="wt-signal"> 的 selected 选项一致
+// 主图指标的显示/隐藏, 由主图左上角图例的眼睛按钮切换。切合约是整页重载, 所以记在 localStorage,
+// 否则每切一次都被打回默认; 读不到(隐私模式、旧值不合法)就用这里的默认值。
+const MAIN_SHOWN_KEY = "flowscope.mainShown";
+const mainShown = { ema: true, band: false, wt: true };
+try {
+  const saved = JSON.parse(localStorage.getItem(MAIN_SHOWN_KEY) || "{}");
+  for (const key of Object.keys(mainShown)) {
+    if (typeof saved[key] === "boolean") mainShown[key] = saved[key];
+  }
+} catch (error) { /* 记不住不影响使用 */ }
 let fpBars = [];      // 足迹 bar: {time, levels: [[price, buy, sell], ...按价格升序]}
 let fpBarSpacing = null;   // 进足迹模式前的 barSpacing, 退出时恢复
 let barRevision = -1, fpRevision = -1;
@@ -62,6 +72,10 @@ const FP = {
   unknownColor: (ratio) => `rgba(167, 139, 250, ${0.35 + 0.55 * ratio})`,
 };
 
+// 两个自定义 series(足迹图、FlowWave带)共用的坐标契约: 库只给 visibleRange 内的 bar 算 x
+// (区间已经包含两侧只露出一半的那根); 区间外的 x 是 NaN, 或者是上次可见时留下的旧值 ——
+// 滚动/缩放之后、下一次 setData 之前不会重算。遍历全部 bar 就会拿旧坐标在画面两侧画出残影,
+// 所以 draw 只走 visibleRange。
 class FootprintRenderer {
   constructor() {
     this._data = null;
@@ -75,7 +89,8 @@ class FootprintRenderer {
     return `rgba(245, 166, 35, ${0.08 + 0.87 * ratio})`;
   }
   draw(target, priceConverter) {
-    if (!this._data || !this._data.bars.length) return;
+    const range = this._data?.visibleRange;
+    if (!range) return;
     const { bars, barSpacing } = this._data;
     const tickSize = this._options?.tickSize;
     target.useMediaCoordinateSpace(({ context: ctx }) => {
@@ -85,7 +100,7 @@ class FootprintRenderer {
       ctx.font = "9px Consolas, monospace";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      for (let i = 0; i < bars.length; i++) {
+      for (let i = range.from; i < range.to; i++) {   // 只画可见区间, 见上方说明
         const d = bars[i].originalData;
         const levels = d.levels;
         if (!levels || !levels.length) continue;
@@ -202,11 +217,14 @@ class BandRenderer {
     return `rgba(149, 152, 161, ${alpha})`;
   }
   draw(target, priceConverter) {
-    if (!this._data || !this._data.bars.length) return;
+    const range = this._data?.visibleRange;
+    if (!range) return;
     const { bars } = this._data;
     target.useMediaCoordinateSpace(({ context: ctx }) => {
+      // 只取可见区间(见 FootprintRenderer 上方的坐标契约): 区间外的旧坐标会和可见的 bar 连成大块假填充。
+      // 区间两端那根本身就半露在窗格外, 带照样连到窗格边缘。
       const pts = [];
-      for (let i = 0; i < bars.length; i++) {
+      for (let i = range.from; i < range.to; i++) {
         const d = bars[i].originalData;
         const yUp = priceConverter(d.up), yDn = priceConverter(d.dn), yMid = priceConverter(d.mid);
         pts.push(yUp == null || yDn == null
@@ -259,6 +277,54 @@ class BandSeries {
   destroy() {}
 }
 
+// ---------- WaveTrend 背离连线(series primitive, 挂在 K 线上, 连两个枢轴的低点/高点, 同原版) ----------
+// 背离是两个枢轴之间的一条斜线, 起点往往在别的 bar 上, custom series 的逐根数据装不下,
+// 所以走 primitive: 每次绘制按时间/数值现算坐标。起点滚出可视区时 timeToCoordinate 仍给出(屏外)坐标,
+// 斜线照样画到边缘。
+class DivergencePrimitive {
+  constructor() {
+    this._segs = [];
+    this._chart = null;
+    this._series = null;
+    this._requestUpdate = null;
+    this._view = { renderer: () => ({ draw: (target) => this._draw(target) }) };
+  }
+  attached({ chart, series, requestUpdate }) {
+    this._chart = chart;
+    this._series = series;
+    this._requestUpdate = requestUpdate;
+  }
+  detached() {
+    this._chart = this._series = this._requestUpdate = null;
+  }
+  // segs: [{t1, v1, t2, v2, text, color, up}], up=true 时标签写在终点下方(看涨), 否则上方
+  setSegments(segs) {
+    this._segs = segs;
+    if (this._requestUpdate) this._requestUpdate();
+  }
+  updateAllViews() {}
+  paneViews() { return [this._view]; }
+  _draw(target) {
+    if (!this._chart || !this._segs.length) return;
+    const ts = this._chart.timeScale();
+    target.useMediaCoordinateSpace(({ context: ctx }) => {
+      ctx.lineWidth = 1;
+      ctx.font = "9px Consolas, monospace";
+      ctx.textAlign = "center";
+      for (const s of this._segs) {
+        const x1 = ts.timeToCoordinate(s.t1), x2 = ts.timeToCoordinate(s.t2);
+        const y1 = this._series.priceToCoordinate(s.v1), y2 = this._series.priceToCoordinate(s.v2);
+        if (x1 == null || x2 == null || y1 == null || y2 == null) continue;
+        ctx.strokeStyle = s.color;
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+        ctx.fillStyle = s.color;
+        ctx.textBaseline = s.up ? "top" : "bottom";
+        ctx.fillText(s.text, x2, s.up ? y2 + 3 : y2 - 3);
+      }
+    });
+  }
+}
+
 // ---------- 图表初始化 ----------
 
 const chart = LightweightCharts.createChart($("chart"), {
@@ -290,8 +356,31 @@ const emaSeries = EMA_PERIODS.map((p, j) =>
   chart.addSeries(LightweightCharts.LineSeries, {
     color: EMA_COLORS[j], lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
   }, 0));
+applyEmaVisibility();
 
-// 主图可选叠加: FlowWave 回归通道带(默认隐藏, 由工具栏「叠加」开关控制)
+// 主图叠加: WaveTrend(移植自 docs/WaveTrend.pine, LazyBear 原版 + DGT 改版; 只需 OHLC, 全部前端计算)
+// 主图上画: 交叉箭头(K 线下方/上方, 同原版标签的位置)、背离连线(K 线的低点/高点之间)、±53/±60/0 参考线。
+// 振荡线、信号线、柱按需求不画; 振荡值与信号线照常计算(交叉就是两者的穿越), 原数看顶部图例的 WT。
+// 参考线换算成价格画在 K 线的价格轴上(FlowIndicators.wtPrice), 拖动/缩放价格轴时跟着 K 线一起动:
+// 换算尺是每根最近 200 根的最高价/最低价通道, ±60 落在通道上下沿, 0 落在中线, 所以这几条线随通道起伏、
+// 不是水平线, 也就只能是逐根数据的 series 而不是价格线。原版(Middle 摆位)是在最后一根上算出一个固定映射,
+// 只画最后 200 根、新 bar 一来整段都会挪; 这里逐根换算, 全历史都有。
+// 参考线一律不参与价格轴自动缩放(autoscaleInfoProvider 返回 null): 通道沿可能来自可视区左边的 bar,
+// 参与的话放大 K 线时价格轴会被撑开。
+// 超卖线不用原版振荡线的青色 #26a69a(与 EMA100 的 #009688 几乎同色), 换成浅青; 超买线用原版信号线的红。
+const WT_COLORS = { ob: "#ef5350", os: "#4dd0e1", bull: "#16a34a", bear: "#dc2626" };
+// 两档超买(实线 60 / 点线 53)、0 轴、两档超卖(点线 -53 / 实线 -60), 线型同原版
+const WT_LEVELS = [[WT.ob1, WT_COLORS.ob, "Solid"], [WT.ob2, WT_COLORS.ob, "Dotted"], [0, "rgba(149, 152, 161, 0.5)", "Solid"],
+                   [WT.os2, WT_COLORS.os, "Dotted"], [WT.os1, WT_COLORS.os, "Solid"]];
+const wtLevelLines = WT_LEVELS.map(([, color, style]) => chart.addSeries(LightweightCharts.LineSeries, {
+  color, lineWidth: 1, lineStyle: LightweightCharts.LineStyle[style], priceLineVisible: false, lastValueVisible: false,
+  crosshairMarkerVisible: false, autoscaleInfoProvider: () => null,
+}, 0));
+const wtDivergence = new DivergencePrimitive();
+candleSeries.attachPrimitive(wtDivergence);
+applyWtVisibility();
+
+// 主图可选叠加: FlowWave 回归通道带(默认隐藏, 由主图左上角图例的眼睛按钮控制)
 const bandSeries = chart.addCustomSeries(new BandSeries(), { visible: false }, 0);
 const bandDotOpts = { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 3,
                       priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
@@ -351,13 +440,25 @@ function addPaneLabel(paneIndex, text) {
 addPaneLabel(1, "FlowMeter");
 addPaneLabel(2, "FlowWave");
 
-// 模拟交易叠加: 成交标记(买红上箭头 / 卖绿下箭头)与持仓均价、挂单价格线, 挂在 K 线上。
+// 模拟交易叠加: 成交标记(买红上箭头 / 卖绿下箭头, 带「买1 / 卖1」文字)与持仓均价、挂单价格线, 挂在 K 线上。
 // 数据来自右侧交易面板的轮询(见文件后部「模拟交易」一节)。
-const tradeMarkers = LightweightCharts.createSeriesMarkers(candleSeries, []);
+// K 线上的标记还有 WaveTrend 交叉箭头(多绿空红, 无文字)。两路拼成一份交给同一个 markers 插件:
+// 同一根 bar 上两路都有时, 库只在同一个插件里把标记上下错开, 分成两个插件会画在同一位置互相盖住。
+const candleMarkers = LightweightCharts.createSeriesMarkers(candleSeries, []);
+let paperMarkerList = [];
+let wtMarkerList = [];
+let candleMarkerKey = "";
 let paperState = null;
-let paperMarkerKey = "";
 let paperLineKey = "";
 let paperLines = [];
+
+function applyCandleMarkers() {
+  const markers = [...paperMarkerList, ...wtMarkerList].sort((a, b) => a.time - b.time);   // 库要求按时间升序
+  const key = JSON.stringify(markers);
+  if (key === candleMarkerKey) return;   // 成交轮询每秒一次, 内容没变就不动图表
+  candleMarkers.setMarkers(markers);
+  candleMarkerKey = key;
+}
 
 // ---------- 指标计算 ----------
 // 纯计算在 indicators.js; 这里只把页面状态(bars/cfg/threshtype/bandK)喂进去,
@@ -469,6 +570,66 @@ function renderLw() {
   lwPulse.setData(pulse);
 }
 
+// 参考线数据: 从振荡值出值的那根起, 每根按当根的通道换算成价格
+function buildWtLevels() {
+  const W = derived.wt;
+  const levels = WT_LEVELS.map(() => []);
+  for (let i = 0; i < bars.length; i++) {
+    if (W.osc[i] == null) continue;
+    WT_LEVELS.forEach(([v], k) => levels[k].push({ time: bars[i].time, value: FlowIndicators.wtPrice(W, i, v) }));
+  }
+  return levels;
+}
+
+// 交叉信号按「WT信号」档位过滤, 金叉打在 K 线下方、死叉打在上方(同原版); 箭头大小对应原版标签的 normal / small / tiny 三档
+function buildWtMarkers() {
+  const minLevel = wtSignal === "strong" ? 3 : wtSignal === "all" ? 1 : Infinity;
+  const SIZE = { 3: 1.4, 2: 1, 1: 0.6 };
+  const markers = [];
+  derived.wt.cross.forEach((c, i) => {
+    const level = Math.abs(c);
+    if (!c || level < minLevel) return;
+    markers.push({ time: bars[i].time, position: c > 0 ? "belowBar" : "aboveBar",
+                   shape: c > 0 ? "arrowUp" : "arrowDown", color: c > 0 ? WT_COLORS.bull : WT_COLORS.bear,
+                   size: SIZE[level] });
+  });
+  return markers;
+}
+
+// 背离连线(K 线低点连低点、高点连高点): 常规背离实色、隐藏背离半透明, 颜色同原版(color.green / color.red)
+function buildWtDivergences() {
+  const COLOR = { RB: "#4caf50", HB: "rgba(76, 175, 80, 0.5)", RS: "#f23645", HS: "rgba(242, 54, 69, 0.5)" };
+  return derived.wt.divs.map((d) => ({
+    t1: bars[d.from].time, v1: d.fromPrice, t2: bars[d.to].time, v2: d.toPrice,
+    text: d.kind, color: COLOR[d.kind], up: d.kind === "RB" || d.kind === "HB",
+  }));
+}
+
+// 交叉箭头和背离连线都挂在 K 线 series 上, 跟着 WaveTrend 开关走, 不能靠 series 的 visible: 隐藏时直接清空
+function renderWtMarks() {
+  const on = wtShown();
+  wtMarkerList = on ? buildWtMarkers() : [];
+  applyCandleMarkers();
+  wtDivergence.setSegments(on ? buildWtDivergences() : []);
+}
+
+// 与 FlowWave 带一样只在 K 线视图生效: 足迹图本身已经很密
+function wtShown() {
+  return mainShown.wt && view !== "footprint";
+}
+
+function applyWtVisibility() {
+  const on = wtShown();
+  wtLevelLines.forEach((s) => s.applyOptions({ visible: on }));
+  if (derived && derived.wt) renderWtMarks();
+}
+
+function renderWt() {
+  const levels = buildWtLevels();
+  wtLevelLines.forEach((s, k) => s.setData(levels[k]));
+  renderWtMarks();
+}
+
 function renderAll() {
   derive();
   candleSeries.setData(bars.map(candleOf));
@@ -476,6 +637,7 @@ function renderAll() {
     s.setData(bars.map((b, i) => ({ time: b.time, value: derived.emaLines[j][i] })).filter((p) => p.value != null)));
   renderSuite();
   renderLw();
+  renderWt();
   renderBand();
   renderPaperOverlays();   // bar 集合变了(切周期/补历史), 成交标记要重新对齐到 bar
   updateLegend(bars.length - 1);
@@ -505,6 +667,7 @@ function updateLast() {
     candleSuite.update(latestCandle?.time === b.time ? latestCandle : { time: b.time });
   }
   renderLw();            // 整体 setData(数据量小)
+  renderWt();            // 同上
   renderBand();          // 同上: 回归通道只影响末尾若干根, 但一样整体重建最省心
   updateLegend(i);
 }
@@ -552,7 +715,7 @@ function renderBand() {
 // 叠加只在 K 线视图生效: 足迹图本身已经很密, 再叠带会糊成一片; 切回 K 线按开关恢复。
 // 图例与可见性共用这一个判据, 否则会出现"足迹图里图例报着带值、画面上却没有带"。
 function bandShown() {
-  return bandOverlay === "on" && view !== "footprint";
+  return mainShown.band && view !== "footprint";
 }
 
 function applyBandVisibility() {
@@ -560,9 +723,9 @@ function applyBandVisibility() {
   bandSeries.applyOptions({ visible: on });
   bandDotHigh.applyOptions({ visible: on });
   bandDotLow.applyOptions({ visible: on });
-  // 「带宽」只在叠加打开时可调。判据用开关本身而不是 bandShown(): 足迹图下带只是被临时藏起来,
+  // 「带宽」只在带打开时可调。判据用开关本身而不是 bandShown(): 足迹图下带只是被临时藏起来,
   // 宽度选择仍然有效, 切回 K 线就用得上, 没必要在这里置灰。
-  $("band-k").disabled = bandOverlay !== "on";
+  $("band-k").disabled = !mainShown.band;
 }
 
 // ---------- 图例 / 工具栏 ----------
@@ -590,11 +753,14 @@ function updateLegend(i) {
   // 叠加带只在"画面上真有带"且这根基线可取时进图例, 免得白占位置
   const band = bandShown() && derived.band && derived.band.up[i] != null
     ? `  带:${fmt(derived.band.dn[i])}/${fmt(derived.band.mid[i])}/${fmt(derived.band.up[i])}` : "";
+  // WaveTrend 叠加轴不显示刻度, 数值只能从这里读
+  const wt = wtShown() && derived.wt.osc[i] != null
+    ? `  WT:${fmt(derived.wt.osc[i], 1)}/${fmt(derived.wt.sig[i], 1)}` : "";
   $("legend").textContent =
     `${t}  O:${fmt(b.open)} H:${fmt(b.high)} L:${fmt(b.low)} C:${fmt(b.close)}  ` +
   `  ${mode.toUpperCase()}:${suiteVal}  Δ:${fmt(deltaOf(b))}  CVD:${fmt(b.cvd)}` +
   `  新买/卖:${fmt(b.buy)}/${fmt(b.sell)} 未知:${fmt(unknown)} 旧买/卖:${fmt(b.buyLegacy)}/${fmt(b.sellLegacy)}` +
-  `  LSMA:${fmt(derived.lw.wave[i], 1)} RVOL:${fmt(d.rvol[i], 2)} 斜率:${fmt(derived.lw.crvSlope[i], 2)}${band}`;
+  `  LSMA:${fmt(derived.lw.wave[i], 1)} RVOL:${fmt(d.rvol[i], 2)} 斜率:${fmt(derived.lw.crvSlope[i], 2)}${band}${wt}`;
 }
 
 chart.subscribeCrosshairMove((param) => {
@@ -610,10 +776,55 @@ chart.subscribeCrosshairMove((param) => {
 
 $("mode").addEventListener("change", (e) => { mode = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
 $("threshtype").addEventListener("change", (e) => { threshtype = e.target.value; renderSuite(); updateLegend(bars.length - 1); });
-$("lw-overlay").addEventListener("change", (e) => {
-  bandOverlay = e.target.value === "on" ? "on" : "off";
-  applyBandVisibility();
-  updateLegend(bars.length - 1);
+
+// ---------- 主图指标图例(左上角): 名称 + 眼睛按钮 ----------
+
+// EMA 的周期按各自线色列出, 兼当色标; 只需填一次
+EMA_PERIODS.forEach((p, j) => {
+  const span = document.createElement("span");
+  span.textContent = String(p);
+  span.style.color = EMA_COLORS[j];
+  $("ml-ema-params").appendChild(span);
+});
+
+function emaShown() {
+  return mainShown.ema && view !== "footprint";
+}
+
+function applyEmaVisibility() {
+  const on = emaShown();
+  emaSeries.forEach((s) => s.applyOptions({ visible: on }));
+}
+
+const APPLY_SHOWN = { ema: applyEmaVisibility, band: applyBandVisibility, wt: applyWtVisibility };
+
+function renderMainLegend() {
+  $("main-legend").hidden = view === "footprint";   // 足迹图下三个指标都强制隐藏, 图例也收起
+  $("ml-band-params").textContent = `${bandK}σ`;
+  for (const key of Object.keys(mainShown)) {
+    $(`ml-${key}`).classList.toggle("off", !mainShown[key]);
+    $(`ml-${key}-eye`).title = mainShown[key] ? "隐藏" : "显示";
+  }
+}
+
+function setMainShown(key, on) {
+  mainShown[key] = on;
+  try {
+    localStorage.setItem(MAIN_SHOWN_KEY, JSON.stringify(mainShown));
+  } catch (error) { /* 记不住不影响使用 */ }
+  APPLY_SHOWN[key]();
+  renderMainLegend();
+  updateLegend(bars.length - 1);   // 带 / WT 的读数只在显示时进顶部图例
+}
+
+for (const key of Object.keys(mainShown)) {
+  $(`ml-${key}-eye`).addEventListener("click", () => setMainShown(key, !mainShown[key]));
+}
+renderMainLegend();
+
+$("wt-signal").addEventListener("change", (e) => {
+  wtSignal = ["strong", "all", "none"].includes(e.target.value) ? e.target.value : "strong";
+  if (derived && derived.wt) renderWtMarks();   // 只换箭头, 振荡线不用重画
 });
 $("band-k").addEventListener("change", (e) => {
   const value = parseFloat(e.target.value);
@@ -624,6 +835,7 @@ $("band-k").addEventListener("change", (e) => {
     derived.band = deriveBand();
     renderBand();
   }
+  renderMainLegend();   // 图例里的带宽跟着变
   updateLegend(bars.length - 1);
 });
 function updateSplitSelection() {
@@ -915,12 +1127,8 @@ document.addEventListener("visibilitychange", () => {
 
 function renderPaperOverlays() {
   if (!paperState) return;
-  const markers = PaperPanel.buildMarkers(paperState.contractTrades, bars);
-  const markerKey = JSON.stringify(markers);
-  if (markerKey !== paperMarkerKey) {
-    tradeMarkers.setMarkers(markers);
-    paperMarkerKey = markerKey;
-  }
+  paperMarkerList = PaperPanel.buildMarkers(paperState.contractTrades, bars);
+  applyCandleMarkers();
   const lines = PaperPanel.priceLines(paperState);
   const lineKey = JSON.stringify(lines);
   if (lineKey === paperLineKey) return;
@@ -968,9 +1176,11 @@ function setView(v) {
   view = v;
   const isFp = v === "footprint";
   candleSeries.applyOptions({ visible: !isFp });
-  emaSeries.forEach((s) => s.applyOptions({ visible: !isFp }));
+  applyEmaVisibility();
   fpSeries.applyOptions({ visible: isFp });
+  applyWtVisibility();     // 足迹图下 WaveTrend 也隐藏
   applyBandVisibility();   // 足迹图下强制隐藏叠加带, 切回 K 线按开关恢复
+  renderMainLegend();      // 足迹图下主图指标全部隐藏, 图例跟着收起
   if (isFp) {
     fpBarSpacing = chart.timeScale().options().barSpacing;
     chart.timeScale().applyOptions({ barSpacing: 60 });

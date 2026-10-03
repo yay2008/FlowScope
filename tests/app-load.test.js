@@ -34,6 +34,7 @@ class StubElement {
     this.title = "";
     this.disabled = false;
     this.options = [];
+    this.style = {};
     this.classList = {
       names: new Set(),
       add: (...names) => names.forEach((n) => this.classList.names.add(n)),
@@ -109,6 +110,7 @@ function createChartStub() {
     createPriceLine(options) { createdPriceLines.push(options); return { applyOptions() {} }; }, removePriceLine() {},
     priceScale() { return { applyOptions() {} }; },
     setVisibleRange() {}, coordinateToPrice() { return 0; }, priceToCoordinate() { return 0; },
+    attachPrimitive() {}, detachPrimitive() {},
   });
   createdPriceLines = [];
   markerCalls = [];
@@ -195,7 +197,7 @@ function runBrowser(options = {}) {
   const fetchImpl = options.fetch || stubFetch;
   const context = {
     document,
-    localStorage: createLocalStorage(),
+    localStorage: options.localStorage || createLocalStorage(),
     location: { search: "", host: "127.0.0.1:8000", protocol: "http:", href: "http://127.0.0.1:8000/" },
     navigator: { userAgent: "node" },
     console,
@@ -314,8 +316,8 @@ test("工具栏默认值与 app.js 初始状态一致", () => {
     ["threshtype", /let threshtype = "([^"]+)"/],
     ["cvd-source", /let cvdSource = "([^"]+)"/],
     ["ltf", /let klineLtf = (\d+)/],
-    ["lw-overlay", /let bandOverlay = "([^"]+)"/],
     ["band-k", /let bandK = ([\d.]+)/],
+    ["wt-signal", /let wtSignal = "([^"]+)"/],
   ];
   for (const [id, pattern] of table) {
     const htmlDefault = html.match(
@@ -468,18 +470,21 @@ test("主图叠加带: 打点只落在首次越界那一根, 且贴在对应的�
   }
 });
 
-test("叠加开关: 打开后主图三个叠加系列可见, 切足迹图强制隐藏, 切回来按开关恢复", () => {
+// 主图左上角图例的眼睛按钮: stub 里没有真实点击, 直接调它的 click 处理器(与浏览器里点击走同一条路径)
+const clickEye = (context, key) => context.document.getElementById(`ml-${key}-eye`).handlers.click[0]();
+const viewSetter = (context) => (value) =>
+  context.document.getElementById("view").handlers.change[0]({ target: { value } });
+
+test("FlowWave带 眼睛按钮: 打开后主图三个叠加系列可见, 切足迹图强制隐藏, 切回来按开关恢复", () => {
   const context = runBrowser();
   const applied = lastAppliedOptions;
-  const toggle = (value) => context.document.getElementById("lw-overlay").handlers.change[0]({ target: { value } });
-  const setView = (value) => context.document.getElementById("view").handlers.change[0]({ target: { value } });
+  const setView = viewSetter(context);
   const lastThree = () => applied.slice(-3).map((o) => o.visible);
 
-  // stub 里没有真实 <select>, 直接调它的 change 处理器(与浏览器里选项改变走同一条路径)
   assert.equal(lastThree().every((v) => v === false), true, "默认关: 三个叠加系列都应隐藏");
 
-  toggle("on");
-  assert.equal(lastThree().every((v) => v === true), true, "打开开关后带与两个打点系列都应可见");
+  clickEye(context, "band");
+  assert.equal(lastThree().every((v) => v === true), true, "打开后带与两个打点系列都应可见");
 
   setView("footprint");
   assert.equal(lastThree().every((v) => v === false), true, "足迹图下叠加必须强制隐藏");
@@ -487,26 +492,98 @@ test("叠加开关: 打开后主图三个叠加系列可见, 切足迹图强制�
   setView("candle");
   assert.equal(lastThree().every((v) => v === true), true, "切回 K 线应按开关恢复可见");
 
-  toggle("off");
-  assert.equal(lastThree().every((v) => v === false), true, "关掉开关后应重新隐藏");
+  clickEye(context, "band");
+  assert.equal(lastThree().every((v) => v === false), true, "再点一下应重新隐藏");
 });
 
-test("叠加开关: 「带宽」只在打开时可调(足迹图下不置灰, 因为只是临时藏起来)", () => {
+test("WaveTrend 眼睛按钮: 参考线、交叉箭头与背离连线默认显示, 点一下清空, 足迹图下强制清空且图例收起", () => {
+  const context = runBrowser();
+  const setView = viewSetter(context);
+  const legend = context.document.getElementById("main-legend");
+  // 一段过了 73 根冷启动的振荡行情; 箭头档位放到「全部」, 保证有箭头可数
+  vm.runInContext(`(() => {
+    cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
+    bars = [];
+    let price = 4000;
+    for (let i = 0; i < 400; i++) {
+      price += Math.sin(i / 6) * 6 + Math.sin(i / 23) * 3;
+      bars.push({ time: 1700000000 + i * 30, open: price - 1, high: price + 2, low: price - 2,
+                  close: price, volume: 100, buy: 60, sell: 40, delta: 20 });
+    }
+    renderAll();
+  })()`, context);
+  context.document.getElementById("wt-signal").handlers.change[0]({ target: { value: "all" } });
+  // K 线上只有一个 markers 插件, 成交标记带「买/卖」文字, 交叉箭头不带
+  const arrows = () => markerCalls[markerCalls.length - 1].filter((m) => !m.text).length;
+  // 五条参考线: 点眼睛时 applyWtVisibility 最后对它们 applyOptions
+  const applied = lastAppliedOptions;
+  const levelsVisible = () => applied.slice(-5).map((o) => o.visible);
+  const segments = () => vm.runInContext("wtDivergence._segs.length", context);
+
+  assert.ok(arrows() > 0, "默认显示: K 线上应有交叉箭头(否则这个用例是空跑)");
+  assert.ok(segments() > 0, "默认显示: 应有背离连线(否则这个用例是空跑)");
+
+  clickEye(context, "wt");
+  assert.deepEqual(levelsVisible(), [false, false, false, false, false], "点一下: 五条参考线隐藏");
+  assert.equal(arrows(), 0, "点一下: 箭头清空");
+  assert.equal(segments(), 0, "点一下: 背离连线清空");
+  assert.equal(context.document.getElementById("ml-wt").classList.contains("off"), true, "图例这一行应变暗");
+  clickEye(context, "wt");
+  assert.deepEqual(levelsVisible(), [true, true, true, true, true], "再点一下: 参考线恢复");
+  assert.ok(arrows() > 0 && segments() > 0, "再点一下恢复");
+
+  setView("footprint");
+  assert.equal(legend.hidden, true, "足迹图下主图指标全部隐藏, 图例收起");
+  assert.equal(arrows(), 0, "足迹图下即使开着也不画");
+  assert.equal(segments(), 0);
+  setView("candle");
+  assert.equal(legend.hidden, false);
+  assert.ok(arrows() > 0 && segments() > 0, "切回 K 线按开关恢复");
+});
+
+test("EMA 眼睛按钮: 四条均线一起隐藏, 显示状态记进 localStorage, 重载后按记下的状态初始化", () => {
+  const storage = createLocalStorage();
+  const context = runBrowser({ localStorage: storage });
+  const applied = lastAppliedOptions;
+  const byId = (id) => context.document.getElementById(id);
+
+  assert.equal(byId("ml-ema-params").children.length, 4, "EMA 后面列出四个周期");
+  clickEye(context, "ema");
+  assert.deepEqual(applied.slice(-4).map((o) => o.visible), [false, false, false, false]);
+  assert.equal(byId("ml-ema-eye").title, "显示");
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.mainShown")), { ema: false, band: false, wt: true });
+
+  // 切合约是整页重载: 新页面要按记下的状态画
+  storage.setItem("flowscope.mainShown", JSON.stringify({ ema: false, band: true, wt: false }));
+  const again = runBrowser({ localStorage: storage });
+  const id2 = (id) => again.document.getElementById(id);
+  assert.equal(id2("ml-ema").classList.contains("off"), true);
+  assert.equal(id2("ml-band").classList.contains("off"), false);
+  assert.equal(id2("ml-wt").classList.contains("off"), true);
+  assert.equal(id2("band-k").disabled, false, "带记成打开, 带宽应可调");
+
+  // 坏值不能把页面弄挂, 回落到默认
+  storage.setItem("flowscope.mainShown", "not json");
+  const third = runBrowser({ localStorage: storage });
+  assert.equal(third.document.getElementById("ml-ema").classList.contains("off"), false);
+  assert.equal(third.document.getElementById("band-k").disabled, true);
+});
+
+test("FlowWave带 眼睛按钮: 「带宽」只在打开时可调(足迹图下不置灰, 因为只是临时藏起来)", () => {
   const context = runBrowser();
   const bandK = context.document.getElementById("band-k");
-  const toggle = (value) => context.document.getElementById("lw-overlay").handlers.change[0]({ target: { value } });
-  const setView = (value) => context.document.getElementById("view").handlers.change[0]({ target: { value } });
+  const setView = viewSetter(context);
 
   assert.equal(bandK.disabled, true, "默认关: 带宽不可调");
 
-  toggle("on");
-  assert.equal(bandK.disabled, false, "打开叠加后带宽可调");
+  clickEye(context, "band");
+  assert.equal(bandK.disabled, false, "打开带后带宽可调");
 
   setView("footprint");
   assert.equal(bandK.disabled, false, "足迹图只是临时隐藏带, 不该把宽度选择也锁掉");
 
-  toggle("off");
-  assert.equal(bandK.disabled, true, "关掉叠加后重新置灰");
+  clickEye(context, "band");
+  assert.equal(bandK.disabled, true, "关掉带后重新置灰");
 });
 
 test("带宽 k 可切换: 半宽按 k 线性变化, 非法值回落到默认 2σ", () => {
@@ -542,6 +619,43 @@ test("带宽 k 可切换: 半宽按 k 线性变化, 非法值回落到默认 2σ
   setK("9");   // 目录之外的倍数: 不按垃圾值画带, 回落到默认并纠正下拉框显示
   assert.equal(select.value, "2", "非法值应回落到默认 2σ");
   assert.ok(Math.abs(halfWidth() - base) < 1e-9, "非法值不得改变带宽");
+});
+
+test("自定义 series 只画 visibleRange 内的 bar: 区间外的旧坐标不能画成残影", () => {
+  // 库只给可见区间内的 bar 算 x, 区间外的 x 是上次可见时留下的旧值; 这里给区间外的 bar 塞一个
+  // 显眼的旧坐标(-5000), 记录画布上所有用到的 x, 一个都不能是它。
+  const context = runBrowser();
+  const r = vm.runInContext(`(() => {
+    const STALE = -5000;
+    const xs = [];
+    const ctx = new Proxy({}, {
+      get: (_, key) => (key === "moveTo" || key === "lineTo" || key === "fillRect" || key === "strokeRect" || key === "fillText"
+        ? (...args) => xs.push(key === "fillText" ? args[1] : args[0])
+        : () => {}),
+      set: () => true,
+    });
+    const target = { useMediaCoordinateSpace: (fn) => fn({ context: ctx }) };
+    const price = (p) => p;   // 价格直接当 y, 只关心 x
+    const range = { from: 2, to: 6 };
+    const barX = (i) => (i >= range.from && i < range.to ? 100 + i * 10 : STALE);
+
+    const band = new BandRenderer();
+    band.update({ barSpacing: 10, visibleRange: range, bars: Array.from({ length: 9 }, (_, i) => ({
+      x: barX(i), originalData: { mid: 10, up: 12, dn: 8, state: 0, idx: i } })) });
+    band.draw(target, price);
+    const bandXs = xs.splice(0);
+
+    const fp = new FootprintRenderer();
+    fp.update({ barSpacing: 60, visibleRange: range, bars: Array.from({ length: 9 }, (_, i) => ({
+      x: barX(i), originalData: { open: 10, high: 12, low: 8, close: 11, coverage: "complete",
+                                  levels: [[9, 5, 3], [10, 8, 2]] } })) }, { tickSize: 1 });
+    fp.draw(target, price);
+    return { bandXs, fpXs: xs.splice(0), stale: STALE };
+  })()`, context);
+  assert.ok(r.bandXs.length > 0, "带应在可见区间内画出东西(否则这个用例是空跑)");
+  assert.ok(r.fpXs.length > 0, "足迹应在可见区间内画出东西(否则这个用例是空跑)");
+  assert.ok(r.bandXs.every((x) => x > r.stale + 1000), `带用到了区间外的旧坐标: ${r.bandXs}`);
+  assert.ok(r.fpXs.every((x) => x > r.stale + 1000), `足迹用到了区间外的旧坐标: ${r.fpXs}`);
 });
 
 test("叠加带的 custom series 满足 lightweight-charts 契约", () => {

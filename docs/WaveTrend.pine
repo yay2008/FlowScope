@@ -1,0 +1,723 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════════════════════════ //
+//# * ══════════════════════════════════════════════════════════════════════════════════════════════
+//# *
+//# * Study       : WaveTrend vX
+//# * Author      : ©LazyBear, modified by ©dgtrd
+//# *
+//# * Revision History
+//# *  Release    : Jun 28, 2020
+//# *  Update     : Sep 05, 2020 : alert added
+//# *  Update     : May 23, 2021 : added ability to compare with other symbols, such as correlated ones or even inversely correlated ones
+//# *  Update     : Jun 07, 2022 : overlay wavetrand display, label customizations
+//# *
+//# * ══════════════════════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════════════════════════ //
+
+indicator('WaveTrend [LazyBear] vX by DGT', 'WTvX ☼☾', true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 250, max_bars_back = 500)
+
+// ---------------------------------------------------------------------------------------------- //
+// Inputs
+
+display = display.all - display.status_line
+
+group_wave = 'WaveTrend Engine'
+
+tp_wave = 'WaveTrend — Momentum Oscillator\n────────────────────────────\n' +
+     'Measures price deviation from a smoothed equilibrium to identify momentum extremes and turning points.\n\n' +
+     'Cross Signals:\n' +
+     '• Strong → Crosses inside extreme zones\n' +
+     '• All → Every cross event\n' +
+     '• None → Markers disabled\n\n' +
+     'Usage:\n' +
+     'Strong crosses near extremes often precede reversals.\n' +
+     'Mid-zone crosses typically indicate continuation.'
+
+crosses = input.string('Strong', 'Display Cross Signals', display = display,
+     options = ['Strong', 'All', 'None'],
+     group = group_wave, tooltip = tp_wave)
+
+chLength  = input.int(10, '  Channel Length (Sensitivity)', minval = 1, group = group_wave, display = display,
+     tooltip = 'Channel Length — Sensitivity Control\n────────────────────────────\n' +
+     'Defines how quickly WaveTrend reacts to price changes.\n\n' +
+     'Effect:\n' +
+     '• Lower → Faster, more signals, more noise\n' +
+     '• Higher → Smoother, fewer signals, more lag\n\n' +
+     'Guidance:\n' +
+     'Use lower values for scalping.\n' +
+     'Use higher values for swing trading.')
+
+avgLength = input.int(21, '  Average Length (Smoothing)', minval = 1, group = group_wave, display = display,
+     tooltip = 'Average Length — Smoothing Strength\n────────────────────────────\n' +
+     'Controls smoothing applied to the oscillator core.\n\n' +
+     'Effect:\n' +
+     '• Higher → Cleaner trends, delayed turns\n' +
+     '• Lower → Faster reactions, more whipsaws\n\n' +
+     'Tip:\n' +
+     'Increasing this reduces false signals in volatile markets.')
+
+sigLength = input.int(4, '  Signal Length (Cross Timing)', minval = 1, group = group_wave, display = display,
+     tooltip = 'Signal Length — Cross Timing\n────────────────────────────\n' +
+     'Controls responsiveness of the signal line used for cross detection.\n\n' +
+     'Effect:\n' +
+     '• Lower → Earlier crosses\n' +
+     '• Higher → More confirmation, more delay\n\n' +
+     'Trading Insight:\n' +
+     'Short signal = aggressive entries.\n' +
+     'Long signal = conservative entries.')
+
+
+upperBand1 = input.int(60, '  Upper Band Level 1', group=group_wave, display = display,
+     tooltip = 'Primary overbought threshold.')
+
+upperBand2 = input.int(53, '  Upper Band Level 2', group=group_wave, display = display,
+     tooltip = 'Secondary overbought threshold.')
+
+lowerBand2 = input.int(-53, '  Lower Band Level 2', group=group_wave, display = display,
+     tooltip = 'Secondary oversold threshold.')
+
+lowerBand1 = input.int(-60, '  Lower Band Level 1', group=group_wave, display = display,
+     tooltip = 'Primary oversold threshold.')
+
+showDashboard = input.bool(true, "Show WaveTrend Dashboard", group = group_wave, inline = 'dash',
+     tooltip = "Displays the WaveTrend analytics panel on the chart.\n\n" +
+               "The dashboard summarizes:\n" +
+               "• Oscillator & Signal values\n" +
+               "• Market Zone (OB / OS / Bull / Bear)\n" +
+               "• Momentum state\n" +
+               "• Cross direction\n" +
+               "• Divergence signals\n" +
+               "• Market regime\n" +
+               "• Extreme warnings\n" +
+               "• Composite directional bias")
+
+dashSizeInput = input.string("Small", "", inline = 'dash', group = group_wave, display = display,
+     options = ["Tiny", "Small", "Normal"])
+
+dashTextSize =
+     dashSizeInput == "Small"  ? size.small :
+     dashSizeInput == "Normal" ? size.normal :
+     size.tiny
+
+compare = input.bool(false, 'Compare Symbol', inline = 'CPR', group = group_wave,
+    tooltip = 'Compare Symbol — Intermarket Context\n────────────────────────────\n' +
+     'Calculates WaveTrend using another asset for correlation analysis.\n\n' +
+     'Use Cases:\n' +
+     '• BTC vs ALT pairs\n' +
+     '• Index vs Stock\n' +
+     '• Risk-On vs Risk-Off assets\n\n' +
+     'Insight:\n' +
+     'Divergences between assets may reveal hidden strength or weakness.')
+symbol = input.symbol('BINANCE:BTCUSDT', '', inline = 'CPR', display = display, group = group_wave)
+
+
+// ---------------------------------------------------------------------------------------------- //
+// Functions  ----------------------------------------------------------------------------------- //
+
+f_drawOnlyLabelX(_x, _y, _text, _xloc, _yloc, _color, _style, _textcolor, _size, _textalign, _tooltip) =>
+    label.new(_x, _y, _text, _xloc, _yloc, _color, _style, _textcolor, _size, _textalign, _tooltip)
+
+f_getWT(s, n1, n2, s1) =>
+    esa = ta.ema(s, n1)
+    d = ta.ema(math.abs(s - esa), n1)
+    ci = (s - esa) / (0.015 * d)
+    wtOsc = ta.ema(ci, n2)
+    wtSig = ta.sma(wtOsc, s1)
+
+    [wtOsc, wtSig]
+
+alarm(_message) =>
+    alert(syminfo.ticker + ' WT : ' + _message + ', price (' + str.tostring(close, format.mintick) + ')')
+
+colorBull      = #16a34a
+colorBear      = #dc2626
+colorNeutral   = #6b7280
+
+colorBullWeak  = color.new(colorBull, 40)
+colorBearWeak  = color.new(colorBear, 40)
+
+colorOsc       = #0ea5e9
+colorSignal    = #f97316
+
+colorHistBull  = color.new(colorBull, 60)
+colorHistBear  = color.new(colorBear, 60)
+
+colorCompare   = #787b86
+
+noColor = #00000000
+
+
+// ---------------------------------------------------------------------------------------------- //
+// Calculations --------------------------------------------------------------------------------- //
+
+
+[wtOsc, wtSig] = f_getWT(hlc3, chLength, avgLength, sigLength)
+extSrc = request.security(symbol, timeframe.period, hlc3, barmerge.gaps_off, barmerge.lookahead_off)
+[wtOscX, wtSigX] = f_getWT(extSrc, chLength, avgLength, sigLength)
+
+lowerThreshold = math.avg(lowerBand1, lowerBand2)
+upperThreshold = math.avg(upperBand1, upperBand2)
+
+
+if ta.crossover(wtOsc, wtSig)
+    if crosses != 'None'
+        if wtOsc < lowerThreshold
+            f_drawOnlyLabelX(bar_index, low, '▲\n•', xloc.bar_index, yloc.price, noColor, label.style_label_up, colorBull, size.normal, text.align_center,
+             'WaveTrend Strong Bullish Cross\n' +
+             syminfo.tickerid + '\n' +
+             '────────────────────────────' +
+             '\nOsc: ' + str.tostring(wtOsc, '#.##') +
+             '\nSignal: ' + str.tostring(wtSig, '#.##') +
+             '\nZone: Oversold' +
+             '\n\nMomentum reversal potential ↑')
+
+            alarm('strong cross below oversold threshold level, bullish sign')
+
+        if crosses != 'Strong'
+            if wtOsc < 0 and wtOsc > lowerThreshold
+                f_drawOnlyLabelX(bar_index, low, '▲', xloc.bar_index, yloc.price, noColor, label.style_label_up, colorBull, size.small, text.align_center,
+                 'WaveTrend Bullish Cross\n' +
+                 syminfo.tickerid + '\n' +
+                 '────────────────────────────' +
+                 '\nOsc: ' + str.tostring(wtOsc, '#.##') +
+                 '\nSignal: ' + str.tostring(wtSig, '#.##') +
+                 '\nZone: Bearish (< 0)' +
+                 '\n\nEarly bullish momentum shift')
+
+            else if wtOsc > 0
+                f_drawOnlyLabelX(bar_index, low, '▲', xloc.bar_index, yloc.price, noColor, label.style_label_up, colorBull, size.tiny, text.align_center,
+                 'WaveTrend Weak Bullish Cross\n' +
+                 syminfo.tickerid + '\n' +
+                 '────────────────────────────' +
+                 '\nOsc: ' + str.tostring(wtOsc, '#.##') +
+                 '\nSignal: ' + str.tostring(wtSig, '#.##') +
+                 '\nZone: Bullish (> 0)' +
+                 '\n\nContinuation bias more likely')
+
+if ta.crossunder(wtOsc, wtSig)
+    if crosses != 'None'
+        if wtOsc > upperThreshold
+            f_drawOnlyLabelX(bar_index, high, '•\n▼', xloc.bar_index, yloc.price, noColor, label.style_label_down, colorBear, size.normal, text.align_center,
+             'WaveTrend Strong Bearish Cross\n' +
+             syminfo.tickerid + '\n' +
+             '────────────────────────────' +
+             '\nOsc: ' + str.tostring(wtOsc, '#.##') +
+             '\nSignal: ' + str.tostring(wtSig, '#.##') +
+             '\nZone: Overbought' +
+             '\n\nMomentum reversal potential ↓')
+
+            alarm('strong cross above overbought threshold level, bearish sign')
+
+        if crosses != 'Strong'
+            if wtOsc > 0 and wtOsc < upperThreshold
+                f_drawOnlyLabelX(bar_index, high, '▼', xloc.bar_index, yloc.price, noColor, label.style_label_down, colorBear, size.small, text.align_center,
+                 'WaveTrend Bearish Cross\n' +
+                 syminfo.tickerid + '\n' +
+                 '────────────────────────────' +
+                 '\nOsc: ' + str.tostring(wtOsc, '#.##') +
+                 '\nSignal: ' + str.tostring(wtSig, '#.##') +
+                 '\nZone: Bullish (> 0)' +
+                 '\n\nEarly bearish momentum shift')
+
+            else if wtOsc < 0
+                f_drawOnlyLabelX(bar_index, high, '▼', xloc.bar_index, yloc.price, noColor, label.style_label_down, colorBear, size.tiny, text.align_center,
+                 'WaveTrend Weak Bearish Cross\n' +
+                 syminfo.tickerid + '\n' +
+                 '────────────────────────────' +
+                 '\nOsc: ' + str.tostring(wtOsc, '#.##') +
+                 '\nSignal: ' + str.tostring(wtSig, '#.##') +
+                 '\nZone: Bearish (< 0)' +
+                 '\n\nContinuation bias more likely')
+
+//alertcondition(ta.cross(wtOsc, wtSig), title='Trading Opportunity', message='Probable Trade Opportunity\n{{exchange}}:{{ticker}}->\nPrice = {{close}},\nTime = {{time}}')
+
+if ta.crossover(wtOscX, wtSigX) and compare
+    if crosses != 'None'
+
+        if wtOscX < lowerThreshold
+            f_drawOnlyLabelX(bar_index, low, '▲\n•', xloc.bar_index, yloc.price, noColor, label.style_label_up, #787b86, size.small, text.align_center,
+             'WaveTrend Strong Bullish Cross\n' +
+             symbol + ' (hlc3: ' + str.tostring(extSrc, format.mintick) + ')\n' +
+             '────────────────────────────' +
+             '\nOsc: ' + str.tostring(wtOscX, '#.##') +
+             '\nSignal: ' + str.tostring(wtSigX, '#.##') +
+             '\nZone: Oversold' +
+             '\n\nMomentum reversal potential ↑')
+
+        if crosses != 'Strong'
+            if wtOscX < 0 and wtOscX > lowerThreshold
+                f_drawOnlyLabelX(bar_index, low, '▲', xloc.bar_index, yloc.price, noColor, label.style_label_up, #787b86, size.tiny, text.align_center,
+                 'WaveTrend Bullish Cross\n' +
+                 symbol + ' (hlc3: ' + str.tostring(extSrc, format.mintick) + ')\n' +
+                 '────────────────────────────' +
+                 '\nOsc: ' + str.tostring(wtOscX, '#.##') +
+                 '\nSignal: ' + str.tostring(wtSigX, '#.##') +
+                 '\nZone: Bearish (< 0)' +
+                 '\n\nEarly bullish momentum shift')
+
+            else if wtOscX > 0
+                f_drawOnlyLabelX(bar_index, low, '▲', xloc.bar_index, yloc.price, noColor, label.style_label_up, #787b86, size.tiny, text.align_center,
+                 'WaveTrend Weak Bullish Cross\n' +
+                 symbol + ' (hlc3: ' + str.tostring(extSrc, format.mintick) + ')\n' +
+                 '────────────────────────────' +
+                 '\nOsc: ' + str.tostring(wtOscX, '#.##') +
+                 '\nSignal: ' + str.tostring(wtSigX, '#.##') +
+                 '\nZone: Bullish (> 0)' +
+                 '\n\nContinuation bias more likely')
+
+
+if ta.crossunder(wtOscX, wtSigX) and compare
+    if crosses != 'None'
+
+        if wtOscX > upperThreshold
+            f_drawOnlyLabelX(bar_index, high, '•\n▼', xloc.bar_index, yloc.price, noColor, label.style_label_down, #787b86, size.small, text.align_center,
+             'WaveTrend Strong Bearish Cross\n' +
+             symbol + ' (hlc3: ' + str.tostring(extSrc, format.mintick) + ')\n' +
+             '────────────────────────────' +
+             '\nOsc: ' + str.tostring(wtOscX, '#.##') +
+             '\nSignal: ' + str.tostring(wtSigX, '#.##') +
+             '\nZone: Overbought' +
+             '\n\nMomentum reversal potential ↓')
+
+        if crosses != 'Strong'
+            if wtOscX > 0 and wtOscX < upperThreshold
+                f_drawOnlyLabelX(bar_index, high, '▼', xloc.bar_index, yloc.price, noColor, label.style_label_down, #787b86, size.tiny, text.align_center,
+                 'WaveTrend Bearish Cross\n' +
+                 symbol + ' (hlc3: ' + str.tostring(extSrc, format.mintick) + ')\n' +
+                 '────────────────────────────' +
+                 '\nOsc: ' + str.tostring(wtOscX, '#.##') +
+                 '\nSignal: ' + str.tostring(wtSigX, '#.##') +
+                 '\nZone: Bullish (> 0)' +
+                 '\n\nEarly bearish momentum shift')
+
+            else if wtOscX < 0
+                f_drawOnlyLabelX(bar_index, high, '▼', xloc.bar_index, yloc.price, noColor, label.style_label_down, #787b86, size.tiny, text.align_center,
+                 'WaveTrend Weak Bearish Cross\n' +
+                 symbol + ' (hlc3: ' + str.tostring(extSrc, format.mintick) + ')\n' +
+                 '────────────────────────────' +
+                 '\nOsc: ' + str.tostring(wtOscX, '#.##') +
+                 '\nSignal: ' + str.tostring(wtSigX, '#.##') +
+                 '\nZone: Bearish (< 0)' +
+                 '\n\nContinuation bias more likely')
+
+// ---------------------------------------------------------------------------------------------- //
+// Divergence Engine
+
+group_diver = "Divergence Detection"
+
+lbR = input.int(5, "Pivot Detection Window", group=group_diver, display = display)
+
+plotBull       = input.bool(true,  "Regular Bullish | Hidden Bullish", inline='bull', group=group_diver)
+plotHiddenBull = input.bool(true,  "", inline='bull', group=group_diver)
+plotBear       = input.bool(true,  "Regular Bearish | Hidden Bearish", inline='bear', group=group_diver)
+plotHiddenBear = input.bool(true,  "", inline='bear', group=group_diver)
+
+// ---------------------------------------------------------------------------------------------- //
+// Oscillator
+
+osc = wtOsc
+
+plFound = not na(ta.pivotlow(osc, lbR, lbR))
+phFound = not na(ta.pivothigh(osc, lbR, lbR))
+
+drawDiv(x1, y1, x2, y2, txt, col, isUp, tip) =>
+    label.new(x = x2, y = y2, text = txt, style = isUp ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, size = size.tiny,
+         tooltip = tip)
+    line.new(x1, y1, x2, y2, color=col, width=1)
+
+
+// ---------------------------------------------------------------------------------------------- //
+// Track pivots
+
+var float prevLowPrice = na
+var float prevLowOsc   = na
+var int   prevLowIndex = na
+
+var float prevHighPrice = na
+var float prevHighOsc   = na
+var int   prevHighIndex = na
+
+// ─────────────────────────────────────────────
+// Divergence State Tracking (for dashboard)
+
+var bool bullCond       = false
+var bool hiddenBullCond = false
+var bool bearCond       = false
+var bool hiddenBearCond = false
+
+// Reset each bar
+bullCond       := false
+hiddenBullCond := false
+bearCond       := false
+hiddenBearCond := false
+
+// ---------------------------------------------------------------------------------------------- //
+// Regular Bullish
+
+
+if plFound
+    currPrice = low[lbR]
+    currOsc   = osc[lbR]
+    currIndex = bar_index - lbR
+
+    if not na(prevLowPrice)
+
+        priceLL = currPrice < prevLowPrice
+        oscHL   = currOsc   > prevLowOsc
+
+        priceHL = currPrice > prevLowPrice
+        oscLL   = currOsc   < prevLowOsc
+
+        if plotBull and priceLL and oscHL
+            bullCond := true
+            tip =
+                 "Regular Bullish Divergence\n" +
+                 "Price: Lower Low\n" +
+                 "Osc: Higher Low\n\n" +
+                 "Signal: Potential upward reversal"
+
+            drawDiv(prevLowIndex, prevLowPrice, currIndex, currPrice, "RB", color.new(color.green, 0), true, tip)
+
+
+        if plotHiddenBull and priceHL and oscLL
+            hiddenBullCond := true
+            tip =
+                 "Hidden Bullish Divergence\n" +
+                 "Price: Higher Low\n" +
+                 "Osc: Lower Low\n\n" +
+                 "Signal: Trend continuation"
+
+            drawDiv(prevLowIndex, prevLowPrice, currIndex, currPrice, "HB", color.new(color.green, 50), true, tip)
+
+
+    prevLowPrice := currPrice
+    prevLowOsc   := currOsc
+    prevLowIndex := currIndex
+
+if phFound
+    currPrice = high[lbR]
+    currOsc   = osc[lbR]
+    currIndex = bar_index - lbR
+
+    if not na(prevHighPrice)
+
+        priceHH = currPrice > prevHighPrice
+        oscLH   = currOsc   < prevHighOsc
+
+        priceLH = currPrice < prevHighPrice
+        oscHH   = currOsc   > prevHighOsc
+
+        if plotBear and priceHH and oscLH
+            bearCond := true
+            tip =
+                 "Regular Bearish Divergence\n" +
+                 "Price: Higher High\n" +
+                 "Osc: Lower High\n\n" +
+                 "Signal: Potential downward reversal"
+
+            drawDiv(prevHighIndex, prevHighPrice, currIndex, currPrice, "RS", color.new(color.red, 0), false, tip)
+
+
+        if plotHiddenBear and priceLH and oscHH
+            hiddenBearCond := true
+            tip =
+                 "Hidden Bearish Divergence\n" +
+                 "Price: Lower High\n" +
+                 "Osc: Higher High\n\n" +
+                 "Signal: Trend continuation"
+
+            drawDiv(prevHighIndex, prevHighPrice, currIndex, currPrice, "HS", color.new(color.red, 50), false, tip)
+
+    prevHighPrice := currPrice
+    prevHighOsc   := currOsc
+    prevHighIndex := currIndex
+
+
+// ---------------------------------------------------------------------------------------------- //
+// State Engine --------------------------------------------------------------------------------- //
+
+var table dash = table.new(position.top_right, 2, 9)
+
+spread = math.abs(wtOsc - wtSig)
+spreadAvg = ta.ema(spread, 20)
+
+if barstate.islast and showDashboard
+
+    // ───── Calculations (only when dashboard is enabled)
+    zoneText =
+         wtOsc > upperThreshold  ? "Overbought" :
+         wtOsc < lowerThreshold  ? "Oversold" :
+         wtOsc > 0               ? "Bullish"   : "Bearish"
+    zoneColor =
+         wtOsc > upperThreshold  ? colorBear :
+         wtOsc < lowerThreshold  ? colorBull :
+         wtOsc > 0               ? colorBullWeak : colorBearWeak
+
+    slope = wtOsc - wtOsc[1]
+
+    momentumUp   = slope > 0 and wtOsc > wtSig
+    momentumDown = slope < 0 and wtOsc < wtSig
+
+    momentumText =
+         momentumUp   ? "Rising ↑" :
+         momentumDown ? "Falling ↓" : "Neutral"
+    momentumColor =
+         momentumUp   ? colorBull :
+         momentumDown ? colorBear : colorNeutral
+
+    divBull = bullCond or hiddenBullCond
+    divBear = bearCond or hiddenBearCond
+    divText =
+         divBull and divBear ? "Mixed" :
+         divBull             ? "Bullish" :
+         divBear             ? "Bearish" : "None"
+    divColor =
+         divBull ? colorBull :
+         divBear ? colorBear : colorNeutral
+
+    strongTrend = spread > spreadAvg
+
+    regimeText =
+         wtOsc > 0 and wtSig > 0 and strongTrend ? "Bull Trend" :
+         wtOsc < 0 and wtSig < 0 and strongTrend ? "Bear Trend" : "Transition"
+
+    regimeBias =
+     regimeText == "Bull Trend" ? 2 :
+     regimeText == "Bear Trend" ? -2 : 0
+
+    regimeColor =
+         wtOsc > 0 and wtSig > 0 ? colorBull :
+         wtOsc < 0 and wtSig < 0 ? colorBear : colorNeutral
+
+    crossUp   = wtOsc > wtSig and wtOsc[1] <= wtSig[1]
+    crossDown = wtOsc < wtSig and wtOsc[1] >= wtSig[1]
+    crossText =
+         crossUp   ? "Bull" :
+         crossDown ? "Bear" : "None"
+    crossColor =
+         crossUp   ? colorBull :
+         crossDown ? colorBear : colorNeutral
+
+    extremeOB = wtOsc > upperThreshold
+    extremeOS = wtOsc < lowerThreshold
+    extremeText =
+         extremeOB ? "OB ⚠" :
+         extremeOS ? "OS ⚠" : "—"
+    extremeColor =
+         extremeOB ? colorBear :
+         extremeOS ? colorBull : colorNeutral
+
+    extConfirm =
+         compare ? (wtOscX > 0 ? "Bull Confirm" : "Bear Confirm") : "—"
+    extColor =
+         compare ? (wtOscX > 0 ? colorBullWeak : colorBearWeak) : colorNeutral
+
+
+    oscBias =
+     wtOsc > 0 ? 1 :
+     wtOsc < 0 ? -1 : 0
+
+    momBias =
+     momentumUp ? 1 :
+     momentumDown ? -1 :
+     oscBias * 0.5
+
+    var float crossState = 0
+
+    if crossUp
+        crossState := 1
+    else if crossDown
+        crossState := -1
+    else
+        crossState := nz(crossState[1]) * 0.8  // decay
+
+    crossBias = crossState > 0.2 ? 1 : crossState < -0.2 ? -1 : 0
+
+    var int divState = 0
+
+    if divBull
+        divState := 2
+    else if divBear
+        divState := -2
+    else
+        divState := math.round(divState * 0.8)
+
+    divBias = divState
+
+    biasScore = oscBias + momBias + crossBias + divBias + regimeBias
+
+    maxScore = 7.0
+    confidence = math.round(math.abs(biasScore) / maxScore * 100)
+
+    biasText =
+         biasScore >= 3  ? "Strong Bull" :
+         biasScore == 2  ? "Bull" :
+         biasScore == 1  ? "Weak Bull" :
+         biasScore == 0  ? "Neutral" :
+         biasScore == -1 ? "Weak Bear" :
+         biasScore == -2 ? "Bear" : "Strong Bear"
+    biasColor =
+         biasScore > 0 ? colorBull :
+         biasScore < 0 ? colorBear : colorNeutral
+
+    biasText += ' (' + str.tostring(confidence) + '%)'
+
+    // ───── Table Cells
+    table.cell(dash, 0, 0, "Oscillator", text_color=chart.fg_color, text_size=dashTextSize,
+        text_halign=text.align_left, tooltip="WaveTrend oscillator value.\nRepresents momentum deviation from equilibrium.\n\nAbove 0 → bullish pressure\nBelow 0 → bearish pressure\nExtremes → potential reversal zones")
+    table.cell(dash, 1, 0, str.tostring(wtOsc, "#.##"), text_color=colorOsc, text_size=dashTextSize,
+        tooltip="Current oscillator reading: " + str.tostring(wtOsc, "#.##"))
+
+    table.cell(dash, 0, 1, "Signal", text_color=chart.fg_color, text_size=dashTextSize,
+        text_halign=text.align_left, tooltip="Smoothed WaveTrend line used for cross detection.\n\nCrossovers between Oscillator and Signal often indicate momentum shifts.")
+    table.cell(dash, 1, 1, str.tostring(wtSig, "#.##"), text_color=colorSignal, text_size=dashTextSize,
+        tooltip="Current signal value: " + str.tostring(wtSig, "#.##"))
+
+    table.cell(dash, 0, 2, "Zone", text_color=chart.fg_color, text_size=dashTextSize,
+        text_halign=text.align_left, tooltip="Current oscillator location relative to thresholds.\n\nOverbought → exhaustion risk\nOversold → rebound potential\nBullish/Bearish → directional bias")
+    table.cell(dash, 1, 2, zoneText, text_color=zoneColor, text_size=dashTextSize,
+        tooltip="Zone classification: " + zoneText)
+
+    table.cell(dash, 0, 3, "Momentum", text_color=chart.fg_color, text_size=dashTextSize,
+        text_halign=text.align_left, tooltip="Momentum state based on slope and position.\n\nRising → strengthening pressure\nFalling → weakening pressure\nNeutral → consolidation phase")
+    table.cell(dash, 1, 3, momentumText, text_color=momentumColor, text_size=dashTextSize,
+        tooltip="Momentum state: " + momentumText)
+
+    table.cell(dash, 0, 4, "Cross", text_color=chart.fg_color, text_size=dashTextSize,
+        text_halign=text.align_left, tooltip="Latest oscillator vs signal interaction.\n\nBull → upward momentum shift\nBear → downward momentum shift\nNone → no recent crossover")
+    table.cell(dash, 1, 4, crossText, text_color=crossColor, text_size=dashTextSize,
+        tooltip="Cross state: " + crossText)
+
+    table.cell(dash, 0, 5, "Divergence", text_color=chart.fg_color, text_size=dashTextSize,
+        text_halign=text.align_left,
+        tooltip="Price vs oscillator disagreement.\n\nBullish → hidden buying pressure\nBearish → hidden selling pressure\nMixed → conflicting signals")
+
+    table.cell(dash, 1, 5, divText, text_color=divColor, text_size=dashTextSize,
+        tooltip="Detected divergence: " + divText)
+
+    table.cell(dash, 0, 6, "Regime", text_color=chart.fg_color, text_size=dashTextSize,
+        text_halign=text.align_left, tooltip="Market environment classification.\n\nBull Regime → both lines above zero\nBear Regime → both lines below zero\nTransition → mixed conditions")
+    table.cell(dash, 1, 6, regimeText, text_color=regimeColor, text_size=dashTextSize,
+        tooltip="Current regime: " + regimeText)
+
+    table.cell(dash, 0, 7, "Extreme", text_color=chart.fg_color, text_size=dashTextSize,
+        text_halign=text.align_left, tooltip="Warning state for statistical extremes.\n\nOB → overbought risk\nOS → oversold opportunity\nNone → normal range")
+    table.cell(dash, 1, 7, extremeText, text_color=extremeColor, text_size=dashTextSize,
+        tooltip="Extreme condition: " + extremeText)
+
+    table.cell(dash, 0, 8, "Bias", text_color=chart.fg_color, text_size=dashTextSize,
+        text_halign=text.align_left, tooltip="Composite directional bias score.\n\nCombines:\n• Oscillator position\n• Momentum state\n• Divergence signals\n\nStrong Bull/Bear → high conviction\nNeutral → low edge environment")
+    table.cell(dash, 1, 8, biasText, text_color=biasColor, text_size=dashTextSize,
+        tooltip="Directional bias: " + biasText)
+
+// ---------------------------------------------------------------------------------------------- //
+// Overlay WaveTrend Plotting Settings  --------------------------------------------------------- //
+
+group_ocs = 'Overlay Visualization'
+oscDisplay = input.bool(true, 'Overlay WaveTrend Display', group = group_ocs,
+    tooltip =
+     'Overlay WaveTrend on Price Chart\n────────────────────────────\n' +
+     'Projects oscillator structure directly onto the price panel.\n\n' +
+     'Benefit:\n' +
+     'Allows momentum context without switching panels.')
+highlight = input.bool(false, 'Highlight WaveTrend/Signal Area', group = group_ocs)
+colorTheme = input.string("Default", "  Color Theme",
+     options = ["Default", "Vibrant", "Monochrome"],
+     group = group_ocs, display = display,
+     tooltip = "Select the color theme for the WaveTrend Overlay:\n" +
+               "• Default → Modern green/red/blue palette\n" +
+               "• Vibrant → Brighter neon-style colors\n" +
+               "• Monochrome → Grayscale colors for minimalistic charts")
+oscPlacement = input.string('Middle', '  Placement', options = ['Top', 'Middle', 'Bottom'], group = group_ocs, display = display,
+    tooltip =
+     'Overlay Placement Position\n────────────────────────────\n' +
+     'Controls where the oscillator appears relative to price.\n\n' +
+     'Options:\n' +
+     '• Top → Above price\n' +
+     '• Middle → Around price\n' +
+     '• Bottom → Below price')
+oscHight = 11 - input.int(7, '  Hight', minval = 1, maxval = 10, group = group_ocs, display = display)
+oscVerticalOffset = input.int(3, '  Vertical Offset', minval = -3, maxval = 10, group = group_ocs, display = display) / 10
+
+
+oscLookbackLength = input.int(200, '  Display Length', minval=10, step=10, maxval=250, display = display, group = group_ocs)
+
+
+osc := wtOsc
+signal = wtSig
+histogram = wtOsc - wtSig
+
+var a_lines = array.new_line()
+var a_hist = array.new_box()
+var a_fill = array.new_linefill()
+
+priceHighest = ta.highest(high, oscLookbackLength)
+priceLowest = ta.lowest(low, oscLookbackLength)
+priceChangeRate = (priceHighest - priceLowest) / priceHighest
+priceLowest := oscPlacement == 'Middle' ? priceLowest : priceLowest * (1 - priceChangeRate * oscVerticalOffset)
+priceHighest := oscPlacement == 'Middle' ? priceHighest : priceHighest * (1 + priceChangeRate * oscVerticalOffset)
+oscHighest = ta.highest(osc, oscLookbackLength)
+oscLowest = ta.lowest(osc, oscLookbackLength)
+
+
+oscColor = color.gray
+signalColor = color.gray
+histColor = color.gray
+
+if colorTheme == "Default"
+    oscColor    := #26a69a
+    signalColor := #ef5350
+    histColor   := #42a5f5
+else if colorTheme == "Vibrant"
+    oscColor    := #008000
+    signalColor := #FF0000
+    histColor   := #0000FF
+else if colorTheme == "Monochrome"
+    oscColor    := #AAAAAA
+    signalColor := #555555
+    histColor   := #888888
+
+if barstate.islast and oscDisplay
+    if array.size(a_lines) > 0
+        for i = 1 to array.size(a_lines) by 1
+            line.delete(array.shift(a_lines))
+
+    if array.size(a_hist) > 0
+        for i = 1 to array.size(a_hist) by 1
+            box.delete(array.shift(a_hist))
+
+    if array.size(a_fill) > 0
+        for i = 1 to array.size(a_fill) by 1
+            linefill.delete(array.shift(a_fill))
+
+    hight = priceChangeRate / oscHight
+    //oscColor = #26a69a// #008000//
+    //signalColor =  #ef5350// #FF0000//
+    //histColor = #42a5f5// #0000FF //
+
+    obLevel1 = oscPlacement == 'Middle' ? priceLowest + (upperBand1 - oscLowest) * (priceHighest - priceLowest) / (oscHighest - oscLowest) : (oscPlacement == 'Top' ? priceHighest : priceLowest) * (1 + upperBand1 / oscHighest * hight)
+    obLevel2 = oscPlacement == 'Middle' ? priceLowest + (upperBand2 - oscLowest) * (priceHighest - priceLowest) / (oscHighest - oscLowest) : (oscPlacement == 'Top' ? priceHighest : priceLowest) * (1 + upperBand2 / oscHighest * hight)
+    osLevel2 = oscPlacement == 'Middle' ? priceLowest + (lowerBand2 - oscLowest) * (priceHighest - priceLowest) / (oscHighest - oscLowest) : (oscPlacement == 'Top' ? priceHighest : priceLowest) * (1 + lowerBand2 / oscHighest * hight)
+    osLevel1 = oscPlacement == 'Middle' ? priceLowest + (lowerBand1 - oscLowest) * (priceHighest - priceLowest) / (oscHighest - oscLowest) : (oscPlacement == 'Top' ? priceHighest : priceLowest) * (1 + lowerBand1 / oscHighest * hight)
+
+    array.push(a_lines, line.new(bar_index[oscLookbackLength], obLevel1, bar_index, obLevel1, xloc.bar_index, extend.none, signalColor, line.style_solid, 1))
+    array.push(a_lines, line.new(bar_index[oscLookbackLength], obLevel2, bar_index, obLevel2, xloc.bar_index, extend.none, signalColor, line.style_dotted, 2))
+    array.push(a_lines, line.new(bar_index[oscLookbackLength], osLevel2, bar_index, osLevel2, xloc.bar_index, extend.none, oscColor, line.style_dotted, 2))
+    array.push(a_lines, line.new(bar_index[oscLookbackLength], osLevel1, bar_index, osLevel1, xloc.bar_index, extend.none, oscColor, line.style_solid, 1))
+
+    midLine = 0
+    midLevel = oscPlacement == 'Middle' ? priceLowest + (midLine - oscLowest) * (priceHighest - priceLowest) / (oscHighest - oscLowest) : (oscPlacement == 'Top' ? priceHighest : priceLowest) * (1 + midLine / oscHighest * hight)
+    array.push(a_lines, line.new(bar_index[oscLookbackLength], midLevel, bar_index, midLevel, xloc.bar_index, extend.none, color.new(color.gray, 25), line.style_solid, 1))
+
+    for barIndex = 0 to oscLookbackLength - 1 by 1
+        if array.size(a_lines) < 498
+            array.push(a_hist, box.new(bar_index[barIndex], oscPlacement == 'Top' ? priceHighest : priceLowest, bar_index[barIndex], (oscPlacement == 'Top' ? priceHighest : priceLowest) * (1 + histogram[barIndex] / oscHighest * hight), histColor[barIndex], 2))
+            array.push(a_lines, line.new(bar_index[barIndex], oscPlacement == 'Middle' ? priceLowest + (osc[barIndex] - oscLowest) * (priceHighest - priceLowest) / (oscHighest - oscLowest) : oscPlacement == 'Top' ? priceHighest * (1 + osc[barIndex] / oscHighest * hight) : priceLowest * (1 + osc[barIndex] / oscHighest * hight), bar_index[barIndex + 1], oscPlacement == 'Middle' ? priceLowest + (osc[barIndex + 1] - oscLowest) * (priceHighest - priceLowest) / (oscHighest - oscLowest) : oscPlacement == 'Top' ? priceHighest * (1 + osc[barIndex + 1] / oscHighest * hight) : priceLowest * (1 + osc[barIndex + 1] / oscHighest * hight), xloc.bar_index, extend.none, highlight ? osc[barIndex] > signal[barIndex] ? oscColor : signalColor : oscColor, line.style_solid, 1))
+            array.push(a_lines, line.new(bar_index[barIndex], oscPlacement == 'Middle' ? priceLowest + (signal[barIndex] - oscLowest) * (priceHighest - priceLowest) / (oscHighest - oscLowest) : oscPlacement == 'Top' ? priceHighest * (1 + signal[barIndex] / oscHighest * hight) : priceLowest * (1 + signal[barIndex] / oscHighest * hight), bar_index[barIndex + 1], oscPlacement == 'Middle' ? priceLowest + (signal[barIndex + 1] - oscLowest) * (priceHighest - priceLowest) / (oscHighest - oscLowest) : oscPlacement == 'Top' ? priceHighest * (1 + signal[barIndex + 1] / oscHighest * hight) : priceLowest * (1 + signal[barIndex + 1] / oscHighest * hight), xloc.bar_index, extend.none, highlight ? osc[barIndex] > signal[barIndex] ? oscColor : signalColor : signalColor, line.style_solid, 1))
+            if highlight
+                array.push(a_fill, linefill.new(array.get(a_lines, 2 * barIndex + 5), array.get(a_lines, 2 * barIndex + 6), osc[barIndex] > signal[barIndex] ? color.new(oscColor, 50) : color.new(signalColor, 50)))
+
+
+var table logo = table.new(position.bottom_right, 1, 1)
+if barstate.islast
+    table.cell(logo, 0, 0, '☼☾  ', text_size = size.normal, text_color = color.teal, tooltip = 'SoleMare Analytics')

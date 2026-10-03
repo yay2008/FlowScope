@@ -155,6 +155,46 @@ body { display: flex; flex-direction: column; }
   min-width: 0;
 }
 
+/* 主图左上角的指标图例: 名称 + 眼睛按钮(显示/隐藏)。#chart 的左上角就是主图窗格的左上角。
+   容器不挡十字光标, 只有每一行接收鼠标(悬停看说明、点眼睛) */
+#main-legend {
+  position: absolute;
+  top: 4px;
+  left: 8px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  font-size: 12px;
+  color: #d1d4dc;
+  pointer-events: none;
+}
+#main-legend[hidden] { display: none; }   /* 上面的 display: flex 会盖掉 hidden 属性 */
+.ml-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  pointer-events: auto;
+}
+.ml-item:hover { background: rgba(42, 46, 57, 0.85); }
+.ml-name { font-weight: 600; cursor: default; }
+.ml-params { display: inline-flex; gap: 4px; color: #9598a1; }
+.ml-item.off .ml-name, .ml-item.off .ml-params { opacity: 0.4; }
+.ml-eye {
+  display: inline-flex;
+  padding: 0;
+  border: none;
+  background: none;
+  color: #9598a1;
+  cursor: pointer;
+}
+.ml-eye:hover { color: #d1d4dc; }
+.ml-slash { display: none; }
+.ml-item.off .ml-slash { display: inline; }
+
 /* ---------- 自选面板 ---------- */
 #workspace { display: flex; flex: 1; min-height: 0; min-width: 0; }
 

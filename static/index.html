@@ -38,17 +38,18 @@
       <option value="footprint">足迹图</option>
     </select>
   </label>
-  <label>叠加
-    <select id="lw-overlay" title="把 FlowWave 的回归通道叠加到主图(不影响副图): 中线 = 收盘价线性回归 21 根, 上下轨 = 中线 ±k 倍回归残差标准差(k 由右边的「带宽」选); wt2 超买(大于80)段染红、超卖(小于20)段染绿, 首次越界处在上/下轨打点。轨道是真实价格, 可当动态支撑压力看。">
-      <option value="off" selected>关</option>
-      <option value="on">FlowWave带</option>
-    </select>
-  </label>
   <label>带宽
-    <select id="band-k" title="叠加带的带宽倍数 k: 上下轨 = 中线 ±k 倍回归残差标准差。实测 800 根 fu 30s 的收盘包含率: 1.5σ 81.1% / 2σ 91.0% / 2.5σ 96.6%。越窄触碰信号越多但假信号也越多, 越宽越少被穿。只在「叠加」打开时可调。" disabled>
+    <select id="band-k" title="主图 FlowWave带 的带宽倍数 k: 上下轨 = 中线 ±k 倍回归残差标准差。实测 800 根 fu 30s 的收盘包含率: 1.5σ 81.1% / 2σ 91.0% / 2.5σ 96.6%。越窄触碰信号越多但假信号也越多, 越宽越少被穿。只在 FlowWave带 显示时可调(主图左上角的眼睛按钮)。" disabled>
       <option value="1.5">1.5σ</option>
       <option value="2" selected>2σ</option>
       <option value="2.5">2.5σ</option>
+    </select>
+  </label>
+  <label>WT信号
+    <select id="wt-signal" title="主图 WaveTrend 的交叉箭头: 振荡线穿越信号线(振荡值的 4 根均线; 两条线图上都不画)的那一根, 金叉打在 K 线下方(绿)、死叉打在上方(红)。强信号(原版默认): 只标超卖区(振荡值低于 -56.5)的金叉与超买区(高于 56.5)的死叉; 全部信号: 另外标 0 轴下方金叉/上方死叉(中号)与顺势交叉(小号); 无信号: 不标箭头。WaveTrend 本身的显示/隐藏在主图左上角的眼睛按钮。">
+      <option value="strong" selected>强信号</option>
+      <option value="all">全部信号</option>
+      <option value="none">无信号</option>
     </select>
   </label>
   <label>模式
@@ -97,7 +98,22 @@
     <div id="watch-hint">加载中…</div>
     <ul id="watch-items"></ul>
   </aside>
-  <div id="chart"></div>
+  <div id="chart">
+    <div id="main-legend">
+      <div class="ml-item" id="ml-ema">
+        <span class="ml-name" title="主图指数移动平均线, 周期 21 / 55 / 100 / 200, 按收盘价计算">EMA</span><span class="ml-params" id="ml-ema-params"></span>
+        <button class="ml-eye" id="ml-ema-eye" type="button"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/><line class="ml-slash" x1="3" y1="3" x2="21" y2="21"/></svg></button>
+      </div>
+      <div class="ml-item" id="ml-band">
+        <span class="ml-name" title="FlowWave 的回归通道(不影响副图 FlowWave): 中线 = 收盘价线性回归 21 根, 上下轨 = 中线 ±k 倍回归残差标准差(k 由工具栏「带宽」选); wt2 超买(大于80)段染红、超卖(小于20)段染绿, 首次越界处在上/下轨打点。轨道是真实价格, 可当动态支撑压力看。">FlowWave带</span><span class="ml-params" id="ml-band-params"></span>
+        <button class="ml-eye" id="ml-band-eye" type="button"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/><line class="ml-slash" x1="3" y1="3" x2="21" y2="21"/></svg></button>
+      </div>
+      <div class="ml-item" id="ml-wt">
+        <span class="ml-name" title="WaveTrend(LazyBear / DGT vX)。主图上画三样: ① 交叉箭头 —— 振荡线穿越信号线(振荡值的 4 根均线)时, K 线下方绿色金叉、上方红色死叉(档位在工具栏「WT信号」); ② 背离 —— 在 K 线低点/高点之间连线(RB/HB 常规/隐藏看涨, RS/HS 常规/隐藏看跌, 枢轴要等右侧 5 根才确认); ③ ±53/±60/0 参考线 —— 按每根最近 200 根的最高/最低价通道换算成价格(±60 在通道上下沿、0 在中线), 所以随通道起伏、不是水平线, 跟着价格轴拖动缩放, 不参与价格轴自动缩放。振荡线、信号线本身不画, 原数看顶部图例的 WT。">WaveTrend</span>
+        <button class="ml-eye" id="ml-wt-eye" type="button"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/><line class="ml-slash" x1="3" y1="3" x2="21" y2="21"/></svg></button>
+      </div>
+    </div>
+  </div>
   <aside id="trade">
     <div id="trade-head">
       <button id="trade-toggle" title="折叠/展开模拟交易面板">›</button>
