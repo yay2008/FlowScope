@@ -5,8 +5,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-// 直接运行页面使用的异步加载流程；只替换网络、计时器和绘图边界。
-const source = fs.readFileSync(path.join(__dirname, "../static/app.js"), "utf8");
+// 直接运行图表组件使用的异步加载流程；只替换网络、计时器和绘图边界。
+const source = fs.readFileSync(path.join(__dirname, "../static/chart-view.js"), "utf8");
 const loader = source.slice(source.indexOf("function clearLoadRetry()"), source.indexOf("function onBars("));
 
 function deferred() {
@@ -24,7 +24,7 @@ function harness() {
     loadGeneration: 0, loadController: null, wsGeneration: 0, reconnectTimer: null,
     watchdog: null, ws: null, symbol: "SHFE.review", ltf: 0, tf: 30,
     cfg: null, bars: [], barRevision: -1, fpRevision: -1,
-    setStatus: (ok, text) => statuses.push(text),
+    onStatus: (ok, text) => statuses.push(text),
     clearTimeout: id => timers.delete(id),
     setTimeout: (fn, delay) => { timers.set(++timerId, {fn, delay}); return timerId; },
     // 故意允许已取消请求继续返回，验证版本检查本身能拦截迟到结果。
@@ -33,7 +33,9 @@ function harness() {
       requests.push({...result, url, signal: options.signal});
       return result.promise;
     },
-    applyPeriod: () => {}, renderAll: () => {},
+    // 每轮加载按工具栏重算本图粒度; 这里直接用 ctx.ltf 模拟"数据源已切换"
+    currentLtf: () => ctx.ltf,
+    onConfig: () => {}, renderAll: () => {},
     chart: {timeScale: () => ({scrollToRealTime: () => {}})},
     connectWs: () => { connected++; ctx.ws = {close: () => closed++}; },
   });

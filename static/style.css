@@ -148,16 +148,25 @@ body { display: flex; flex-direction: column; }
   pointer-events: none;   /* 不挡十字光标 */
 }
 
+/* 图表区: 放图表组件(.chart-view, 由 chart-view.js 创建), 多张时横向并排 */
 #chart {
   position: relative;
+  display: flex;
   flex: 1;
   min-height: 0;
   min-width: 0;
 }
+.chart-view {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+.chart-view + .chart-view { border-left: 1px solid #2a2e39; }
 
-/* 主图左上角的指标图例: 名称 + 眼睛按钮(显示/隐藏)。#chart 的左上角就是主图窗格的左上角。
-   容器不挡十字光标, 只有每一行接收鼠标(悬停看说明、点眼睛) */
-#main-legend {
+/* 每张图的左上角(也就是主图窗格的左上角): 周期标签, 下面挂主图指标图例。
+   容器不挡十字光标, 只有标签和图例的每一行接收鼠标(悬停看说明、点眼睛) */
+.chart-corner {
   position: absolute;
   top: 4px;
   left: 8px;
@@ -165,12 +174,32 @@ body { display: flex; flex-direction: column; }
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  gap: 3px;
+  pointer-events: none;
+}
+.tf-badge {
+  padding: 0 6px;
+  border: 1px solid #2a2e39;
+  border-radius: 3px;
+  background: rgba(30, 34, 45, 0.85);
+  color: #f0b90d;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  cursor: default;
+  pointer-events: auto;
+}
+
+/* 主图指标图例: 名称 + 眼睛按钮(显示/隐藏), 每张图一份 */
+.main-legend {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 1px;
   font-size: 12px;
   color: #d1d4dc;
-  pointer-events: none;
 }
-#main-legend[hidden] { display: none; }   /* 上面的 display: flex 会盖掉 hidden 属性 */
+.main-legend[hidden] { display: none; }   /* 上面的 display: flex 会盖掉 hidden 属性 */
 .ml-item {
   display: flex;
   align-items: center;
