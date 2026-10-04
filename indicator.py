@@ -19,7 +19,12 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_TF_SEC = 30       # 默认主周期(秒)
-TF_OPTIONS = [10, 30]     # 可选主周期(秒), 前后端共用
+# 原生采集的主周期(秒): 各自订阅/判向/落盘, 常驻采集与加密回填只认它们。
+NATIVE_TFS = [10, 30]
+# 可选主周期(秒), 前后端共用。1 分钟及以上不单独采集, 由 30s 合成(见 rollup.py):
+# 买卖量逐根相加, CVD 沿用 30s 的累计, 所以各周期在同一时刻的 CVD 对得上。
+TF_OPTIONS = [10, 30, 60, 300, 900, 3600, 14400]
+ROLLUP_BASE_TF = 30       # 合成大周期用的底层周期
 BAR_NS = DEFAULT_TF_SEC * 10**9   # 默认主周期宽度(纳秒); 单周期调用方的兼容默认值
 TZ_SHIFT_S = 8 * 3600    # tqSdk 时间戳是 UTC, +8h 转北京时间给前端展示
 GAP_NS = 60 * 10**9      # 相邻快照间隔超过 60s 视为断档(休市/断线), 重置判向状态
@@ -55,10 +60,15 @@ def bar_ns_for(tf_sec) -> int:
     return (tf_sec if tf_sec in TF_OPTIONS else DEFAULT_TF_SEC) * 10**9
 
 
+def is_rollup(tf_sec) -> bool:
+    """该周期是否由底层 30s 合成(不在原生采集之列)。"""
+    return tf_sec in TF_OPTIONS and tf_sec not in NATIVE_TFS
+
+
 def ltf_options(tf_sec) -> list[int]:
     """该主周期下合法的拆分粒度: 必须能整除主周期, 且不比主周期更粗。
 
-    主周期 30s -> 0/1/5/10/15/30; 主周期 10s -> 0/1/5/10。
+    主周期 30s 及以上 -> 0/1/5/10/15/30; 主周期 10s -> 0/1/5/10。
     """
     bar = tf_sec if tf_sec in TF_OPTIONS else DEFAULT_TF_SEC
     return [s for s in CFG["ltfOptions"] if s == 0 or (s <= bar and bar % s == 0)]

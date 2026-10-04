@@ -9,6 +9,8 @@
 - 常驻采集集合(set_pinned, 由 app 按默认合约 + 自选设置)不依赖页面、不参与闲置回收;
   页面临时打开的其它合约按真实需求回收。
 - tick 窗口最多 10000 条，更早的 buy/sell 靠 CSV 随运行时间累积。
+- 1 分钟及以上的周期不单独采集: 只订阅该周期的原生 K 线, 买卖量由同合约 30s 合成
+  (FuturesRollupFeed, 见 rollup.py)。
 """
 from __future__ import annotations
 
@@ -25,9 +27,10 @@ import pandas as pd
 from dotenv import load_dotenv
 from tqsdk import TqApi, TqAuth
 
-from indicator import (CFG, DEFAULT_TF_SEC, TF_OPTIONS, bar_ns_for, ltf_options,
-                       build_bars, build_bars_from_ltf, bars_to_records)
+from indicator import (CFG, DEFAULT_TF_SEC, ROLLUP_BASE_TF, TF_OPTIONS, bar_ns_for, is_rollup,
+                       ltf_options, build_bars, build_bars_from_ltf, bars_to_records)
 from history_store import HistoryStore
+from rollup import RollupMixin, candles_from_klines
 from tick_analytics import TickAnalytics
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -168,6 +171,8 @@ class Feed:
         self._computed_version = -1
         self.revision = 0
         self.stores = {}
+        # 各粒度最近一次合并历史、算好 CVD 的完整窗口; 大周期由它合成(见 rollup.py)。
+        self.latest = {}
         self.analytics = TickAnalytics(self.bar_ns)
         self.lower_klines = {}
 
@@ -192,6 +197,16 @@ class Feed:
         self.klines = self.ticks = self.quote = None
         self.lower_klines = {}
         self.analytics = TickAnalytics(self.bar_ns)
+
+    def has_data(self) -> bool:
+        """采集循环据此决定这一轮要不要处理它: 有 tick 才算得出买卖量。"""
+        return self.ticks is not None and len(self.ticks) > 0
+
+    def data_changing(self, api) -> bool:
+        """本轮 wait_update 有没有带来它关心的新数据。"""
+        return (api.is_changing(self.ticks) or api.is_changing(self.klines) or
+                any(api.is_changing(lower) for lower in self.lower_klines.values()) or
+                api.is_changing(self.quote, "price_tick"))
 
     def ensure_ltf_subscriptions(self, api):
         """只在 ingest 线程订阅当前被请求的小周期 K 线。"""
@@ -355,11 +370,16 @@ class Feed:
         bars = store.merge(bars)
         store.save_completed(bars)
         bars = store.with_cvd(bars)
+        self.latest[ltf] = bars
+        return self._snapshot_message(ltf, bars, previous, revision, store.base)
+
+    def _snapshot_message(self, ltf, bars, previous, revision, cvd_base):
+        """算好的 bars -> (该粒度的快照, 与上一份快照相比有变化时的增量消息或 None)。"""
         recs = bars_to_records(bars.tail(SNAPSHOT_BARS))
         snapshot = {"symbol": self.symbol, "cfg": self.cfg(), "ltf": ltf,
                     "tf": self.tf,
                     "source": "tick" if ltf == 0 else "kline",
-                    "revision": revision, "cvdBase": store.base,
+                    "revision": revision, "cvdBase": cvd_base,
                     "bars": recs}
         old = {b["time"]: b for b in previous.get(ltf, {}).get("bars", [])}
         changed = [bar for bar in recs if old.get(bar["time"]) != bar]
@@ -368,6 +388,39 @@ class Feed:
             message = {"type": "bars", "symbol": self.symbol, "ltf": ltf,
                        "tf": self.tf, "revision": revision, "bars": changed}
         return snapshot, message
+
+
+class FuturesRollupFeed(RollupMixin, Feed):
+    """期货大周期: 只订阅该周期的原生 K 线(开高低收量), 买卖量由同合约 30s 合成(见 rollup.py)。
+
+    不订阅 tick, 不做判向; base_lookup 返回同合约的 30s Feed(由 FeedManager 一并建好)。
+    """
+
+    def __init__(self, symbol: str, tf: int, base_lookup):
+        super().__init__(symbol, tf)
+        self._init_rollup(base_lookup)
+
+    def subscribe(self, api: TqApi):
+        ensure_listed(api, self.symbol)
+        self.klines = api.get_kline_serial(self.symbol, self.tf, data_length=MAX_KLINES)
+        with self._state_lock:
+            self.snapshots.clear()
+            self.ready.clear()
+            self.error = None
+            self.retry_at = None
+            self.compute_retry_at = 0.0
+            self._computed_version = -1
+
+    def has_data(self) -> bool:
+        return self.klines is not None and len(self.klines) > 0
+
+    def data_changing(self, api) -> bool:
+        """原生 K 线在变, 或底层 30s 又算了一轮(revision 前进)。"""
+        base = self.base()
+        return api.is_changing(self.klines) or (base is not None and base.revision != self.base_revision)
+
+    def candles(self, base) -> pd.DataFrame:
+        return candles_from_klines(self.klines)
 
 
 def _query_cache(api):
@@ -600,13 +653,22 @@ class FeedManager:
                 feed.request(demand=True)
             self._prune(now)
             if feed is None:
+                if is_rollup(key[1]):
+                    # 大周期的买卖量由同合约 30s 合成: 底层没在采集就一并建上
+                    self.ensure(key[0], ROLLUP_BASE_TF)
                 if len(self.feeds) >= MAX_FEEDS:
                     raise ValueError("订阅合约数量已达上限")
-                feed = Feed(key[0], key[1])
+                feed = self._new_feed(key)
                 feed.request(demand=True)
                 self.feeds[key] = feed
                 self.cmd_q.put(key)
             return feed
+
+    def _new_feed(self, key: tuple[str, int]) -> Feed:
+        if not is_rollup(key[1]):
+            return Feed(*key)
+        base_key = (key[0], ROLLUP_BASE_TF)
+        return FuturesRollupFeed(key[0], key[1], lambda: self.feeds.get(base_key))
 
     def set_pinned(self, keys) -> list[tuple[str, int]]:
         """设置常驻采集集合: 关掉所有页面也照常订阅、计算并落盘。
@@ -614,7 +676,9 @@ class FeedManager:
         keys 为 (合约, 主周期), 按优先级排列; 超出 MAX_PINNED_FEEDS 的部分不常驻,
         在状态接口里列出。移出集合的 Feed 回到按真实需求闲置回收的规则, 闲置期从移出时起算。
         """
-        ordered = list(dict.fromkeys(feed_key(validate_symbol(symbol), tf) for symbol, tf in keys))
+        # 大周期由 30s 合成, 不单独常驻
+        ordered = list(dict.fromkeys(feed_key(validate_symbol(symbol), tf) for symbol, tf in keys
+                                     if not is_rollup(tf)))
         with self._lock:
             pinned = ordered[:MAX_PINNED_FEEDS]
             # 常驻期间没人看图时闲置时长从创建起算, 早已超过回收期; 不重新计时, 下一轮就会
@@ -683,8 +747,13 @@ class FeedManager:
                 due += [key for key, seconds in idle.items()
                         if IDLE_EVICT_SEC - EVICT_BATCH_SEC <= seconds < IDLE_EVICT_SEC
                         and self.feeds[key] in self._sdk_feeds]
+            # 大周期还留着, 它的 30s 底层就不能回收(只开着 WS 时底层收不到真实请求)。
+            # 与大周期同一轮到期的底层照常一起回收, 合并成一次连接重建。
+            kept = {(symbol, ROLLUP_BASE_TF) for symbol, tf in self.feeds
+                    if is_rollup(tf) and (symbol, tf) not in due}
             for key in due:
-                self._forget(key)
+                if key not in kept:
+                    self._forget(key)
 
     def _forget(self, key: tuple[str, int]):
         """必须在持有 self._lock 时调用。"""
@@ -849,7 +918,8 @@ class FeedManager:
             if self._rebuild_api.is_set():
                 return True
             with self._lock:
-                feeds = list(self.feeds.values())
+                # 大周期排在最后: 它由同合约 30s 合成, 要用到 30s 本轮刚算出的窗口
+                feeds = sorted(self.feeds.values(), key=lambda f: getattr(f, "is_rollup", False))
                 clients = list(self.clients.values())
             by_key = {feed_key(f.symbol, f.tf): f for f in feeds}
             for symbol, tf, ltf, footprint in clients:
@@ -861,16 +931,14 @@ class FeedManager:
                     break
                 with self._lock:
                     subscribed = self._subscribed.get(feed_key(feed.symbol, feed.tf)) is feed
-                if not subscribed or feed.ticks is None or len(feed.ticks) == 0:
+                if not subscribed or not feed.has_data():
                     continue
                 if time.monotonic() < feed.compute_retry_at:
                     continue
                 try:
                     feed.ensure_ltf_subscriptions(api)
                     with feed._state_lock:
-                        changed = (api.is_changing(feed.ticks) or api.is_changing(feed.klines) or
-                                   any(api.is_changing(lower) for lower in feed.lower_klines.values()) or
-                                   api.is_changing(feed.quote, "price_tick"))
+                        changed = feed.data_changing(api)
                         needs_recompute = (not feed.snapshots or feed.error is not None or
                                            feed._computed_version != feed._demand_version or changed)
                     if changed:

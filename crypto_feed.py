@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """加密货币永续合约行情(币安、OKX): 逐笔成交 -> 10s/30s bar, 广播、落盘、回填。
 
+1 分钟及以上的周期不收逐笔成交, 由同合约 30s 合成(CryptoRollupFeed, 见 rollup.py)。
+
 和 TqSdk 采集(ingest.py)完全分开: 每个交易所的每路 WebSocket 一个线程(Channel), 只管连接、
 订阅增减与解析; 解析出的事件交给一个管理线程(CryptoManager), 由它独占 bar 窗口与历史文件、
 重算快照、安排回填。app.py 按合约代码前缀分流, 对外接口与 FeedManager / Feed 一致。
@@ -37,8 +39,10 @@ import numpy as np
 import pandas as pd
 
 import ingest
-from indicator import BAR_COLUMNS, DEFAULT_TF_SEC, TF_OPTIONS, TZ_SHIFT_S, finalize_bars, ltf_options
+from indicator import (BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, ROLLUP_BASE_TF, TZ_SHIFT_S, finalize_bars,
+                       is_rollup, ltf_options)
 from ingest import COMPUTE_RETRY_SEC, MAX_KLINES, feed_key, feed_label, validate_symbol
+from rollup import CANDLE_COLUMNS, RollupMixin, join_candles, resample_candles
 
 VENUE_NAMES = {"BINANCE": "币安", "OKX": "OKX", "AGG": "多所汇总"}
 # 默认常驻采集: 币安与 OKX 的 BTC 永续(多所汇总 AGG.BTC 由这两路合成)。自选里的加密合约追加在后。
@@ -56,7 +60,7 @@ MAX_BACKOFF_SEC = 60
 TRIM_SLACK = 100           # 内存里的 bar 超出窗口这么多根才裁一次, 不必每笔成交都裁
 IDLE_EVICT_SEC = 600       # 页面临时打开的合约, 最后一次需求之后保留多久
 # 洞两端要插回内存的成交范围: 最长主周期的一根 bar(两个主周期的端点 bar 都在里面)
-EDGE_MS = max(TF_OPTIONS) * 1000
+EDGE_MS = max(NATIVE_TFS) * 1000
 HOLE_RETRY_SEC = 900       # 回填没补完的洞(REST 不通、归档包还没发布)多久后重试
 WATCH_TTL_SEC = 30         # 自选面板要过的报价, 之后还订阅多久(面板 3 秒轮询一次)
 TEMPORARY_BACKFILL_DAYS = 1  # 页面临时打开(不在常驻集合里)的合约只回填这么多天, 免得随手点一下就下载一周
@@ -73,6 +77,11 @@ def venue_of(symbol) -> str | None:
 
 def is_crypto(symbol) -> bool:
     return venue_of(symbol) is not None
+
+
+def rollup_bases(keys) -> set[tuple[str, int]]:
+    """在看的 (合约, 周期) 里大周期对应的 30s 底层: 它们要按"有人在看"的节奏重算。"""
+    return {(symbol, ROLLUP_BASE_TF) for symbol, tf in keys if is_rollup(tf)}
 
 
 def step_digits(step: float) -> int:
@@ -388,6 +397,47 @@ class CandleStore:
         self._written: dict[int, tuple] = {}   # 最近写过(或读回)的行, 值没变就不再写
         self._needs_header = True
         self._needs_newline = False
+        # 整个文件的内容(大周期合成用, 见 history): 时间 -> 开高低收量, 读到的字节偏移
+        self._all: dict[int, tuple] = {}
+        self._all_offset = 0
+        self._all_frame: pd.DataFrame | None = None
+        self.revision = 0
+
+    def history(self) -> pd.DataFrame:
+        """整个文件的开高低收量(大周期要往前合成很多根, load 只读窗口内的)。
+
+        按文件大小增量读: 只解析上次之后新追加的整行, 后写的行优先; 文件变短(被替换)就从头读。
+        revision 在内容变了时加一, 供调用方判断缓存还能不能用。
+        """
+        size = self.path.stat().st_size if self.path.exists() else 0
+        if size < self._all_offset:
+            self._all, self._all_offset, self._all_frame = {}, 0, None
+            self.revision += 1
+        if size > self._all_offset:
+            with open(self.path, "rb") as handle:
+                handle.seek(self._all_offset)
+                chunk = handle.read(size - self._all_offset)
+            end = chunk.rfind(b"\n") + 1      # 最后半行(正在写)留到下次
+            for line in chunk[:end].decode("utf-8", "replace").splitlines():
+                cells = line.split(",")
+                if len(cells) != len(self.COLUMNS):
+                    continue
+                try:
+                    values = [float(cell) for cell in cells]
+                except ValueError:
+                    continue                  # 表头或坏行
+                if all(np.isfinite(values)):
+                    self._all[int(values[0])] = tuple(values[1:])
+            if end:
+                self._all_offset += end
+                self._all_frame = None
+                self.revision += 1
+        if self._all_frame is None:
+            times = sorted(self._all)
+            frame = pd.DataFrame([self._all[t] for t in times], columns=BAR_FIELDS, dtype=float)
+            frame.insert(0, "time", np.array(times, dtype=np.int64))
+            self._all_frame = frame
+        return self._all_frame
 
     def load(self) -> pd.DataFrame:
         """读回最近 window 根; 文件不存在或读不了按没有历史处理, 坏行跳过。"""
@@ -526,6 +576,54 @@ class CryptoFeed(ingest.Feed):
             broadcast(message)
 
 
+class CryptoRollupFeed(RollupMixin, ingest.Feed):
+    """加密大周期: 开高低收量与买卖量都由 30s 合成(见 rollup.py); 不收逐笔成交, 不落盘。
+
+    base_lookup 返回买卖量的底层(单个交易所是它的 30s CryptoFeed, 多所汇总是汇总的 30s);
+    candle_feeds 返回开高低收量的来源: 单个交易所就是它自己, 多所汇总是各交易所的 30s,
+    开高低收取第一个交易所的、成交量相加(同 AggregateFeed)。只在管理线程里重算。
+    """
+
+    rule = "slots"
+
+    def __init__(self, symbol: str, tf: int, base_lookup, candle_feeds):
+        super().__init__(symbol, tf)
+        self._init_rollup(base_lookup)
+        self.candle_feeds = candle_feeds
+        self.last_compute = 0.0
+        self._candle_cache: dict[int, tuple] = {}   # id(来源 Feed) -> (缓存键, 窗口之前那段合成好的 K 线)
+
+    def candles(self, base) -> pd.DataFrame:
+        feeds = self.candle_feeds()
+        if not feeds or feeds[0] is None:
+            return pd.DataFrame(columns=CANDLE_COLUMNS)
+        out = self._source_candles(feeds[0])
+        if len(feeds) > 1 and not out.empty:
+            volume = out.set_index("time")["volume"]
+            for feed in feeds[1:]:
+                if feed is not None:
+                    other = self._source_candles(feed).set_index("time")["volume"]
+                    volume = volume.add(other.reindex(volume.index), fill_value=0.0)
+            out = out.assign(volume=volume.round(VOLUME_ROUND).to_numpy())
+        return out
+
+    def _source_candles(self, feed: CryptoFeed) -> pd.DataFrame:
+        """一个 30s 来源 -> 本周期开高低收量: 文件里窗口之前那段按文件版本缓存, 最近窗口每次现算。"""
+        latest = feed.latest.get(0)
+        window = (latest[CANDLE_COLUMNS] if latest is not None and not latest.empty
+                  else pd.DataFrame(columns=CANDLE_COLUMNS))
+        start = int(window["time"].iloc[0]) if not window.empty else None
+        # history() 没有新内容时只是一次 stat; 先读一下, 版本号才是新的
+        history = feed.candles.history() if feed.candles is not None else window.iloc[:0]
+        key = (id(feed.candles), feed.candles.revision if feed.candles is not None else None, start)
+        cached = self._candle_cache.get(id(feed))
+        if cached is None or cached[0] != key:
+            older = history[history["time"] < start] if start is not None else history
+            cached = (key, resample_candles(older, self.tf))
+            self._candle_cache[id(feed)] = cached
+        return join_candles(cached[1], resample_candles(window, self.tf))
+
+
 def _connect(url: str):
     """真实连接(websockets 的同步客户端, 自带心跳); 测试与离线预览换成假连接。"""
     from websockets.sync.client import connect
@@ -643,6 +741,8 @@ class CryptoManager:
                 self.instruments[instrument.symbol] = instrument
         self.defaults = [symbol for symbol in defaults if venue_of(symbol) in self.adapters]
         self.feeds: dict[tuple[str, int], CryptoFeed] = {}
+        # 大周期(由 30s 合成, 见 CryptoRollupFeed): 页面要了才建, 闲置 IDLE_EVICT_SEC 后回收
+        self.rollups: dict[tuple[str, int], CryptoRollupFeed] = {}
         self.quotes: dict[str, dict] = {}          # 合约 -> {"ticker": {...}, "book": {...}, "mark": {...}}
         self.events: queue.Queue = queue.Queue()
         self.clients: dict[asyncio.Queue, tuple[str, int, int]] = {}   # 值: (合约, 主周期, 拆分粒度)
@@ -705,13 +805,15 @@ class CryptoManager:
         return instrument
 
     def ensure(self, symbol: str, tf: int = DEFAULT_TF_SEC):
+        if is_rollup(tf):
+            return self._ensure_rollup(symbol, tf)
         if venue_of(symbol) == "AGG" and self.aggregates is not None:
             return self.aggregates.ensure(symbol, tf)
         instrument = self.require(symbol)
         key = feed_key(instrument.symbol, tf)
         with self._lock:
             self._demand[instrument.symbol] = time.monotonic()
-            for period in TF_OPTIONS:
+            for period in NATIVE_TFS:
                 other = feed_key(instrument.symbol, period)
                 if other not in self.feeds:
                     self.feeds[other] = CryptoFeed(instrument, period)
@@ -723,14 +825,40 @@ class CryptoManager:
         """接口与 FeedManager 一致; 加密行情没有订阅冷却, 连接问题看 status_snapshot。"""
         return None
 
+    def _ensure_rollup(self, symbol: str, tf: int):
+        """大周期: 底层 30s(单个交易所或多所汇总)没在采集就一并建上, 再建合成 Feed。"""
+        base = self.ensure(symbol, ROLLUP_BASE_TF)
+        key = feed_key(base.symbol, tf)
+        with self._lock:
+            feed = self.rollups.get(key)
+            if feed is None:
+                feed = self.rollups[key] = self._new_rollup(key)
+        feed.request(demand=True)
+        return feed
+
+    def _new_rollup(self, key: tuple[str, int]) -> CryptoRollupFeed:
+        symbol, tf = key
+        base_key = (symbol, ROLLUP_BASE_TF)
+        if venue_of(symbol) == "AGG" and self.aggregates is not None:
+            parts = self.aggregates.components(symbol)
+            return CryptoRollupFeed(symbol, tf, lambda: self.aggregates.feeds.get(base_key),
+                                    lambda: [self.feeds.get((part, ROLLUP_BASE_TF)) for part in parts])
+        return CryptoRollupFeed(symbol, tf, lambda: self.feeds.get(base_key), lambda: [self.feeds.get(base_key)])
+
+    def _feed_of(self, key: tuple[str, int]):
+        """页面订阅对应的 Feed: 单个交易所、多所汇总或大周期。"""
+        with self._lock:
+            feed = self.feeds.get(key) or self.rollups.get(key)
+        if feed is None and self.aggregates is not None:
+            feed = self.aggregates.feeds.get(key)
+        return feed
+
     def add_client(self, queue_: asyncio.Queue, symbol: str, ltf: int, footprint=False,
                    tf: int = DEFAULT_TF_SEC):
         key = feed_key(symbol, tf)
         with self._lock:
             self.clients[queue_] = (key[0], key[1], ltf)
-            feed = self.feeds.get(key)
-        if feed is None and self.aggregates is not None:
-            feed = self.aggregates.feeds.get(key)
+        feed = self._feed_of(key)
         if feed is not None:
             feed.request(ltf=ltf, demand=True)
 
@@ -832,10 +960,11 @@ class CryptoManager:
     def status_snapshot(self) -> dict:
         with self._lock:
             feeds = sorted(feed_label(key) for key in self.feeds)
-            gaps = {key[0]: feed.trades.gaps for key, feed in self.feeds.items() if key[1] == min(TF_OPTIONS)}
+            gaps = {key[0]: feed.trades.gaps for key, feed in self.feeds.items() if key[1] == min(NATIVE_TFS)}
             holes = len(self._holes)
             pinned, skipped = list(self.pinned), list(self.pin_skipped)
             aggregates = sorted(feed_label(key) for key in self.aggregates.feeds) if self.aggregates else []
+            rollups = sorted(feed_label(key) for key in self.rollups)
         channels = {channel.key: channel.snapshot() for channel in self.channels}
         states = {item["status"] for item in channels.values() if item["status"] != "idle"}
         status = self.status if self.status != "running" else (
@@ -843,7 +972,7 @@ class CryptoManager:
         return {"status": status,
                 "lastError": next((item["lastError"] for item in channels.values() if item["lastError"]), None),
                 "feeds": feeds, "collecting": pinned, "collectSkipped": skipped,
-                "aggregates": aggregates,
+                "aggregates": aggregates, "rollups": rollups,
                 "channels": channels,
                 # 本次运行成交编号接不上的次数: 每次对应一段断线, 由回填补上
                 "gaps": gaps, "holes": holes,
@@ -898,8 +1027,12 @@ class CryptoManager:
             watched = {symbol for symbol, _, _ in self.clients.values()}
             for key in [key for key in self.feeds if key[0] not in trade_symbols and key[0] not in watched]:
                 del self.feeds[key]
+            viewed = {(symbol, tf) for symbol, tf, _ in self.clients.values()}
+            for key in [key for key, feed in self.rollups.items()
+                        if key not in viewed and feed.idle_for(now) >= IDLE_EVICT_SEC]:
+                del self.rollups[key]
             for symbol in trade_symbols:
-                for tf in TF_OPTIONS:
+                for tf in NATIVE_TFS:
                     if (symbol, tf) not in self.feeds:
                         self.feeds[(symbol, tf)] = CryptoFeed(self.instruments[symbol], tf)
             feeds = list(self.feeds.values())
@@ -971,7 +1104,7 @@ class CryptoManager:
         kind, symbol = event[0], event[1]
         if kind == "trade":
             applied = False
-            for tf in TF_OPTIONS:
+            for tf in NATIVE_TFS:
                 feed = self.feeds.get((symbol, tf))
                 if feed is None:
                     continue
@@ -1019,7 +1152,7 @@ class CryptoManager:
                 _, symbol, before_id, edges, error = result
                 hole = self._holes.get((symbol, before_id))
                 if error is None:
-                    for tf in TF_OPTIONS:
+                    for tf in NATIVE_TFS:
                         feed = self.feeds.get((symbol, tf))
                         if feed is not None:
                             feed.trades.insert(edges, before_id)
@@ -1034,7 +1167,7 @@ class CryptoManager:
         """把各合约窗口里新出现的洞登记下来, 到点的交给回填线程(一个洞同时只有一个任务)。"""
         if self.backfiller is None:
             return
-        tf = min(TF_OPTIONS)
+        tf = min(NATIVE_TFS)
         for symbol in self.trade_symbols(now):
             feed = self.feeds.get((symbol, tf))
             if feed is None:
@@ -1048,7 +1181,7 @@ class CryptoManager:
         for (symbol, before_id), hole in list(self._holes.items()):
             if hole["running"] or now < hole["retry_at"]:
                 continue
-            feeds = {tf: self.feeds.get((symbol, tf)) for tf in TF_OPTIONS}
+            feeds = {tf: self.feeds.get((symbol, tf)) for tf in NATIVE_TFS}
             if any(feed is None for feed in feeds.values()):
                 del self._holes[(symbol, before_id)]      # 合约已经不采集了, 洞也不用补了
                 continue
@@ -1066,9 +1199,10 @@ class CryptoManager:
         watched = set()
         for symbol, tf, ltf in clients:
             watched.add((symbol, tf))
-            feed = self.feeds.get((symbol, tf))
+            feed = self._feed_of((symbol, tf))
             if feed is not None:
-                feed.request(ltf=ltf, demand=False)   # 保持在看的拆分粒度不过期
+                feed.request(ltf=ltf, demand=False)   # 保持在看的拆分粒度不过期(大周期会转给 30s)
+        watched |= rollup_bases(watched)       # 看着大周期, 也就是看着它的 30s
         dirty, self._dirty = self._dirty, set()
         for key, feed in feeds:
             if not feed.loaded:
@@ -1094,3 +1228,26 @@ class CryptoManager:
                 print(f"[crypto] {feed_label(key)} {feed.error}", flush=True)
         if self.aggregates is not None:
             self.aggregates.compute(self, dirty | {key[0] for key, _ in feeds if key in watched})
+        self._compute_rollups(now, watched)
+
+    def _compute_rollups(self, now: float, watched: set):
+        """底层 30s 又算了一轮(或有新需求)的大周期才重算; 没人看的最多每 IDLE_RECOMPUTE_SEC 一次。"""
+        with self._lock:
+            rollups = list(self.rollups.items())
+        for key, feed in rollups:
+            base = feed.base()
+            with feed._state_lock:
+                stale = feed._computed_version != feed._demand_version or feed.error is not None
+            moved = base is not None and base.revision != feed.base_revision
+            due = moved and (key in watched or now - feed.last_compute >= IDLE_RECOMPUTE_SEC)
+            if not (stale or due) or now < feed.compute_retry_at:
+                continue
+            try:
+                feed.recompute(self.broadcast)
+                feed.last_compute = now
+                feed.compute_retry_at = 0.0
+            except Exception as exc:
+                with feed._state_lock:
+                    feed.error = f"行情处理失败: {exc}"
+                    feed.compute_retry_at = now + COMPUTE_RETRY_SEC
+                print(f"[crypto] {feed_label(key)} {feed.error}", flush=True)

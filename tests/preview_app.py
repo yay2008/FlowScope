@@ -30,7 +30,7 @@ import ingest
 import okx_feed
 import paper
 from backup import BackupScheduler
-from indicator import tick_bar_start
+from indicator import ROLLUP_BASE_TF, TZ_SHIFT_S, tick_bar_start
 
 
 class CatalogApi:
@@ -150,6 +150,42 @@ def kline_rows(ticks, seconds=30):
     rows = groups.last_price.ohlc()
     rows["volume"] = groups.size() * 2
     return rows.reset_index()
+
+
+PREVIEW_HISTORY_DAYS = 3   # 模拟 tick 之前再垫几天 30s 历史, 大周期(1 小时、4 小时)才看得出形状
+
+
+def history_candles(end_ns: int, days: int = PREVIEW_HISTORY_DAYS) -> pd.DataFrame:
+    """模拟行情开始之前的 30s K 线(datetime 为 UTC 纳秒), 价格与 tick_rows 同一量级。"""
+    i = np.arange(-(days * 86400 // 30), 0)
+    mid = 3000 + 40 * np.sin(i / 300) + 10 * np.sin(i / 23)
+    close = np.round(mid + 3 * np.sin(i / 5))
+    opened = np.round(mid)
+    return pd.DataFrame({"datetime": end_ns + i * 30 * 10**9, "open": opened,
+                         "high": np.maximum(opened, close) + 2, "low": np.minimum(opened, close) - 2,
+                         "close": close, "volume": 60.0 + (i * 7 % 50) * 2})
+
+
+def seed_history(feed):
+    """给 30s 底层的 tick 口径历史文件垫上更早的已核对买卖量(大周期合成用得到)。"""
+    older = history_candles(int(feed.ticks.datetime.iloc[0]) // (30 * 10**9) * 30 * 10**9)
+    buy = np.round(older.volume * (0.5 + 0.3 * np.sin(np.arange(len(older)) / 40)))
+    rows = pd.DataFrame({"time": older.datetime // 10**9 + TZ_SHIFT_S, "buy": buy,
+                         "sell": older.volume - buy, "unknown": 0.0, "buyLegacy": buy,
+                         "sellLegacy": older.volume - buy, "coverage": "complete", "hasBaseline": True})
+    feed._store(0).save_completed(rows, final=True)
+
+
+def rollup_klines(base, tf: int) -> pd.DataFrame:
+    """大周期的"原生" K 线: 垫的历史按周期合成, 接上由 tick 聚出的实时部分。"""
+    first = int(base.ticks.datetime.iloc[0]) // (30 * 10**9) * 30 * 10**9
+    older = history_candles(first)
+    groups = older.groupby(older.datetime // (tf * 10**9) * (tf * 10**9))
+    older = pd.DataFrame({"open": groups.open.first(), "high": groups.high.max(), "low": groups.low.min(),
+                          "close": groups.close.last(), "volume": groups.volume.sum()}).reset_index()
+    live = kline_rows(base.ticks, tf)
+    return (pd.concat([older, live], ignore_index=True)
+            .drop_duplicates("datetime", keep="last").tail(2000).reset_index(drop=True))
 
 
 SIM_STEP_MS = 2000      # 模拟成交: 每 2 秒一笔, 编号 = 时间 / 2 秒, 所以任何一段时间的成交都能当场算出来
@@ -293,13 +329,26 @@ class PreviewManager(ingest.FeedManager):
             self._run_jobs(self.catalog_api)
             self._run_loop_hooks(self.catalog_api)   # 模拟交易: 刷新盘口、撮合挂单
             with self._lock:
-                feeds = list(self.feeds.values())
+                # 大周期由 30s 合成, 排在最后才能用上 30s 本轮的窗口
+                feeds = sorted(self.feeds.values(), key=lambda f: getattr(f, "is_rollup", False))
                 clients = list(self.clients.values())
             for feed in feeds:
+                if getattr(feed, "is_rollup", False):
+                    base = feed.base()
+                    if base is None or base.ticks is None:
+                        continue
+                    feed.klines = rollup_klines(base, feed.tf)
+                    for symbol, tf, ltf, footprint in clients:
+                        if symbol == feed.symbol and tf == feed.tf:
+                            feed.request(ltf=ltf, footprint=footprint)
+                    feed.recompute(self.broadcast)
+                    continue
                 if feed.ticks is None:
                     feed.quote = SimpleNamespace(price_tick=1.)
                     feed.ticks = tick_rows(0, 10000)
                     feed.klines = kline_rows(feed.ticks, feed.tf)
+                    if feed.tf == ROLLUP_BASE_TF:
+                        seed_history(feed)
                 else:
                     fresh = tick_rows(int(feed.ticks.id.iloc[-1]) + 1, 1)
                     feed.ticks = pd.concat([feed.ticks, fresh], ignore_index=True).tail(10000)

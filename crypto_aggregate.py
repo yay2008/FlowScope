@@ -17,8 +17,8 @@ import numpy as np
 import pandas as pd
 
 import ingest
-from crypto_feed import IDLE_RECOMPUTE_SEC, VENUE_NAMES, venue_of
-from indicator import BAR_COLUMNS, DEFAULT_TF_SEC, TF_OPTIONS, finalize_bars, ltf_options
+from crypto_feed import IDLE_RECOMPUTE_SEC, VENUE_NAMES, rollup_bases, venue_of
+from indicator import BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, finalize_bars, ltf_options
 from ingest import feed_key
 
 PREFIX = "AGG."
@@ -171,7 +171,7 @@ class AggregateBook:
         qty_digits = max(self.manager.instrument(part).qty_digits for part in parts)
         with self.manager._lock:
             self.manager._demand[symbol] = time.monotonic()
-            for period in TF_OPTIONS:
+            for period in NATIVE_TFS:
                 key = feed_key(symbol, period)
                 if key not in self.feeds:
                     self.feeds[key] = AggregateFeed(key[0], period, parts, primary.price_digits, qty_digits)
@@ -221,6 +221,7 @@ class AggregateBook:
         # 与 ensure(HTTP 线程)同一把锁: 增删 feeds 时不能和页面新建汇总撞在一起
         with manager._lock:
             watched = {(symbol, tf) for symbol, tf, _ in manager.clients.values()}
+            watched |= rollup_bases(watched)      # 汇总的大周期由汇总的 30s 合成
             wanted = set(manager.pinned_aggregates()) | {symbol for symbol in manager._demand
                                                          if venue_of(symbol) == "AGG"}
             wanted |= {symbol for symbol, _ in watched if venue_of(symbol) == "AGG"}
@@ -229,7 +230,7 @@ class AggregateBook:
             for symbol in wanted:
                 if not self.components(symbol):
                     continue
-                for tf in TF_OPTIONS:
+                for tf in NATIVE_TFS:
                     if feed_key(symbol, tf) not in self.feeds:
                         self.ensure_feed(symbol, tf)
             feeds = list(self.feeds.items())

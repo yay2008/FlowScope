@@ -1,7 +1,7 @@
 /* 图表组件: 一张 lightweight-charts 图 + 它自己的数据加载与实时推送, 可以实例化多张。
  *
- * 每张图固定一个主周期 tf(10 或 30 秒), 左上角标出周期; 各自拉 GET /api/history、各自连 WS /ws,
- * 后端按 (symbol, tf) 独立订阅与落盘, 所以多张图之间互不干扰。
+ * 每张图一个主周期 tf(10s/30s/1m/5m/15m/1h/4h), 左上角的下拉框可以切换; 各自拉 GET /api/history、
+ * 各自连 WS /ws, 后端按 (symbol, tf) 各出一份快照(1 分钟及以上由 30s 合成), 所以多张图之间互不干扰。
  * 渲染: 三个 pane: K线(可叠加 WaveTrend) / Volume Suite / LSMA×CRVOL;
  * 阈值与配色按 Volume Suite (By Leviathan) 口径在前端实时计算(纯计算在 indicators.js)。
  *
@@ -15,8 +15,21 @@
   "use strict";
   const { LW, WT, EMA_PERIODS, buyOf, sellOf, deltaOf } = FlowIndicators;
 
-  // 各主周期下合法的拆分粒度; 与后端 indicator.ltf_options 同源, 拿到 cfg 后以 cfg 为准
-  const LTF_BY_TF = { 10: [1, 5, 10], 30: [1, 5, 10, 15, 30] };
+  // 可选主周期(秒), 与后端 indicator.TF_OPTIONS 一致(tests/test_rollup.py 核对两边相同)
+  const TF_CHOICES = [10, 30, 60, 300, 900, 3600, 14400];
+  // 拆分粒度候选(秒); 本周期合法的是能整除主周期的那些, 规则同后端 indicator.ltf_options, 拿到 cfg 后以 cfg 为准
+  const LTF_CHOICES = [1, 5, 10, 15, 30];
+
+  function localLtfOptions(tf) {
+    return LTF_CHOICES.filter((s) => s <= tf && tf % s === 0);
+  }
+
+  // 周期(秒) -> 显示名: 10s、1m、15m、1h、4h
+  function tfLabel(tf) {
+    if (tf % 3600 === 0) return `${tf / 3600}h`;
+    if (tf % 60 === 0) return `${tf / 60}m`;
+    return `${tf}s`;
+  }
   // 加载失败后自动重试: 订阅失败是暂时的(冷却期一过后端会自动重订),
   // 所以页面不该停在"加载失败"上等用户手动刷新。
   const RETRY_DELAY_MS = 5000;
@@ -364,7 +377,7 @@
 
   /* 建一张图。options:
    *   host      放图的容器, 组件在里面建自己的 .chart-view
-   *   tf        主周期(秒), 10 或 30, 建好后不变
+   *   tf        初始主周期(秒), 之后由左上角的下拉框切换(setTf)
    *   symbol    合约代码(切合约是整页重载, 所以也不变)
    *   settings  页面的工具栏状态, 按引用共用, 组件只读
    *   shown     本图主图指标的初始显示开关 {ema, band, wt}, 之后由本图图例的眼睛按钮切换
@@ -376,9 +389,11 @@
    *   onCrosshair(time, price)  本图十字光标动了(用户移动, 或光标停着时本图数据变了); 移出图表时
    *                             time 为 null, 光标不在主图窗格时 price 为 null
    *   onRangeChange()           本图的可视范围变了(用户缩放拖动, 也包括新 bar 自动右移、加载后滚到最新)
+   *   onTfChange()              用户在左上角切换了本图周期(新周期用 tf 取, 本图已开始按新周期加载)
    */
   function create({ host, tf, symbol, settings, shown: initialShown, onStatus = noop, onLegend = noop,
-                    onConfig = noop, onShownChange = noop, onCrosshair = noop, onRangeChange = noop }) {
+                    onConfig = noop, onShownChange = noop, onCrosshair = noop, onRangeChange = noop,
+                    onTfChange = noop }) {
     let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
     let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
     let derived = null;   // 派生数组(rolling sma/zscore 等)
@@ -397,17 +412,24 @@
     let retryAttempts = 0;
     const shown = { ema: true, band: false, wt: true, ...initialShown };   // 本图主图指标的显示开关
 
-    // ---------- 容器: 图表本身 + 左上角的周期标签和主图指标图例 ----------
+    // ---------- 容器: 图表本身 + 左上角的周期下拉框和主图指标图例 ----------
 
     const el = document.createElement("div");
     el.className = "chart-view";
     const corner = document.createElement("div");
     corner.className = "chart-corner";
-    const badge = document.createElement("span");
-    badge.className = "tf-badge";
-    badge.textContent = `${tf}s`;
-    badge.title = `主图周期 ${tf} 秒：K 线、成交量、足迹图、CVD 都按该周期计算；指标长度按根数固定` +
-                  "（与 TradingView 切周期行为一致），所以 10s 下 300 根均线覆盖的时长是 30s 的 1/3。";
+    const badge = document.createElement("select");
+    badge.className = "tf-select";
+    for (const value of TF_CHOICES) {
+      const option = document.createElement("option");
+      option.value = String(value);
+      option.textContent = tfLabel(value);
+      badge.appendChild(option);
+    }
+    badge.value = String(tf);
+    badge.title = "主图周期：K 线、成交量、CVD 都按该周期计算，1 分钟及以上由 30s 合成（足迹图只有 10s、30s）。" +
+                  "指标长度按根数固定（与 TradingView 切周期行为一致），周期越大，同样根数覆盖的时长越长。";
+    badge.addEventListener("change", () => setTf(Number(badge.value)));
     corner.appendChild(badge);
     el.appendChild(corner);
     host.appendChild(el);
@@ -463,7 +485,7 @@
         horzLines: { color: "#1e222d" },
       },
       crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-      timeScale: { borderColor: "#2a2e39", timeVisible: true, secondsVisible: true, rightOffset: 3 },
+      timeScale: { borderColor: "#2a2e39", timeVisible: true, secondsVisible: tf < 60, rightOffset: 3 },
       rightPriceScale: { borderColor: "#2a2e39" },
     });
 
@@ -990,8 +1012,8 @@
     // 本周期合法的拆分粒度: cfg 是本图上次加载时服务端下发的, 拿到之前按本地表
     function ltfOptions() {
       const options = cfg && cfg.tf === tf ? cfg.ltfOptions : null;
-      const legal = options && options.length ? options.filter((s) => s > 0) : LTF_BY_TF[tf];
-      return legal && legal.length ? legal : [1, 5, 10];
+      const legal = options && options.length ? options.filter((s) => s > 0) : localLtfOptions(tf);
+      return legal.length ? legal : [1, 5, 10];
     }
 
     // 本图该请求的粒度: tick 口径恒为 0; K 线口径取工具栏的选择, 本周期用不了(15/30 不能整除 10)时
@@ -1172,6 +1194,26 @@
       };
     }
 
+    // 切换本图周期: 先清掉旧周期的画面(新数据到之前不能还显示旧周期的 K 线), 再按新周期重新加载;
+    // 加载流程会作废进行中的请求、重试与旧周期的推送连接。
+    function setTf(next) {
+      if (next === tf || !TF_CHOICES.includes(next)) {
+        badge.value = String(tf);
+        return;
+      }
+      tf = next;
+      badge.value = String(tf);
+      bars = [];
+      fpBars = [];
+      barRevision = -1;
+      fpRevision = -1;
+      chart.timeScale().applyOptions({ secondsVisible: tf < 60 });
+      fpSeries.setData([]);
+      if (cfg) renderAll();
+      loadHistory();
+      onTfChange();
+    }
+
     // 本图对应时刻 t 的 bar: 起点不晚于 t 的最后一根。bar 从周期的整数倍开始, 所以 10s 的 t 落到包含它的
     // 30s bar, 30s 的 t 落到同一时刻的第一根 10s bar; 本图缺这一根就是前一根
     function barAt(t) {
@@ -1182,7 +1224,8 @@
     // ---------- 对页面的接口 ----------
     // 工具栏改了 settings 之后, 页面按改动调对应的入口
     return {
-      tf,
+      get tf() { return tf; },
+      setTf,
       el,
       shown: () => ({ ...shown }),
       load: () => loadHistory(),       // 重新加载(CVD口径/拆分粒度变了), 作废进行中的请求与重试
@@ -1218,6 +1261,17 @@
         if (current && Math.abs(current.from - from) < 0.01 && Math.abs(current.to - to) < 0.01) return;
         chart.timeScale().setVisibleLogicalRange({ from, to });
       },
+      // 只对齐右边缘(两张图周期差太多, 完整同步会把大周期压成一两根时用): 本图可视的 bar 数不变,
+      // 右边缘移到 time; 两边都已看到最新时, 本图保留自己的右侧留白
+      alignRightEdge(time) {
+        const current = chart.timeScale().getVisibleLogicalRange();
+        if (!current || !bars.length) return;
+        const last = bars.length - 1;
+        let to = logicalAtTime(bars, tf, time);
+        if (to > last && current.to > last) to = current.to;
+        if (Math.abs(current.to - to) < 0.01) return;
+        chart.timeScale().setVisibleLogicalRange({ from: to - (current.to - current.from), to });
+      },
       showCrosshair(time, price) {     // price 为 null 时横线落在那根 bar 的收盘价上
         const bar = barAt(time);
         if (!bar) chart.clearCrosshairPosition();
@@ -1235,6 +1289,6 @@
   }
 
   // 渲染类与时间换算一并导出, 测试直接检查
-  root.ChartView = { create, FootprintRenderer, BandRenderer, BandSeries,
+  root.ChartView = { create, FootprintRenderer, BandRenderer, BandSeries, TF_CHOICES, tfLabel, localLtfOptions,
                      indexAtOrBefore, timeAtLogical, logicalAtTime };
 })(typeof globalThis !== "undefined" ? globalThis : this);

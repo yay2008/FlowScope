@@ -22,7 +22,7 @@ from catalog import CatalogService
 from crypto_aggregate import AggregateBook
 from crypto_backfill import Backfiller
 from favorites import FavoriteStore, FavoritesService, MAX_FAVORITES
-from indicator import CFG, DEFAULT_TF_SEC, TF_OPTIONS, ltf_options
+from indicator import CFG, DEFAULT_TF_SEC, NATIVE_TFS, ltf_options
 from ingest import FeedManager, validate_symbol, validate_tf
 from okx_feed import OkxAdapter
 from paper import DEFAULT_CASH, PaperService, PaperStore
@@ -32,7 +32,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "KQ.m@SHFE.fu"
 FAVORITES_FILE = "favorites.json"
 # 常驻采集的主周期: 每个周期的历史各自落盘, 都要在无人看图时继续积累。
-COLLECT_TFS = TF_OPTIONS
+# 1 分钟及以上由 30s 合成(见 rollup.py), 不单独采集。
+COLLECT_TFS = NATIVE_TFS
 
 app = FastAPI(title="FlowScope")
 manager = FeedManager()

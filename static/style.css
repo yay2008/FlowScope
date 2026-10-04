@@ -189,6 +189,20 @@ body { display: flex; flex-direction: column; }
   cursor: default;
   pointer-events: auto;
 }
+/* 周期下拉框: 外观同原来的周期标签 */
+.tf-select {
+  padding: 0 4px;
+  border: 1px solid #2a2e39;
+  border-radius: 3px;
+  background: rgba(30, 34, 45, 0.85);
+  color: #f0b90d;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.tf-select option { background: #1e222d; color: #d1d4dc; }
 
 /* 主图指标图例: 名称 + 眼睛按钮(显示/隐藏), 每张图一份 */
 .main-legend {

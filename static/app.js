@@ -1,6 +1,6 @@
 /* FlowScope 前端: 页面级逻辑
  * 工具栏、合约选择器、自选面板、模拟交易面板在这里; 图表本身(K线/指标/足迹图与数据推送)是 chart-view.js 里
- * 可实例化的组件, 一张图固定一个主周期并在左上角标出。页面放 10s、30s 两张图左右并排:
+ * 可实例化的组件, 每张图一个主周期, 左上角的下拉框切换。页面放两张图左右并排(默认 10s、30s):
  * 工具栏状态 settings 两张图共用, 十字光标与可视时间范围联动, 主图指标的显示开关每张图各管各的。
  */
 "use strict";
@@ -38,9 +38,29 @@ if (CRYPTO_SYMBOL.test(symbol)) {
 }
 
 // ---------- 图表 ----------
-// 10s(左)、30s(右)两张图。后端按 (symbol, tf) 独立订阅与落盘, 每张图各自加载、各自连推送。
+// 左右两张图, 周期各自在左上角切换。后端按 (symbol, tf) 各出一份快照, 每张图各自加载、各自连推送。
 
-const CHART_TFS = [10, 30];
+// 两张图的周期记在 localStorage(切合约是整页重载, 不记的话每次都被打回默认), 读不到或不合法就用默认的
+// 左 10s、右 30s。chartTfs 跟着切换更新, 早于 charts 声明: 建图时就会报连接状态(见 setChartStatus)。
+const CHART_TFS_KEY = "flowscope.chartTfs";
+const DEFAULT_CHART_TFS = [10, 30];
+
+function loadChartTfs() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CHART_TFS_KEY) || "null");
+    if (Array.isArray(saved) && saved.length === DEFAULT_CHART_TFS.length &&
+        saved.every((tf) => ChartView.TF_CHOICES.includes(tf))) return saved;
+  } catch (error) { /* 记不住不影响使用 */ }
+  return [...DEFAULT_CHART_TFS];
+}
+
+function saveChartTfs() {
+  try {
+    localStorage.setItem(CHART_TFS_KEY, JSON.stringify(chartTfs));
+  } catch (error) { /* 记不住不影响使用 */ }
+}
+
+const chartTfs = loadChartTfs();
 
 // 各图主图指标的显示开关记在 localStorage, 格式 {"10": {ema, band, wt}, "30": {...}}: 切合约是整页重载,
 // 不记的话每切一次都被打回默认。旧版只记一份 {ema, band, wt}, 两张图都按它初始化;
@@ -59,25 +79,29 @@ function loadShown(tf) {
   return shown;
 }
 
+// 只改当前两张图所在周期的那几项, 其它周期记下的开关留着(切回去、重载后还用得上)
 function saveShown() {
   try {
-    localStorage.setItem(MAIN_SHOWN_KEY, JSON.stringify(Object.fromEntries(charts.map((c) => [c.tf, c.shown()]))));
+    let saved = JSON.parse(localStorage.getItem(MAIN_SHOWN_KEY) || "{}");
+    if (!saved || typeof saved !== "object" || typeof saved.ema === "boolean") saved = {};   // 旧版单份格式
+    for (const c of charts) saved[c.tf] = c.shown();
+    localStorage.setItem(MAIN_SHOWN_KEY, JSON.stringify(saved));
   } catch (error) { /* 记不住不影响使用 */ }
 }
 
-// 鼠标所在(最近进入)的那张图: 顶栏读数显示它, 十字光标与缩放/拖动以它为准同步另一张。默认 30s。
+// 鼠标所在(最近进入)的那张图: 顶栏读数显示它, 十字光标与缩放/拖动以它为准同步另一张。默认右边那张。
 // 只由鼠标进入图表区域来切换, 十字光标事件不算(见 syncCrosshair)。
 let activeChart = null;
-const chartStatus = new Map();   // tf -> {ok, text}
+const chartStatus = new Map();   // 第几张图 -> {ok, text}
 
-function makeChart(tf) {
+function makeChart(tf, index) {
   const chartView = ChartView.create({
     host: $("chart"),
     tf,
     symbol,
     settings,
     shown: loadShown(tf),
-    onStatus: (ok, text) => setChartStatus(tf, ok, text),
+    onStatus: (ok, text) => setChartStatus(index, ok, text),
     onLegend: (text, coverage) => showLegend(chartView, text, coverage),
     onConfig: refreshLtfOptions,
     onShownChange: () => {
@@ -86,13 +110,21 @@ function makeChart(tf) {
     },
     onCrosshair: (time, price) => syncCrosshair(chartView, time, price),
     onRangeChange: syncRanges,
+    onTfChange: () => {
+      chartTfs[index] = chartView.tf;
+      saveChartTfs();
+      saveShown();
+      refreshLtfOptions();
+      showChartStatus();
+      if (chartView === activeChart) chartView.refreshLegend();
+    },
   });
   chartView.el.addEventListener("pointerenter", () => activate(chartView));
   return chartView;
 }
 
-const charts = CHART_TFS.map(makeChart);
-activeChart = charts.find((c) => c.tf === 30);
+const charts = chartTfs.map(makeChart);
+activeChart = charts[charts.length - 1];
 
 function activate(chartView) {
   if (chartView === activeChart) return;
@@ -101,20 +133,25 @@ function activate(chartView) {
 }
 
 // 顶栏连接状态: 两张图都连上才显示「已连接」, 否则列出没连上的(带周期前缀)
-function setChartStatus(tf, ok, text) {
-  chartStatus.set(tf, { ok, text });
-  const pending = CHART_TFS.filter((t) => !chartStatus.get(t)?.ok);
+function setChartStatus(index, ok, text) {
+  chartStatus.set(index, { ok, text });
+  showChartStatus();
+}
+
+function showChartStatus() {
+  const pending = chartTfs.map((tf, index) => index).filter((index) => !chartStatus.get(index)?.ok);
   const el = $("status");
   el.className = pending.length ? "off" : "on";
   el.textContent = pending.length
-    ? pending.map((t) => `${t}s: ${chartStatus.get(t)?.text ?? "连接中…"}`).join("  ")
+    ? pending.map((index) => `${ChartView.tfLabel(chartTfs[index])}: ${chartStatus.get(index)?.text ?? "连接中…"}`)
+      .join("  ")
     : "已连接";
 }
 
 // 顶栏读数只显示鼠标所在那张图(带周期前缀), 另一张的读数直接忽略
 function showLegend(chartView, text, coverage) {
   if (chartView !== activeChart) return;
-  $("legend").textContent = `${chartView.tf}s · ${text}`;
+  $("legend").textContent = `${ChartView.tfLabel(chartView.tf)} · ${text}`;
   $("coverage").textContent = coverage;
 }
 
@@ -133,12 +170,19 @@ function syncCrosshair(source, time, price) {
 // 可视时间范围联动: 以鼠标所在那张图为准, 另一张显示同一段时间(bar 粗细随周期不同)。
 // 另一张自己动了(新 bar 自动右移、加载完滚到最新)也拉回来对齐; 已经对齐时 setVisibleTimeRange 什么都不做,
 // 所以不会来回触发。另一张缩不到那么小(bar 间距有下限)时只能显示它放得下的那部分, 不反过来改鼠标所在那张。
+// 两张图周期相差超过 FULL_SYNC_RATIO 倍(如 1m 与 4h)时, 显示同一段时间会把大周期压成一两根,
+// 所以只对齐右边缘时刻, 各图保留自己的缩放。
+const FULL_SYNC_RATIO = 3;
+
 function syncRanges() {
   if (!activeChart) return;
   const range = activeChart.visibleTimeRange();
   if (!range) return;
   for (const c of charts) {
-    if (c !== activeChart) c.setVisibleTimeRange(range);
+    if (c === activeChart) continue;
+    const ratio = Math.max(c.tf, activeChart.tf) / Math.min(c.tf, activeChart.tf);
+    if (ratio <= FULL_SYNC_RATIO) c.setVisibleTimeRange(range);
+    else c.alignRightEdge(range.to);
   }
 }
 

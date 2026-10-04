@@ -31,7 +31,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from crypto_feed import EDGE_MS, Instrument, aggregate_trades
-from indicator import TF_OPTIONS, ltf_options
+from indicator import NATIVE_TFS, ltf_options
 
 USER_AGENT = "FlowScope/1.0"
 DAY_MS = 86_400_000
@@ -169,7 +169,7 @@ class Backfiller:
     def job(self, instrument, after_id, after_ms, before_id, before_ms, complete, days=None) -> HoleJob:
         """洞 -> 回填任务; 左端没有已知成交时从回填窗口起点补起(往前 days 天, 对齐到最长主周期)。"""
         if after_id is None:
-            edge = max(TF_OPTIONS) * 1000
+            edge = max(NATIVE_TFS) * 1000
             start = (before_ms - (self.days if days is None else days) * DAY_MS) // edge * edge
         else:
             start = after_ms
@@ -249,7 +249,7 @@ class Backfiller:
         """这一段里还有没补完的整根 bar, 或者有洞两端的成交要取。"""
         if any(start < hi and lo < end for lo, hi in edges):
             return True
-        for tf in TF_OPTIONS:
+        for tf in NATIVE_TFS:
             tf_ms = tf * 1000
             done = job.complete.get(tf, set())
             first = -(-start // tf_ms) * tf_ms
@@ -291,7 +291,7 @@ class Backfiller:
             if job.after_id is not None:
                 mask &= trades["id"] > job.after_id
             trades = trades[mask]
-            for tf in TF_OPTIONS:
+            for tf in NATIVE_TFS:
                 bars = aggregate_trades(trades, tf, ltf_options(tf), start, end)
                 skip = job.complete.get(tf, set())
                 bars = bars[~bars.index.isin(skip)] if skip else bars

@@ -364,7 +364,7 @@ function findAll(node, predicate, out = []) {
   return out;
 }
 
-test("「周期」下拉框已移除: 10s、30s 两张图左右并排, 各自左上角标出周期, 下面是本图的主图指标图例", () => {
+test("工具栏的周期下拉框已移除: 默认 10s、30s 两张图左右并排, 各自左上角有周期下拉框, 下面是本图的主图指标图例", () => {
   const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
   assert.ok(!html.includes('id="tf"'), "工具栏的周期下拉框应已移除");
   assert.ok(!html.includes('id="main-legend"'), "主图图例由图表组件建, 每张图一份");
@@ -374,9 +374,11 @@ test("「周期」下拉框已移除: 10s、30s 两张图左右并排, 各自左
   const context = runBrowser();
   assert.equal(vm.runInContext("charts.map((c) => c.tf).join()", context), "10,30", "左 10s、右 30s");
   const corners = findAll(context.document.getElementById("chart"), (node) => node.className === "chart-corner");
-  assert.deepEqual(corners.map((corner) => corner.children[0].textContent), ["10s", "30s"]);
+  assert.deepEqual(corners.map((corner) => corner.children[0].value), ["10", "30"]);
+  assert.deepEqual(corners[0].children[0].children.map((o) => o.textContent),
+                   ["10s", "30s", "1m", "5m", "15m", "1h", "4h"]);
   for (const corner of corners) {
-    assert.equal(corner.children[0].className, "tf-badge");
+    assert.equal(corner.children[0].className, "tf-select");
     assert.equal(corner.children[1].className, "main-legend", "主图图例应挂在周期标签下面");
   }
 });
@@ -959,13 +961,13 @@ test("顶栏读数只显示鼠标所在那张图, 带周期前缀; 鼠标换到�
 test("顶栏连接状态: 两张图都连上才显示「已连接」, 否则带周期前缀列出没连上的", () => {
   const context = runBrowser();
   const status = context.document.getElementById("status");
-  vm.runInContext(`setChartStatus(10, true, "已连接"); setChartStatus(30, false, "同步中…");`, context);
+  vm.runInContext(`setChartStatus(0, true, "已连接"); setChartStatus(1, false, "同步中…");`, context);
   assert.equal(status.textContent, "30s: 同步中…");
   assert.equal(status.className, "off");
-  vm.runInContext(`setChartStatus(30, true, "已连接");`, context);
+  vm.runInContext(`setChartStatus(1, true, "已连接");`, context);
   assert.equal(status.textContent, "已连接");
   assert.equal(status.className, "on");
-  vm.runInContext(`setChartStatus(10, false, "已断开, 重连补齐中…"); setChartStatus(30, false, "加载中…");`, context);
+  vm.runInContext(`setChartStatus(0, false, "已断开, 重连补齐中…"); setChartStatus(1, false, "加载中…");`, context);
   assert.equal(status.textContent, "10s: 已断开, 重连补齐中…  30s: 加载中…");
 });
 

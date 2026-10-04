@@ -119,6 +119,8 @@ class HistoryStore:
         # 旧估算文件的对照列, 优先级低于主文件。
         self.estimated_extra: dict[int, dict] = {}
         self._legacy_paths = [Path(item) for item in legacy_paths]
+        # 内容版本号: 读入新行或落盘改了内容就加一; 大周期合成据此判断缓存还能不能用。
+        self.revision = 0
         self._offset = 0
         self._size = 0
         self._needs_header = True
@@ -184,6 +186,7 @@ class HistoryStore:
         顺序与旧版完全一致(旧版先读主文件与估算文件, 再 ``extra.update`` 覆盖),
         因此同一时间戳上 complete 压 partial、主文件压旧估算。
         """
+        self.revision += 1
         self.values.clear()
         self.estimates.clear()
         self._legacy.clear()
@@ -339,6 +342,7 @@ class HistoryStore:
         if batch is None:
             return
         self._dirty = True
+        self.revision += 1
         times, buys, sells, codes, extras = batch
         partial_mask = codes == 1
         legacy_mask = codes == 2
@@ -531,6 +535,7 @@ class HistoryStore:
             self._append(lines)
         if changed:
             self._dirty = True
+            self.revision += 1
 
     def with_cvd(self, bars):
         """显示 CVD 累计可用估算量；核对通过的累计量独立保留，二者均固定基准。"""

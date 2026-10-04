@@ -59,7 +59,7 @@ class PeriodOptionTests(unittest.TestCase):
         self.assertEqual(bar_ns_for(30), 30 * 10**9)
 
     def test_illegal_period_falls_back_to_default(self):
-        for bad in [0, 7, 60, None, "x", "10.5"]:
+        for bad in [0, 7, 45, 120, None, "x", "10.5"]:
             self.assertEqual(bar_ns_for(bad), DEFAULT_TF_SEC * 10**9)
 
     def test_split_granularity_must_divide_the_period(self):

@@ -22,7 +22,7 @@ from binance_feed import BinanceAdapter
 from crypto_backfill import DAY_MS, Backfiller, FetchError, NotPublished, RestBlocked
 from crypto_feed import (CandleStore, Channel, CryptoFeed, CryptoManager, Instrument, TradeBars,
                          aggregate_trades)
-from indicator import TF_OPTIONS, TZ_SHIFT_S, ltf_options
+from indicator import NATIVE_TFS, TZ_SHIFT_S, ltf_options
 from okx_feed import OkxAdapter
 
 DAY0 = 1_790_985_600_000            # 2026-10-03 00:00 UTC
@@ -159,12 +159,12 @@ class TradeBarsTests(unittest.TestCase):
 class AggregateTests(unittest.TestCase):
     def test_bulk_aggregation_matches_live_bars(self):
         trades = make_trades(BASE, 400, step_ms=1700, quiet=range(40, 60))
-        live = {tf: TradeBars(tf) for tf in TF_OPTIONS}
+        live = {tf: TradeBars(tf) for tf in NATIVE_TFS}
         for row in trades.itertuples(index=False):
             for bars in live.values():
                 bars.add(int(row.id), float(row.price), float(row.qty), int(row.t), bool(row.sell))
         end = int(trades.t.iloc[-1]) // 30000 * 30000
-        for tf in TF_OPTIONS:
+        for tf in NATIVE_TFS:
             bulk = aggregate_trades(trades, tf, ltf_options(tf), BASE, end)
             for ltf in ltf_options(tf):
                 frame = live[tf].frame(ltf).set_index("time")
@@ -330,7 +330,7 @@ class BackfillTests(unittest.TestCase):
         backfiller = Backfiller(days=days)
         backfiller.bind({"FAKE": venue})
         job = backfiller.job(FAKE, None, None, self.before_id, self.before_ms,
-                             complete or {tf: set() for tf in TF_OPTIONS})
+                             complete or {tf: set() for tf in NATIVE_TFS})
         backfiller._fill(job)
         return job, drain(backfiller.results), backfiller
 
@@ -352,7 +352,7 @@ class BackfillTests(unittest.TestCase):
         self.assertEqual(done[:3], ("done", "FAKE.X", self.before_id))
         self.assertIsNone(done[4])
         known = self.trades[self.trades.id < self.before_id]
-        for tf in TF_OPTIONS:
+        for tf in NATIVE_TFS:
             got = pd.concat([item[3] for item in bars if item[2] == tf]).sort_index()
             expected = aggregate_trades(known, tf, ltf_options(tf), job.start_ms, self.before_ms + 1)
             pd.testing.assert_frame_equal(got, expected, check_freq=False, check_names=False)
@@ -379,7 +379,7 @@ class BackfillTests(unittest.TestCase):
 
     def test_complete_bars_are_not_fetched_again(self):
         venue = FakeVenue(self.trades, published_before=DAY0 + 2 * DAY_MS)
-        complete = {tf: set(range(DAY0 + DAY_MS, DAY0 + 2 * DAY_MS, tf * 1000)) for tf in TF_OPTIONS}
+        complete = {tf: set(range(DAY0 + DAY_MS, DAY0 + 2 * DAY_MS, tf * 1000)) for tf in NATIVE_TFS}
         self.run_job(venue, complete)
         self.assertNotIn(("day", DAY0 + DAY_MS), venue.calls)
 
