@@ -1,6 +1,8 @@
 /* 模拟交易面板(右侧): 下单、持仓、账户、委托与成交; 以及图表上的成交标记和价格线的数据。
  *
  * 后端撮合在 paper.py: 市价单按对手价整笔成交, 限价单要价格穿过才成交(看不到排队)。
+ * 加密合约是另一个账户(paper_crypto.py, state.mode === "crypto"): 数量是小数的币、USDT 记账、
+ * 每个合约一个杠杆、计资金费; 面板据此换单位、显示杠杆选择与强平价。
  * 面板轮询 GET /api/paper(展开时 1 秒一次, 折叠时 5 秒一次, 页面在后台时停止),
  * 每次拿到新数据回调 onState, 由 app.js 重画成交标记与价格线。
  * 纯函数(buildMarkers / priceLines / 格式化)在 Node 测试里直接加载。
@@ -16,6 +18,7 @@
   const POLL_COLLAPSED_MS = 5000;
   const COLLAPSED_KEY = "flowscope.tradeCollapsed";
   const STATUS_LABELS = { open: "挂单中", filled: "已成交", cancelled: "已撤", rejected: "已拒" };
+  const LEVERAGES = [1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125];
 
   // 成交时间 -> 所在 bar 的时间: 标记只能打在已有的 bar 上, 落在休市缺口里的挂到前一根。
   function snapTime(bars, time) {
@@ -98,17 +101,26 @@
       buy: byId("trade-buy"), sell: byId("trade-sell"), flatten: byId("trade-flatten"), msg: byId("trade-msg"),
       position: byId("trade-position"), account: byId("trade-account"), orders: byId("trade-orders"),
       trades: byId("trade-trades"), note: byId("trade-note"), reset: byId("trade-reset"),
+      qtyLabel: byId("trade-qty-label"), leverageRow: byId("trade-leverage-row"), leverage: byId("trade-leverage"),
     };
     let state = null;
     let timer = null;
     let polling = false;
     let submitting = false;
     let pollError = false;   // 当前提示来自轮询失败: 下一次轮询成功就清掉, 下单结果的提示则保留
+    let formMode = "";       // 下单表单当前按哪种账户布置(换了才重设数量默认值与杠杆选项)
 
     const collapsed = () => els.panel.classList.contains("collapsed");
     const orderType = () => (els.type.value === "limit" ? "limit" : "market");
     const decimals = () => (state && state.quote ? state.quote.priceDecs : 0);
     const price = (value) => FlowDataRef.formatPrice(value, decimals());
+    const isCrypto = () => !!state && state.mode === "crypto";
+    // 金额: 期货按元取整, 加密按 USDT 两位小数; 数量: 期货是手, 加密是币(按数量步长的位数)
+    const money = (value) => formatMoney(value, isCrypto() ? 2 : 0);
+    const signed = (value) => formatSigned(value, isCrypto() ? 2 : 0);
+    const amount = (value) => (isCrypto() && value != null
+      ? FlowDataRef.formatPrice(value, state.quote ? state.quote.qtyDecs : 4) : String(value));
+    const unit = () => (isCrypto() ? (state.quote && state.quote.unit) || "" : "手");
 
     function setCollapsed(value) {
       try {
@@ -172,15 +184,55 @@
 
     function renderQuote() {
       const quote = state.quote;
-      const status = quote ? (quote.open ? "交易中" : `休市 · ${quote.reason}`) : "行情未就绪";
+      const open = isCrypto() ? "24 小时交易" : "交易中";
+      const closed = isCrypto() ? "暂停" : "休市";
+      const status = quote ? (quote.open ? open : `${closed} · ${quote.reason}`) : "行情未就绪";
       els.contract.textContent = `${state.contract || state.symbol} · ${status}`;
       els.contract.title = quote ? `${quote.name}  报价时间 ${quote.datetime || "—"}` : "";
       els.contract.classList.toggle("closed", !(quote && quote.open));
       els.ask.textContent = price(quote && quote.ask);
-      els.askVol.textContent = quote && quote.askVolume != null ? String(quote.askVolume) : "";
+      els.askVol.textContent = quote && quote.askVolume != null ? amount(quote.askVolume) : "";
       els.bid.textContent = price(quote && quote.bid);
-      els.bidVol.textContent = quote && quote.bidVolume != null ? String(quote.bidVolume) : "";
+      els.bidVol.textContent = quote && quote.bidVolume != null ? amount(quote.bidVolume) : "";
       if (quote && quote.priceTick) els.price.step = String(quote.priceTick);
+      renderForm();
+    }
+
+    // 下单表单跟着账户类型换: 期货是整数手; 加密是币(步长、最小量来自合约), 外加杠杆选择
+    function renderForm() {
+      const quote = state.quote;
+      const mode = isCrypto() ? `crypto:${state.symbol}` : "futures";
+      els.panel.classList.toggle("crypto", isCrypto());
+      // 多所汇总这类不能交易的代码没有报价: 不显示单位与杠杆
+      if (els.qtyLabel) els.qtyLabel.textContent = isCrypto() ? (unit() ? `数量(${unit()})` : "数量") : "手数";
+      if (els.leverageRow) els.leverageRow.hidden = !(isCrypto() && quote);
+      if (isCrypto() && quote) {
+        els.qty.step = String(quote.qtyStep);
+        els.qty.min = String(quote.minQty);
+        els.qty.max = "";
+      } else if (!isCrypto()) {
+        els.qty.step = "1";
+        els.qty.min = "1";
+        els.qty.max = "500";
+      }
+      if (mode !== formMode && (!isCrypto() || quote)) {
+        formMode = mode;
+        els.qty.value = isCrypto() ? String(quote.minQty) : "1";
+        if (isCrypto() && els.leverage) {
+          els.leverage.textContent = "";
+          const choices = LEVERAGES.filter((value) => value <= (quote.maxLeverage || 125));
+          if (!choices.includes(state.leverage)) choices.push(state.leverage);
+          for (const value of choices.sort((a, b) => a - b)) {
+            const option = root.document.createElement("option");
+            option.value = String(value);
+            option.textContent = `${value}x`;
+            els.leverage.appendChild(option);
+          }
+        }
+      }
+      if (isCrypto() && els.leverage && root.document.activeElement !== els.leverage) {
+        els.leverage.value = String(state.leverage);
+      }
     }
 
     function renderButtons() {
@@ -201,16 +253,21 @@
     function renderPosition() {
       const position = (state.positions || []).find((item) => item.contract === state.contract);
       const rows = position ? [
-        ["方向", `${position.qty > 0 ? "多" : "空"} ${Math.abs(position.qty)} 手`, position.qty > 0 ? "up" : "down"],
+        ["方向", `${position.qty > 0 ? "多" : "空"} ${amount(Math.abs(position.qty))} ${unit()}`,
+         position.qty > 0 ? "up" : "down"],
         ["均价", formatMoney(position.avgPrice, Math.max(decimals(), 2))],
-        ["最新", price(position.last)],
-        ["浮动盈亏", formatSigned(position.floatPnl), pnlClass(position.floatPnl)],
-        ["保证金", formatMoney(position.margin)],
+        [isCrypto() ? "标记价" : "最新", price(position.last)],
+        ["浮动盈亏", signed(position.floatPnl), pnlClass(position.floatPnl)],
+        ["保证金", money(position.margin)],
       ] : [["当前合约", "无持仓"]];
+      if (position && isCrypto()) {
+        rows.push(["杠杆", `${position.leverage}x 全仓`]);
+        rows.push(["强平价(估)", position.liqPrice != null ? price(position.liqPrice) : "—"]);
+      }
       // 其它合约的持仓(比如换月前的旧合约)也要看得见, 不然会忘了平
       for (const item of state.positions || []) {
         if (item.contract === state.contract) continue;
-        rows.push([item.contract, `${item.qty > 0 ? "多" : "空"}${Math.abs(item.qty)} ${formatSigned(item.floatPnl)}`,
+        rows.push([item.contract, `${item.qty > 0 ? "多" : "空"}${amount(Math.abs(item.qty))} ${signed(item.floatPnl)}`,
                    pnlClass(item.floatPnl)]);
       }
       grid(els.position, rows);
@@ -218,15 +275,19 @@
 
     function renderAccount() {
       const account = state.account;
-      grid(els.account, [
-        ["权益", formatMoney(account.equity)],
-        ["可用", formatMoney(account.available), account.available < 0 ? "down" : ""],
-        ["保证金", formatMoney(account.margin)],
-        ["浮动盈亏", formatSigned(account.floatPnl), pnlClass(account.floatPnl)],
-        ["平仓盈亏", formatSigned(account.realizedPnl), pnlClass(account.realizedPnl)],
+      const rows = [
+        ["权益", money(account.equity)],
+        ["可用", money(account.available), account.available < 0 ? "down" : ""],
+        ["保证金", money(account.margin)],
+        ["浮动盈亏", signed(account.floatPnl), pnlClass(account.floatPnl)],
+        ["平仓盈亏", signed(account.realizedPnl), pnlClass(account.realizedPnl)],
         ["手续费", formatMoney(account.fees, 2)],
-      ]);
-      els.account.title = `初始资金 ${formatMoney(account.initialCash)}；保证金按 ${Math.round(account.marginRate * 100)}% 估算`;
+      ];
+      if (isCrypto()) rows.push(["资金费", signed(account.funding), pnlClass(account.funding)]);
+      grid(els.account, rows);
+      els.account.title = isCrypto()
+        ? `初始资金 ${money(account.initialCash)} USDT；全仓，保证金 = 名义金额 / 杠杆`
+        : `初始资金 ${formatMoney(account.initialCash)}；保证金按 ${Math.round(account.marginRate * 100)}% 估算`;
     }
 
     function renderOrders() {
@@ -268,7 +329,7 @@
         text.textContent = `${trade.side === "buy" ? "买" : "卖"} ${trade.qty} @${FlowDataRef.formatPrice(trade.price, decimals())}`;
         const result = root.document.createElement("span");
         result.className = trade.close ? pnlClass(trade.pnl) : "trade-dim";
-        result.textContent = trade.close ? formatSigned(trade.pnl) : "开";
+        result.textContent = trade.close ? signed(trade.pnl) : "开";
         item.title = `${trade.contract}  ${trade.at}  开 ${trade.open} 平 ${trade.close}  手续费 ${formatMoney(trade.fee, 2)}  成交后持仓 ${trade.position}`;
         item.append(time, text, result);
         els.trades.appendChild(item);
@@ -278,6 +339,19 @@
 
     function renderNote() {
       const fee = state.fee;
+      if (isCrypto()) {
+        const quote = state.quote || {};
+        let text = `手续费: 挂单 ${(fee.maker * 100).toFixed(3)}% 吃单 ${(fee.taker * 100).toFixed(3)}%`;
+        if (quote.fundingRate != null) {
+          const next = quote.nextFundingTime
+            ? new Date(quote.nextFundingTime).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "—";
+          text += ` · 资金费率 ${(quote.fundingRate * 100).toFixed(4)}%（${next} 结算）`;
+        }
+        els.note.textContent = text;
+        els.note.title = "模拟成交: 市价单按五档盘口逐档吃到够量, 按均价成交; 限价单挂单后要价格穿过限价才按限价成交(挂单费率)。" +
+          "全仓, 权益低于维持保证金(名义金额 0.5%)按标记价强平; 到点按资金费率结算。看不到排队, 结果只作参考。";
+        return;
+      }
       let feeText = "手续费: 未找到费率, 按 0 计";
       if (fee) {
         feeText = fee.mode === "ratio"
@@ -326,8 +400,8 @@
 
     function submit(side) {
       const qty = Number(els.qty.value);
-      if (!Number.isInteger(qty) || qty < 1) {
-        showMessage("手数要是正整数", "error");
+      if (isCrypto() ? !(qty > 0) : !Number.isInteger(qty) || qty < 1) {
+        showMessage(isCrypto() ? "数量要是正数" : "手数要是正整数", "error");
         return;
       }
       const body = { symbol: options.getSymbol(), side, qty, type: orderType(), clientId: newClientId() };
@@ -352,22 +426,32 @@
     }
 
     function reset() {
+      const crypto = isCrypto();
       const current = state ? state.account.initialCash : 1000000;
-      const answer = root.prompt("重置模拟账户: 清空全部持仓、委托与成交。\n初始资金(元):", String(current));
+      const answer = root.prompt(`重置${crypto ? "加密" : "期货"}模拟账户: 清空全部持仓、委托与成交。\n` +
+                                 `初始资金(${crypto ? "USDT" : "元"}):`, String(current));
       if (answer == null) return;
       const cash = Number(String(answer).replace(/,/g, ""));
       if (!(cash > 0)) {
         showMessage("初始资金要是正数", "error");
         return;
       }
-      send(`/api/paper/reset?cash=${encodeURIComponent(cash)}`, { method: "POST" },
-           () => `账户已重置, 初始资金 ${formatMoney(cash)}`);
+      // 带上合约代码: 服务端据此决定重置哪一个账户
+      send(`/api/paper/reset?cash=${encodeURIComponent(cash)}&symbol=${encodeURIComponent(options.getSymbol())}`,
+           { method: "POST" }, () => `账户已重置, 初始资金 ${formatMoney(cash)}${crypto ? " USDT" : ""}`);
+    }
+
+    function changeLeverage() {
+      const value = Number(els.leverage.value);
+      send(`/api/paper/leverage?symbol=${encodeURIComponent(options.getSymbol())}&leverage=${value}`,
+           { method: "POST" }, () => `杠杆已改为 ${value}x`);
     }
 
     els.buy.addEventListener("click", () => submit("buy"));
     els.sell.addEventListener("click", () => submit("sell"));
     els.flatten.addEventListener("click", flatten);
     els.reset.addEventListener("click", reset);
+    if (els.leverage) els.leverage.addEventListener("change", changeLeverage);
     els.type.addEventListener("change", () => {
       // 切到限价时用最新价预填, 省得从空白开始敲
       if (orderType() === "limit" && !els.price.value && state && state.quote && state.quote.last != null) {

@@ -1,8 +1,10 @@
 """离线交互验收：python tests/preview_app.py [--duration 300]。
 
-仅生成模拟行情，使用临时 CSV；不连接 TqSdk，不读取或改写真实历史。
+仅生成模拟行情，使用临时 CSV；不连接 TqSdk 与交易所，不读取或改写真实历史。
+加密永续用 ?symbol=BINANCE.BTCUSDT.P / OKX.BTC-USDT-SWAP / AGG.BTC 打开（模拟逐笔成交，回填最近一天）。
 """
 import argparse
+import json
 import math
 import os
 from pathlib import Path
@@ -19,8 +21,13 @@ import pandas as pd
 import uvicorn
 
 import app as server
+import binance_feed
 import catalog
+import crypto_aggregate
+import crypto_backfill
+import crypto_feed
 import ingest
+import okx_feed
 import paper
 from backup import BackupScheduler
 from indicator import tick_bar_start
@@ -145,6 +152,135 @@ def kline_rows(ticks, seconds=30):
     return rows.reset_index()
 
 
+SIM_STEP_MS = 2000      # 模拟成交: 每 2 秒一笔, 编号 = 时间 / 2 秒, 所以任何一段时间的成交都能当场算出来
+
+
+def sim_trade(k: int, base: float, seed: int):
+    """第 k 笔模拟成交: (编号, 价, 量, 毫秒, 是否主动卖)。推送与回填用同一个函数, 两边严丝合缝。"""
+    price = round(base + 300 * math.sin(k / 900) + 40 * math.sin(k / 37 + seed), 1)
+    return k, price, round(0.001 * (1 + (k * 7 + seed) % 50), 3), k * SIM_STEP_MS, (k * 3 + seed) % 5 >= 3
+
+
+def sim_frame(start: int, end: int, base: float, seed: int) -> pd.DataFrame:
+    rows = [sim_trade(k, base, seed) for k in range(-(-start // SIM_STEP_MS), -(-end // SIM_STEP_MS))]
+    return pd.DataFrame(rows, columns=["id", "price", "qty", "t", "sell"])
+
+
+class SimChannel:
+    """离线预览的推送通道(接口同 crypto_feed.Channel 的 spec): topic 写成 "种类:合约"。"""
+
+    name = "sim"
+    ping = None
+    ping_sec = 0.0
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def topic(self, kind, inst_id):
+        return f"{kind}:{inst_id}" if kind in ("trade", "ticker", "book", "mark") else None
+
+    def url(self, topics):
+        return f"sim://{self.adapter.venue}?{','.join(sorted(topics))}"
+
+    def subscribe_messages(self, topics):
+        return []
+
+    def change_messages(self, current, wanted):
+        return [json.dumps({"topics": sorted(wanted)})]
+
+    def parse(self, raw):
+        return [tuple(event) for event in json.loads(raw)]
+
+
+class SimSocket:
+    """按真实时间吐出模拟成交; 每 0.5 秒再给一次 24 小时行情、五档盘口与标记价格。"""
+
+    def __init__(self, adapter, url):
+        self.adapter = adapter
+        self.topics = set(url.split("?", 1)[1].split(",")) if "?" in url else set()
+        self.next_k = int(time.time() * 1000) // SIM_STEP_MS
+        self.next_quote = 0.0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def send(self, message):
+        self.topics = set(json.loads(message)["topics"])
+
+    def recv(self, timeout=None):
+        deadline = time.time() + (timeout or 0)
+        while True:
+            events = []
+            if self.next_k * SIM_STEP_MS <= time.time() * 1000:
+                for inst_id, (symbol, base, seed) in self.adapter.sim.items():
+                    if f"trade:{inst_id}" in self.topics:
+                        events.append(["trade", symbol, *sim_trade(self.next_k, base, seed)])
+                self.next_k += 1
+            elif time.time() >= self.next_quote:
+                self.next_quote = time.time() + 0.5
+                events = self._quotes()
+            if events:
+                return json.dumps(events)
+            if time.time() >= deadline:
+                raise TimeoutError
+            time.sleep(0.05)
+
+    def _quotes(self):
+        events = []
+        k = int(time.time() * 1000) // SIM_STEP_MS
+        for inst_id, (symbol, base, seed) in self.adapter.sim.items():
+            price = sim_trade(k, base, seed)[1]
+            opened = sim_trade(k - 43200, base, seed)[1]
+            if f"ticker:{inst_id}" in self.topics:
+                events.append(["ticker", symbol, {"last": price, "open": opened, "high": price + 300,
+                                                  "low": price - 300, "volume": 1100.0, "amount": 1100.0 * price,
+                                                  "changePct": (price - opened) / opened * 100}])
+            if f"book:{inst_id}" in self.topics:
+                events.append(["book", symbol, {"bids": [[round(price - 0.1 * i, 1), 0.5 + i] for i in range(5)],
+                                                "asks": [[round(price + 0.1 * (i + 1), 1), 0.5 + i] for i in range(5)],
+                                                "time": int(time.time() * 1000)}])
+            if f"mark:{inst_id}" in self.topics:
+                nxt = (int(time.time() * 1000) // 28_800_000 + 1) * 28_800_000
+                events.append(["mark", symbol, {"markPrice": price, "fundingRate": 0.0001, "nextFundingTime": nxt}])
+        return events
+
+
+def preview_adapter(cls, sim):
+    """真实适配器换成模拟数据: 合约参数用内置的, 推送、归档包、REST 都走模拟成交。"""
+
+    class Adapter(cls):
+        def __init__(self):
+            super().__init__()
+            self.sim = sim                      # 原生代码 -> (合约代码, 基准价, 种子)
+            self.channels = [SimChannel(self)]
+
+        def load_instruments(self, http):
+            raise crypto_backfill.FetchError("离线预览只用内置合约")
+
+        def archive_trades(self, http, instrument, day):
+            raise crypto_backfill.NotPublished("离线预览没有归档包")
+
+        def rest_trades(self, http, instrument, start, end, after_id, before_id):
+            _, base, seed = self.sim[instrument.inst_id]
+            return sim_frame(start, end, base, seed)
+
+    return Adapter()
+
+
+def preview_crypto():
+    """离线预览的加密行情: 币安 BTC、OKX BTC 两路模拟成交, 回填最近一天, 外加多所汇总。"""
+    adapters = [preview_adapter(binance_feed.BinanceAdapter, {"BTCUSDT": ("BINANCE.BTCUSDT.P", 85000.0, 1)}),
+                preview_adapter(okx_feed.OkxAdapter, {"BTC-USDT-SWAP": ("OKX.BTC-USDT-SWAP", 85003.0, 2)})]
+    venues = {adapter.venue: adapter for adapter in adapters}
+    manager = crypto_feed.CryptoManager(adapters, backfiller=crypto_backfill.Backfiller(days=1),
+                                        connect=lambda url: SimSocket(venues[url[6:].split("?")[0]], url))
+    manager.aggregates = crypto_aggregate.AggregateBook(manager)
+    return manager
+
+
 class PreviewManager(ingest.FeedManager):
     def __init__(self):
         super().__init__()
@@ -208,11 +344,12 @@ if __name__ == "__main__":
         ingest.DATA_DIR = os.path.join(directory, "data")
         os.makedirs(ingest.DATA_DIR)
         server.manager = PreviewManager()
+        server.crypto = preview_crypto()
         # 模拟数据的快照必须留在临时目录: 混进真实 backups/ 会被当成最新一份, 推迟真实备份。
         server.backups = BackupScheduler(lambda: ingest.DATA_DIR,
                                          lambda: os.path.join(directory, "backups"))
         # 预置几个自选, 打开页面就能看到面板(写在临时数据目录里, 不碰真实自选)。
-        for symbol in ("KQ.m@SHFE.fu", "KQ.m@DCE.i", "KQ.m@CZCE.TA"):
+        for symbol in ("KQ.m@SHFE.fu", "KQ.m@DCE.i", "KQ.m@CZCE.TA", "BINANCE.BTCUSDT.P", "AGG.BTC"):
             server.favorites.add(symbol)
         runner = uvicorn.Server(uvicorn.Config(server.app, host="127.0.0.1", port=8765, log_level="warning"))
         if args.duration:

@@ -184,6 +184,11 @@
 
     function ensureMonths(product) {
       const key = productKey(product);
+      // 加密永续没有月份: 二级只有永续本身(monthOptions 的第一项), 不必去问服务端
+      if (product.crypto) {
+        if (!monthState.has(key)) monthState.set(key, { status: "ready", months: [], error: null, at: now() });
+        return;
+      }
       const known = monthState.get(key);
       if (known) {
         // 取失败不是永久状态: 隔一会儿(下次悬停/打开/搜索命中它时)再试一次
@@ -238,10 +243,13 @@
         name.title = `${product.contSymbol}${product.mainSymbol ? " → " + product.mainSymbol : ""}`;
         const qty = doc.createElement("span");
         qty.className = "picker-qty";
-        qty.textContent = flow.formatOpenInterest(product.openInterest);
+        // 加密永续的 24 小时成交额要等交易所合约列表到了才有, 没有就空着(不显示 0)
+        qty.textContent = product.crypto && !product.openInterest ? "" : flow.formatOpenInterest(product.openInterest);
+        // 期货这一栏是主力合约的昨日持仓量, 加密永续是 24 小时成交额(USDT)
+        qty.title = product.crypto ? "24 小时成交额（USDT）" : "主力合约昨日持仓量";
         item.append(name, qty);
-        // 品种行上的 ☆ 收藏的是它的主力(主连), 与二级第一项是同一个合约
-        appendStar(item, product.contSymbol, "该品种主力", productStars);
+        // 品种行上的 ☆ 收藏的是它的主力(主连), 与二级第一项是同一个合约; 加密永续就是它本身
+        appendStar(item, product.contSymbol, product.crypto ? "" : "该品种主力", productStars);
         item.addEventListener("mouseenter", () => selectProduct(index, false));
         item.addEventListener("click", () => selectProduct(index, true));
         item.addEventListener("dblclick", () => pick(product.contSymbol));   // 双击 = 直接主力
@@ -277,7 +285,7 @@
       if (!product) return;
       const state = monthState.get(productKey(product));
       const head = node("picker-months-head");
-      head.textContent = `月份 · ${product.name}` +
+      head.textContent = `${product.crypto ? "永续" : "月份"} · ${product.name}` +
         (state && state.status === "loading" ? "（加载中…）" : "");
       el.months.append(head);
       core.monthOptions(product, (state && state.months) || []).forEach((option, index) => {
@@ -285,10 +293,11 @@
         item.setAttribute("id", `picker-month-${index}`);
         const name = doc.createElement("span");
         name.className = "picker-name";
-        name.textContent = (option.isMain ? "★ " : "") + flow.monthLabel(option);
+        name.textContent = product.crypto ? `${product.name} · ${product.exchangeName}`
+          : (option.isMain ? "★ " : "") + flow.monthLabel(option);
         name.title = option.symbol;
         item.append(name);
-        appendStar(item, option.symbol, option.isMain ? "该品种主力" : "", monthStars);
+        appendStar(item, option.symbol, option.isMain && !product.crypto ? "该品种主力" : "", monthStars);
         item.addEventListener("mouseenter", () => {
           level = "month";
           monthIndex = index;
@@ -318,6 +327,7 @@
         toggleFavorite(symbol);
       });
       star.addEventListener("dblclick", (event) => event.stopPropagation());
+      star.starExtra = extra;          // 重画时沿用这一行自己的提示
       paintStar(star, symbol, extra);
       item.append(star);
       const nodes = registry.get(symbol) || [];
@@ -348,11 +358,10 @@
 
     // 宿主页面改了自选(行内点击、自选面板 ×)后调这个, 就地重画所有 ☆
     function refreshFavorites() {
-      for (const [symbol, nodes] of productStars) {
-        nodes.forEach((star) => paintStar(star, symbol, "该品种主力"));
-      }
-      for (const [symbol, nodes] of monthStars) {
-        nodes.forEach((star) => paintStar(star, symbol));
+      for (const registry of [productStars, monthStars]) {
+        for (const [symbol, nodes] of registry) {
+          nodes.forEach((star) => paintStar(star, symbol, star.starExtra));
+        }
       }
     }
 

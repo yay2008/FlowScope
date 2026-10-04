@@ -350,6 +350,7 @@ body { display: flex; flex-direction: column; }
   font: inherit;
 }
 #trade-qty { width: 52px; }
+#trade.crypto #trade-qty { width: 84px; }   /* 加密合约的数量是小数的币 */
 #trade-price { width: 96px; }
 
 .trade-actions { display: flex; gap: 6px; }

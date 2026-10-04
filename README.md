@@ -1,6 +1,6 @@
 # FlowScope
 
-FlowScope 是一个基于 TqSdk 的期货行情监控页面（10s、30s 两张图左右并排），提供主动买卖量、Volume Suite、Delta、CVD、LSMA×CRVOL 与 WaveTrend 等指标。
+FlowScope 是一个基于 TqSdk 的期货行情监控页面（10s、30s 两张图左右并排），提供主动买卖量、Volume Suite、Delta、CVD、LSMA×CRVOL 与 WaveTrend 等指标。另支持币安、OKX 的 U 本位永续与两家的多所汇总，含历史回填与模拟交易（见「加密永续」一节）。
 
 ## 启动
 
@@ -79,6 +79,34 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（10s、30s 两张�
 
 同一数据目录请只运行一个服务进程，使用默认单 worker 启动方式。
 
+## 加密永续（币安 / OKX / 多所汇总）
+
+除了 TqSdk 期货，页面还能看 U 本位永续合约：币安 `BINANCE.BTCUSDT.P`（沿用 TradingView 的写法）、OKX `OKX.BTC-USDT-SWAP`（OKX 原生代码），以及两家相加的多所汇总 `AGG.BTC`。合约选择器里期货分组之后是「币安永续」「OKX永续」「多所汇总」三组（按 24 小时成交额排序，二级只有永续本身），☆ 可以加自选；也可以直接写在 URL 的 `?symbol=` 里。行情走交易所的公开接口，**不需要账号或 API key**。
+
+- **结构**：每个交易所的每路 WebSocket 一个线程，只管连接、订阅增减与解析（`crypto_feed.Channel`，各交易所的细节在 `binance_feed.py` / `okx_feed.py`）；一个管理线程（`crypto_feed.CryptoManager`）独占 bar 窗口与历史文件、重算快照、安排回填。和 TqSdk 采集各用各的连接与线程，哪边断线都不影响另一边，也不占 TqSdk 的 32 个订阅名额。增减合约是在已有连接上 SUBSCRIBE / UNSUBSCRIBE，不断线。
+- **主动买卖量是交易所给的**：币安 aggTrade 的 `m`、OKX `trades-all` 的 `side` 直接标明主动方，不用估算，`未知` 恒为 0，新旧两套判向列同值。上面「与 TradingView 的差异」说的快照边界问题在这里不存在。数量一律折成币（OKX 按张计，乘合约面值），所以两家的量可以直接相加。
+- **K 线自己合成**：交易所都没有 10s/30s K 线，开高低收量由逐笔成交合成，按成交时间切 `[起点, 起点+周期)`。成交编号连续而隔了几根 bar，说明那段时间确实没成交，补零量 bar（价格沿用前收）。开高低收量另存在 `data/{代码}_{10,30}s_ohlc.csv`（期货的 K 线由服务端下发，这边只能自己存），买卖量用与期货相同的历史文件。
+- **覆盖判定与「洞」**：两家的成交编号都逐笔连续（实测过），漏没漏成交能精确判断。本次运行收到的第一笔之前、以及断线重连后编号接不上的地方各算一个「洞」，洞两端所在的 bar 记「部分」，中间整根的 bar 不补。
+- **历史回填**（`crypto_backfill.py`）：洞由回填线程补上（每个交易所一个线程，互不排队）。整个归档日都在洞里且交易所已经发布了归档包，就下载归档包（币安 data.binance.vision 按 UTC 切日、带 SHA256 校验；OKX 按北京时间切日，读回后检查编号连续）；其余部分（最近一两天、归档包还没发布的那天、洞两端的零头）用 REST 按整点小时一段段取。由新到旧处理，最近的先补完；补完一段就把其中整根的 bar（开高低收量、主动买卖量、每种拆分粒度）写盘，洞两端 bar 缺的那几笔最后插回内存窗口，这两根也变成「完整」。第一次启动补最近 7 天（`.env` 里 `CRYPTO_BACKFILL_DAYS` 可改），之后每次启动只补其中还不完整的 bar；页面临时打开、没收进自选的合约只补 1 天。取不到的部分（REST 不通、归档包还没发布）15 分钟后再试，第二天归档包发布后自然补齐。
+- **REST 的速度与可达性**：币安 REST 每次 1000 笔，按响应头里的权重留余量地等；部分地区返回 451（开发服务器就是），这时只用归档包，最近一天要等第二天归档包发布才补齐。OKX 的 `history-trades` 每次只有 100 笔、限频 20 次/2 秒，补一天要 10~20 分钟，所以整天的都尽量用归档包。
+- **行情地址**：币安必须走 `wss://fstream.binance.com/market/...`（逐笔成交、24 小时行情、标记价格与资金费率）和 `/public/...`（五档盘口）。2026-10 实测旧路径 `/ws/`、`/stream` 能握手却收不到任何消息。OKX 的逐笔成交要走 business 通道的 `trades-all`（public 通道的 `trades` 会把同一笔吃单合并），连接 30 秒没数据会被断开，空闲时发 `ping` 保活。连接 60 秒没有任何消息会主动重连，失败按 1、2、4…60 秒退避。
+- **常驻采集**：默认币安与 OKX 的 BTC 永续两个主周期一直采集、落盘；自选里的加密合约（多所汇总展开成它的各交易所合约）接在后面，最多 12 个。交易所的合约列表是启动后才从 REST 取到的（取不到就用内置的 BTC/ETH），列表一到，自选里的其它合约就开始采。页面临时打开的合约在最后一次请求后保留 10 分钟。
+- **自选面板**：加密合约的报价来自 24 小时行情推送（涨跌幅是 24 小时滚动的，不是相对昨结算），第二行写交易所名；TqSdk 不可用时加密合约照样有报价。
+- **多所汇总**（`crypto_aggregate.py`）：`AGG.BTC` = 币安 BTCUSDT + OKX BTC-USDT。开高低收取币安的，成交量与主动买卖量相加；一根 bar 只有两家都完整才算完整，任何一家缺这根就整根缺，不拿半边数据冒充汇总。自己的历史文件只存两家都完整的 bar，每 30 秒用两家的历史文件补一次，所以回填补上某一家之后汇总也跟着补齐。选择器里只列两家都有 USDT 永续的币。
+- **K 线口径**：拆分粒度用 1 秒小 bar 现算；回填时每种拆分粒度都一起写盘。
+- **暂不支持**：足迹图（显示为空，BTC 最小价位太细，要先做价格分档）。
+
+### 加密模拟交易
+
+加密合约在右侧面板下单走另一个账户（`paper_crypto.py`，存在 `data/paper/crypto.json`），和期货账户分开记账：币种（USDT 对人民币）、数量（小数的币对整数手）、杠杆、24 小时交易、资金费都不一样。
+
+- **数量**以币计（OKX 也折成币），必须是数量步长的整数倍、不少于最小下单量，名义金额不少于最小下单金额（来自交易所合约列表）。
+- **市价单**按五档盘口逐档吃到够量，按成交均价成交；五档都吃完还不够就拒单。**限价单**下单时够得着、且限价以内的档位量够就立即按均价成交（吃单费率）；否则挂单，之后最新价或对手一档**穿过**限价才按限价成交（挂单费率），碰到不算。
+- **杠杆**每个合约一个（默认 10 倍，面板上选），全仓；初始保证金 = 名义金额 / 杠杆。开仓（含反手的开仓部分）要求成交后权益够付全部持仓的初始保证金，只减仓不查；降杠杆后保证金不够会被拒。
+- **手续费**按交易所最低一档：挂单 0.02%、吃单 0.05%。**资金费**到交易所公布的结算时刻，按结算前最后看到的资金费率与标记价格结算（费率为正时多头付费）；服务没开着时错过的结算不补。
+- **强平**：权益低于全部持仓的维持保证金（名义金额 × 0.5%）时，按标记价格平掉全部持仓、撤掉挂单。面板上的「强平价(估)」只按当前合约估算。浮动盈亏、保证金都按标记价格算。
+- 多所汇总不能下单（面板提示切到单个交易所的合约）。委托编号以 `C` 开头，撤单据此分到加密账户；「重置账户」带上当前合约代码，重置的是当前合约所属的那个账户。
+
 ## 模拟交易
 
 页面右侧的「模拟交易」面板可以在当前合约上下单，账户、持仓、委托和成交都记在服务端的 `data/paper/account.json`（整个账户一个文件，临时文件 + `os.replace` 原子替换，随 `data/` 快照一起备份），所有浏览器共用一份。**不走 TqSdk 的交易接口**：TqSim 的账户只在内存里，回收订阅、断线重连都会重建 TqApi、账户随之清零；快期模拟要在采集连接上下单，一个出错的调用就可能拖停整条行情连接。所以 `paper.py` 只**读**报价、自己撮合。
@@ -110,13 +138,13 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（10s、30s 两张�
 
 - `GET /api/history?symbol=...&ltf=0&tf=30`：返回最近 800 根 bar 快照，包含 `source`（`tick` 或 `kline`）、`ltf`、`tf`、`revision`、`cvdBase` 和各 bar 的 `coverage`。`tf` 为主图周期秒数（10 或 30，非法值回落 30）；`ltf=0` 为 tick 口径，正数为 K 线口径的小周期秒数，非法或不能整除 `tf` 时回落为 0。返回的 `cfg.ltfOptions` 已是该周期下的合法子集。
 - `GET /api/footprint?symbol=...&tf=30`：按需返回足迹快照，足迹跟随主图周期，包含 `revision`、`tickSize`（未知时为 null）和各 bar 的 `coverage`。
-- `GET /api/status`：返回行情采集线程状态、最近错误和已订阅合约（形如 `KQ.m@SHFE.fu@30s`，同一合约的不同周期分别列出）。`collecting` 是常驻采集集合，`collectSkipped` 是超出名额、只在页面打开时才采集的部分；`backup` 是备份状态（`dir` 目录、`count` 份数、`latest` 最新一份、`error` 最近一次失败原因，正常为 `null`）。另有诊断字段：`jobQueue`（排队中的一次性查询数）、`busySec`（当前 SDK 调用已耗时，正常是 `null`）、`quietSec`（距上次收到行情流多久）、`lastProbeSec`/`probeError`（最近一次连接自检的间隔与失败原因）。
+- `GET /api/status`：返回行情采集线程状态、最近错误和已订阅合约（形如 `KQ.m@SHFE.fu@30s`，同一合约的不同周期分别列出）。`collecting` 是常驻采集集合，`collectSkipped` 是超出名额、只在页面打开时才采集的部分；`backup` 是备份状态（`dir` 目录、`count` 份数、`latest` 最新一份、`error` 最近一次失败原因，正常为 `null`）。另有诊断字段：`jobQueue`（排队中的一次性查询数）、`busySec`（当前 SDK 调用已耗时，正常是 `null`）、`quietSec`（距上次收到行情流多久）、`lastProbeSec`/`probeError`（最近一次连接自检的间隔与失败原因）。以上都是 TqSdk 采集；加密行情的状态单独放在 `crypto` 里：`status`/`lastError`、`feeds`、`collecting`/`collectSkipped`（常驻采集）、`aggregates`、`channels`（每路 WebSocket 的 `status`/`connects`/`topics`/`quietSec`）、`gaps`（本次运行各合约成交编号接不上的次数）、`holes`（还没补完的洞）、`backfill`（各交易所正在做的回填、排队数、补完的段数、`restBlocked` REST 被拒的原因）。
 - `GET /api/favorites` / `POST /api/favorites?symbol=...` / `DELETE /api/favorites?symbol=...`：自选列表的读取、收藏（幂等，追加到末尾、不改变已有顺序）与移出，都返回 `{"symbols": [...], "max": 40}`。代码走与订阅相同的校验，非法代码或超过 40 个返回 400；新收藏的代码还会先到合约服务确认存在，查不到返回 400「合约 … 不存在」（原因见《订阅失败会自愈》里的"不存在的代码"）。行情线程没连上时查不了，照常收藏，订阅时还有同样的检查兜底；移出不碰行情，是即时的。
 - `GET /api/watch?symbols=A,B,C&refresh=false`：自选面板用的轻量报价快照，每项含 `symbol`/`name`/`insClass`/`mainSymbol`/`lastPrice`/`basePrice`/`change`/`changePct`/`openInterest`/`volume`/`amount`/`priceDecs`/`expired`，取不到的字段是 `null`（NaN 不会是合法 JSON）。`openInterest`/`volume`/`amount` 都是**单边口径**的当日累计值，与菜单的「昨仓」同口径、可直接比较。只读报价对象、不订阅 K 线与 tick，1.5 秒 TTL 内多个页面的轮询只查一次；行情源不可用时返回 `source="unavailable"` 和空 `quotes`，不当作错误。
 - `GET /api/symbol?symbol=KQ.m@SHFE.fu`：顶栏只读展示位用的合约名，返回 `{"symbol", "label"}`。主连先解析出当前标的月份合约再取中文名（`KQ.m@SHFE.fu` → 「燃油2611」，随主力换月变化），月份合约直接取自身名称；查询走合约服务的静态接口（不订阅行情），名字取不到时 `label` 回退成合约代码，所以展示位永远不会空着或报错。代码走与订阅相同的校验，非法返回 400。
 - `GET /api/symbols?exchange=SHFE&product=fu&refresh=false`：合约选择器的数据源。不带参数时返回按交易所分组的全部主连品种（`exchangeId`/`exchangeName`/`productId`/`name`/`contSymbol`/`mainSymbol`/`openInterest`，组内按主力合约昨日持仓量降序）；带 `exchange`+`product` 时额外返回该品种的未下市月份合约（`symbol`/`name`/`openInterest`/`isMain`，同样按昨日持仓量降序）。`openInterest` 是交易所口径的**昨日持仓量**，只用于排序和下拉提示，不是实时值。`source` 为 `live` 或 `fallback`，`fallback` 表示行情源不可用（此时用内置常用品种、月份为空，`error`/`monthsError` 给出原因）；`refresh=true` 跳过缓存。查询全部是静态合约查询（不订阅行情）并在采集线程执行、带超时兜底，页面不会因为合约服务慢而卡住。
 - `GET /api/paper?symbol=...`：模拟交易面板的数据：`account`（`initialCash`/`cash`/`equity`/`floatPnl`/`margin`/`available`/`realizedPnl`/`fees`/`marginRate`）、`positions`、`orders`（全部挂单 + 最近 10 笔已结束的委托）、`trades`（最近 50 笔）、`contract`（主连解析成的标的月份合约）、`quote`（该合约盘口，含 `open`/`reason` 表示能否成交）、`contractTrades`（该合约的成交，供图表标记）、`fee`（该品种费率，查不到为 `null`）。第一次看某个代码时先到合约服务确认存在；查不到在 `error` 里说明，30 秒内不再重查。
-- `POST /api/paper/orders`，JSON `{symbol, side: "buy"|"sell", qty, type: "market"|"limit", price?, clientId?}`：下单，返回委托。市价单当场成交，否则 400 并说明原因；限价单能成交就成交，否则挂单。`DELETE /api/paper/orders/{id}` 撤单；`POST /api/paper/flatten?symbol=...` 按市价平掉该合约全部持仓；`POST /api/paper/reset?cash=1000000` 重置账户。
+- `POST /api/paper/orders`，JSON `{symbol, side: "buy"|"sell", qty, type: "market"|"limit", price?, clientId?}`：下单，返回委托。市价单当场成交，否则 400 并说明原因；限价单能成交就成交，否则挂单。`DELETE /api/paper/orders/{id}` 撤单；`POST /api/paper/flatten?symbol=...` 按市价平掉该合约全部持仓；`POST /api/paper/reset?cash=1000000` 重置账户（带 `&symbol=` 加密合约代码时重置的是加密账户，资金按 USDT）。加密合约另有 `POST /api/paper/leverage?symbol=...&leverage=20` 设杠杆；加密账户的 `GET /api/paper` 多出 `mode: "crypto"`、`leverage`、`fundings`，持仓带 `leverage`/`liqPrice`，账户带 `funding`，报价带五档 `bids`/`asks`、`markPrice`、`fundingRate`/`nextFundingTime` 与数量步长 `qtyStep`/`minQty`。
 - `WS /ws?symbol=...&ltf=0&tf=30&footprint=false`：先注册订阅，再发送 `snapshot` 完整快照，随后发送带版本号的 `bars` 批量增量，包含最新 bar 和历史修订。`footprint=true` 还会接收 `footprints` 或 `footprint_snapshot`；两种数据分别跟踪版本号。所有消息都带 `symbol`/`tf`（`bars` 另带 `ltf`），前端据此过滤，不同周期不会互相串消息。
 - 每次 WebSocket 重连都重新同步完整快照。慢客户端队列溢出时以 1013 关闭连接，前端自动重连补齐；15 秒无业务消息时发送包含行情源状态的 `ping`。
 
@@ -156,7 +184,7 @@ node --check static/chart-view.js
 .\.venv\Scripts\python.exe tests/preview_app.py --duration 300
 ```
 
-访问 `http://127.0.0.1:8765/`。模拟器也会制造 K 线与 tick 分批到达的短暂部分覆盖，用于检查图表恢复；300 秒后自动停止。
+访问 `http://127.0.0.1:8765/`。模拟器也会制造 K 线与 tick 分批到达的短暂部分覆盖，用于检查图表恢复；300 秒后自动停止。加密永续用 `?symbol=BINANCE.BTCUSDT.P`、`OKX.BTC-USDT-SWAP`、`AGG.BTC` 打开：两家都是模拟的逐笔成交（按时间确定性生成，推送与回填同一套数据，启动后回填最近一天），盘口、资金费率也是模拟的，同样不连交易所。
 
 ## 研究报告（docs/）
 

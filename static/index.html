@@ -106,12 +106,13 @@
         <span class="trade-dim">买一</span><span id="trade-bid">—</span><span id="trade-bid-vol" class="trade-dim"></span>
       </div>
       <div class="trade-form">
-        <label>手数<input id="trade-qty" type="number" min="1" max="500" step="1" value="1"></label>
+        <label><span id="trade-qty-label">手数</span><input id="trade-qty" type="number" min="1" max="500" step="1" value="1"></label>
         <label>类型<select id="trade-type">
           <option value="market" selected>市价</option>
           <option value="limit">限价</option>
         </select></label>
         <label id="trade-price-row" hidden>价格<input id="trade-price" type="number" min="0" step="any"></label>
+        <label id="trade-leverage-row" hidden title="加密合约每个合约一个杠杆(全仓); 降杠杆后保证金不够会被拒">杠杆<select id="trade-leverage"></select></label>
       </div>
       <div class="trade-actions">
         <button id="trade-buy" class="trade-buy" title="市价: 按卖一价整笔成交; 限价: 卖一不高于限价就立即成交, 否则挂单">买入</button>

@@ -496,15 +496,16 @@ class HistoryStore:
         self._offset += len(payload.encode("utf-8"))
         self._size = self._offset
 
-    def save_completed(self, bars):
+    def save_completed(self, bars, final=False):
         """把已走完的 bar 落盘; 只有数值或对照列真的变了才追加。
 
         核对通过的行写 ``complete``, 只有前置快照的估算行写 ``partial`` —— 两者靠
         source 列区分, 所以重启后估算量不会冒充已核对的量。
+        最后一根默认当作还没走完; ``final=True`` 表示整张表都已走完(加密行情的历史回填)。
         """
         if bars.empty:
             return
-        done = bars.iloc[:-1]
+        done = bars if final else bars.iloc[:-1]
         estimated = (done.coverage.eq(SOURCE_PARTIAL)
                      & (done.get("hasBaseline", False) | ~done.time.isin(self.estimates)))
         changed = False

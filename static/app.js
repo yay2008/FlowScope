@@ -29,6 +29,14 @@ let favorites = [];
 // (主连会解析成当前标的月份合约的中文名), 在页面末尾统一发起。
 $("symbol-name").title = symbol;
 
+// 加密合约(币安/OKX/多所汇总)的 tick 口径是交易所逐笔成交自带的主动方向, 不是 TqSdk 快照估算, 下拉框照实写。
+const CRYPTO_SYMBOL = /^(BINANCE|OKX|AGG)\./;
+if (CRYPTO_SYMBOL.test(symbol)) {
+  const tickOption = $("cvd-source").querySelector('option[value="tick"]');
+  if (tickOption) tickOption.textContent = "交易所逐笔主动方向";
+  $("cvd-source").title = "交易所逐笔主动方向：成交自带的主动买卖方，不用估算；TV K线口径：按小周期K线涨跌归类成交量。也影响Delta和买卖量。";
+}
+
 // ---------- 图表 ----------
 // 10s(左)、30s(右)两张图。后端按 (symbol, tf) 独立订阅与落盘, 每张图各自加载、各自连推送。
 
@@ -318,7 +326,8 @@ function renderWatch() {
     bottom.className = "watch-bottom";
     const label = document.createElement("span");
     label.className = "watch-code";
-    label.textContent = code.split("@").pop();
+    // 加密合约的代码太长, 这一栏写交易所(币安 / OKX / 多所汇总)
+    label.textContent = row.venue || code.split("@").pop();
     label.title = code;
     const price = document.createElement("span");
     price.textContent = FlowData.formatPrice(row.lastPrice, row.priceDecs);
@@ -326,6 +335,7 @@ function renderWatch() {
     const pct = row.changePct;
     change.className = "watch-chg " + FlowData.changeClass(pct);
     change.textContent = FlowData.formatChangePct(pct);
+    if (row.venue) change.title = "24 小时涨跌";
     bottom.append(label, price, change);
     item.append(top, bottom);
 
@@ -359,7 +369,8 @@ async function pollWatch() {
     const data = await fetchJson(`/api/watch?symbols=${encodeURIComponent(favorites.join(","))}`);
     if (data.source === "live") {
       watchRows = new Map((data.quotes || []).map((row) => [row.symbol, row]));
-      setWatchHint("");   // 上一次的失败提示到这里就该消失
+      // 上一次的失败提示到这里就该消失; 加密合约有报价而期货行情未就绪时, 只提示期货那部分
+      setWatchHint(data.error ? `期货行情未就绪（${data.error}）` : "");
     } else {
       setWatchHint("行情未就绪" + (data.error ? `（${data.error}）` : ""));
     }

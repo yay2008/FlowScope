@@ -312,24 +312,9 @@ class Feed:
                 continue
             if ltf == 0:
                 tick_bars = bars
-            store = self._store(ltf)
-            # 增量读: 文件被其它进程(离线脚本/另一次运行)追加过时补齐内存视图,
-            # 无变化时只是一次 stat, 不会重解析整个文件。
-            store.refresh()
-            bars = store.merge(bars)
-            store.save_completed(bars)
-            bars = store.with_cvd(bars)
-            recs = bars_to_records(bars.tail(SNAPSHOT_BARS))
-            snapshots[ltf] = {"symbol": self.symbol, "cfg": period_cfg(self.tf), "ltf": ltf,
-                              "tf": self.tf,
-                              "source": "tick" if ltf == 0 else "kline",
-                              "revision": revision, "cvdBase": store.base,
-                              "bars": recs}
-            old = {b["time"]: b for b in previous.get(ltf, {}).get("bars", [])}
-            changed = [bar for bar in recs if old.get(bar["time"]) != bar]
-            if changed:
-                messages.append({"type": "bars", "symbol": self.symbol, "ltf": ltf,
-                                 "tf": self.tf, "revision": revision, "bars": changed})
+            snapshots[ltf], message = self._publish(ltf, bars, previous, revision)
+            if message:
+                messages.append(message)
         fp = None
         if want_fp and tick_bars is not None:
             coverage = dict(zip(tick_bars.time, tick_bars.coverage))
@@ -356,6 +341,33 @@ class Feed:
                 self.ready.set()
         for message in messages:
             broadcast(message)
+
+    def cfg(self) -> dict:
+        """快照里下发前端的配置; 币安合约在此基础上补价格/成交量的显示位数。"""
+        return period_cfg(self.tf)
+
+    def _publish(self, ltf, bars, previous, revision):
+        """合并历史、落盘、算 CVD, 返回 (该粒度的快照, 有变化时的增量消息或 None)。"""
+        store = self._store(ltf)
+        # 增量读: 文件被其它进程(离线脚本/另一次运行)追加过时补齐内存视图,
+        # 无变化时只是一次 stat, 不会重解析整个文件。
+        store.refresh()
+        bars = store.merge(bars)
+        store.save_completed(bars)
+        bars = store.with_cvd(bars)
+        recs = bars_to_records(bars.tail(SNAPSHOT_BARS))
+        snapshot = {"symbol": self.symbol, "cfg": self.cfg(), "ltf": ltf,
+                    "tf": self.tf,
+                    "source": "tick" if ltf == 0 else "kline",
+                    "revision": revision, "cvdBase": store.base,
+                    "bars": recs}
+        old = {b["time"]: b for b in previous.get(ltf, {}).get("bars", [])}
+        changed = [bar for bar in recs if old.get(bar["time"]) != bar]
+        message = None
+        if changed:
+            message = {"type": "bars", "symbol": self.symbol, "ltf": ltf,
+                       "tf": self.tf, "revision": revision, "bars": changed}
+        return snapshot, message
 
 
 def _query_cache(api):

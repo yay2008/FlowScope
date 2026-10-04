@@ -855,25 +855,28 @@
       const quality = isFp ? fpBars.find((fp) => fp.time === b.time)?.coverage : b.coverage;
       const coverage = "覆盖:" + (({complete: "完整", partial: "部分", missing: "缺失", legacy: "旧历史"})[quality] || "缺失");
       const t = new Date(b.time * 1000).toISOString().slice(5, 19).replace("T", " ");
+      // 价格与成交量的显示位数由服务端按合约下发: 期货都是整数手, 币安 BTC 的量是小数(0.001 步长)
+      const px = (v) => fmt(v, cfg?.priceDigits ?? 0);
+      const vol = (v) => fmt(v, cfg?.volumeDigits ?? 0);
       const suiteVal =
         mode === "rvol" ? fmt(d.rvol[i], 2) :
         mode === "crvol" ? fmt(d.crv[i], 2) :
-        mode === "volume" ? fmt(b.volume) :
-        mode === "bsv" ? `${fmt(buyOf(b))}/${fmt(sellOf(b))}` :
-        mode === "delta" ? fmt(deltaOf(b)) : fmt(b.cvd);
+        mode === "volume" ? vol(b.volume) :
+        mode === "bsv" ? `${vol(buyOf(b))}/${vol(sellOf(b))}` :
+        mode === "delta" ? vol(deltaOf(b)) : vol(b.cvd);
       // 判向对照: 同一根 bar 同时给出新算法(买/卖/未知)与旧算法(买/卖)
       const fp = isFp ? fpBars.find((item) => item.time === b.time) : null;
       const unknown = fp ? fp.levels.reduce((sum, lv) => sum + (lv[3] || 0), 0) : (b.unknown ?? 0);
       // 叠加带只在"画面上真有带"且这根基线可取时进图例, 免得白占位置
       const band = bandShown() && derived.band && derived.band.up[i] != null
-        ? `  带:${fmt(derived.band.dn[i])}/${fmt(derived.band.mid[i])}/${fmt(derived.band.up[i])}` : "";
+        ? `  带:${px(derived.band.dn[i])}/${px(derived.band.mid[i])}/${px(derived.band.up[i])}` : "";
       // WaveTrend 叠加轴不显示刻度, 数值只能从这里读
       const wt = wtShown() && derived.wt.osc[i] != null
         ? `  WT:${fmt(derived.wt.osc[i], 1)}/${fmt(derived.wt.sig[i], 1)}` : "";
       const text =
-        `${t}  O:${fmt(b.open)} H:${fmt(b.high)} L:${fmt(b.low)} C:${fmt(b.close)}  ` +
-      `  ${mode.toUpperCase()}:${suiteVal}  Δ:${fmt(deltaOf(b))}  CVD:${fmt(b.cvd)}` +
-      `  新买/卖:${fmt(b.buy)}/${fmt(b.sell)} 未知:${fmt(unknown)} 旧买/卖:${fmt(b.buyLegacy)}/${fmt(b.sellLegacy)}` +
+        `${t}  O:${px(b.open)} H:${px(b.high)} L:${px(b.low)} C:${px(b.close)}  ` +
+      `  ${mode.toUpperCase()}:${suiteVal}  Δ:${vol(deltaOf(b))}  CVD:${vol(b.cvd)}` +
+      `  新买/卖:${vol(b.buy)}/${vol(b.sell)} 未知:${vol(unknown)} 旧买/卖:${vol(b.buyLegacy)}/${vol(b.sellLegacy)}` +
       `  LSMA:${fmt(derived.lw.wave[i], 1)} RVOL:${fmt(d.rvol[i], 2)} 斜率:${fmt(derived.lw.crvSlope[i], 2)}${band}${wt}`;
       onLegend(text, coverage);
     }
