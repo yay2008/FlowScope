@@ -618,7 +618,9 @@ test("WaveTrend 眼睛按钮: 参考线、交叉箭头与背离连线默认显�
   assert.ok(arrows() > 0 && segments() > 0, "切回 K 线按开关恢复");
 });
 
-test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关分别记进 localStorage, 重载后各自按记下的状态初始化", () => {
+const offFlags = (ctx, index) => ["ema", "band", "wt"].map((key) => legendRow(ctx, index, key).classList.contains("off"));
+
+test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各记进 localStorage, 重载后各自按记下的状态初始化", () => {
   const storage = createLocalStorage();
   const context = runBrowser({ localStorage: storage });
   const applied = stubCharts[1].applied;
@@ -627,29 +629,52 @@ test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关分别记进
   clickEye(context, 1, "ema");
   assert.deepEqual(applied.slice(-4).map((o) => o.visible), [false, false, false, false]);
   assert.equal(eyeOf(context, 1, "ema").title, "显示");
-  assert.deepEqual(JSON.parse(storage.getItem("flowscope.mainShown")),
-                   { 10: { ema: true, band: false, wt: true }, 30: { ema: false, band: false, wt: true } });
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")),
+                   [{ ema: true, band: false, wt: true }, { ema: false, band: false, wt: true }]);
 
   // 切合约是整页重载: 新页面的两张图各按记下的状态画
-  storage.setItem("flowscope.mainShown", JSON.stringify({
-    10: { ema: true, band: false, wt: true }, 30: { ema: false, band: true, wt: false } }));
+  storage.setItem("flowscope.chartShown", JSON.stringify([
+    { ema: true, band: false, wt: true }, { ema: false, band: true, wt: false }]));
   const again = runBrowser({ localStorage: storage });
-  const off = (ctx, index) => ["ema", "band", "wt"].map((key) => legendRow(ctx, index, key).classList.contains("off"));
-  assert.deepEqual(off(again, 0), [false, true, false]);
-  assert.deepEqual(off(again, 1), [true, false, true]);
-  assert.equal(again.document.getElementById("band-k").disabled, false, "30s 图的带记成打开, 带宽应可调");
+  assert.deepEqual(offFlags(again, 0), [false, true, false]);
+  assert.deepEqual(offFlags(again, 1), [true, false, true]);
+  assert.equal(again.document.getElementById("band-k").disabled, false, "右图的带记成打开, 带宽应可调");
 
-  // 旧版只记一份 {ema, band, wt}: 两张图都按它初始化
+  // 旧版按周期记 {"10": {...}, "30": {...}}: 新键还没有时各图按自己的周期初始化
+  storage.removeItem("flowscope.chartShown");
+  storage.setItem("flowscope.mainShown", JSON.stringify({
+    10: { ema: true, band: true, wt: true }, 30: { ema: false, band: false, wt: false } }));
+  const perPeriod = runBrowser({ localStorage: storage });
+  assert.deepEqual(offFlags(perPeriod, 0), [false, false, false]);
+  assert.deepEqual(offFlags(perPeriod, 1), [true, true, true]);
+
+  // 更早只记一份 {ema, band, wt}: 两张图都按它初始化
   storage.setItem("flowscope.mainShown", JSON.stringify({ ema: false, band: true, wt: true }));
   const legacy = runBrowser({ localStorage: storage });
-  assert.deepEqual(off(legacy, 0), [true, false, false]);
-  assert.deepEqual(off(legacy, 1), [true, false, false]);
+  assert.deepEqual(offFlags(legacy, 0), [true, false, false]);
+  assert.deepEqual(offFlags(legacy, 1), [true, false, false]);
 
   // 坏值不能把页面弄挂, 回落到默认
-  storage.setItem("flowscope.mainShown", "not json");
+  storage.setItem("flowscope.chartShown", "not json");
   const third = runBrowser({ localStorage: storage });
-  assert.deepEqual(off(third, 1), [false, true, false]);
+  assert.deepEqual(offFlags(third, 1), [false, true, false]);
   assert.equal(third.document.getElementById("band-k").disabled, true);
+});
+
+test("两张图选同一个周期时开关各管各的, 重载后不串; 切周期不换本图的开关", () => {
+  const storage = createLocalStorage();
+  storage.setItem("flowscope.chartTfs", "[30,30]");
+  const context = runBrowser({ localStorage: storage, fetch: historyRecorder([]) });
+  clickEye(context, 0, "wt");
+  const again = runBrowser({ localStorage: storage, fetch: historyRecorder([]) });
+  assert.deepEqual(offFlags(again, 0), [false, true, true], "左图关掉的 WaveTrend 重载后还是关的");
+  assert.deepEqual(offFlags(again, 1), [false, true, false], "右图不受左图影响");
+
+  const select = tfSelectOf(again, 0);
+  select.value = "300";
+  select.handlers.change[0]();
+  assert.deepEqual(offFlags(again, 0), [false, true, true], "切周期后本图开关不变");
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0], { ema: true, band: false, wt: false });
 });
 
 test("「带宽」只在有图打开 FlowWave带 时可调(足迹图下不置灰, 因为只是临时藏起来)", () => {
@@ -969,6 +994,91 @@ test("顶栏连接状态: 两张图都连上才显示「已连接」, 否则带�
   assert.equal(status.className, "on");
   vm.runInContext(`setChartStatus(0, false, "已断开, 重连补齐中…"); setChartStatus(1, false, "加载中…");`, context);
   assert.equal(status.textContent, "10s: 已断开, 重连补齐中…  30s: 加载中…");
+});
+
+// ---------- 切换周期 ----------
+
+const tfSelectOf = (context, index) => findByClass(chartEl(context, index), "tf-select");
+
+test("周期显示名与本地兜底的拆分粒度: 能整除主周期的才合法", () => {
+  const context = runBrowser();
+  const r = JSON.parse(vm.runInContext(`JSON.stringify({
+    labels: ChartView.TF_CHOICES.map(ChartView.tfLabel),
+    ltf10: ChartView.localLtfOptions(10), ltf60: ChartView.localLtfOptions(60), ltf4h: ChartView.localLtfOptions(14400),
+  })`, context));
+  assert.deepEqual(r.labels, ["10s", "30s", "1m", "5m", "15m", "1h", "4h"]);
+  assert.deepEqual(r.ltf10, [1, 5, 10]);
+  assert.deepEqual(r.ltf60, [1, 5, 10, 15, 30]);
+  assert.deepEqual(r.ltf4h, [1, 5, 10, 15, 30]);
+});
+
+test("切换周期: 本图按新周期重新请求, 顶栏状态换成新周期前缀, 周期记进 localStorage, 重载后照旧", () => {
+  const calls = [];
+  const localStorage = createLocalStorage();
+  const context = runBrowser({ fetch: historyRecorder(calls), localStorage });
+  // 本图已有数据和配置时也要先清空画面(空数据走一遍渲染不能出错), 再按新周期加载
+  feedBothCharts(context);
+  const select = tfSelectOf(context, 1);
+  assert.equal(select.value, "30");
+  select.value = "300";
+  assert.doesNotThrow(() => select.handlers.change[0]());
+  assert.equal(vm.runInContext("charts[1].tf", context), 300);
+  assert.equal(vm.runInContext("charts[1].bars.length", context), 0, "旧周期的 bar 不能留在新周期的图上");
+  assert.equal(calls.at(-1).get("tf"), "300");
+  assert.equal(localStorage.getItem("flowscope.chartTfs"), "[10,300]");
+  vm.runInContext(`setChartStatus(0, true, "已连接"); setChartStatus(1, false, "加载中…");`, context);
+  assert.equal(context.document.getElementById("status").textContent, "5m: 加载中…");
+
+  const reloaded = runBrowser({ fetch: historyRecorder(calls), localStorage });
+  assert.equal(vm.runInContext("charts.map((c) => c.tf).join()", reloaded), "10,300");
+  assert.equal(tfSelectOf(reloaded, 1).value, "300");
+});
+
+test("记下的周期不合法(旧版、手改)就回到默认的左 10s、右 30s", () => {
+  for (const saved of ["[10,45]", "[60]", "oops"]) {
+    const localStorage = createLocalStorage();
+    localStorage.setItem("flowscope.chartTfs", saved);
+    const context = runBrowser({ localStorage });
+    assert.equal(vm.runInContext("charts.map((c) => c.tf).join()", context), "10,30", saved);
+  }
+});
+
+test("可视范围联动: 周期相差超过 3 倍时只对齐右边缘, 另一张保留自己的缩放", () => {
+  const localStorage = createLocalStorage();
+  localStorage.setItem("flowscope.chartTfs", "[60,3600]");
+  const context = runBrowser({ localStorage });
+  vm.runInContext(`(() => {
+    for (const c of charts) {
+      c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
+      c.bars = [];
+      for (let t = ${T0}; t < ${T0 + 86400}; t += c.tf) {
+        c.bars.push({ time: t, open: 4000, high: 4002, low: 3998, close: 4001, volume: 100 });
+      }
+      c.renderAll();
+    }
+  })()`, context);
+  const [ts1m, ts1h] = stubCharts.map((chart) => chart.timeScale);
+  ts1h.setVisibleLogicalRange({ from: 0, to: 20 });            // 1h 图看 20 根
+  chartEl(context, 0).handlers.pointerenter[0]();
+  ts1m.setVisibleLogicalRange({ from: 600, to: 700 });         // 1m 图右边缘 = T0 + 700 分钟
+  near(ts1h.getVisibleLogicalRange(), { from: 700 / 60 - 20, to: 700 / 60 });
+  const sets = ts1h.sets;
+  ts1m.setVisibleLogicalRange({ from: 600, to: 700 });         // 已经对齐: 不再重设
+  assert.equal(ts1h.sets, sets);
+  // 两边都已看到最新(右边缘越过末根): 1h 图停在最新, 保留自己的右侧留白
+  chartEl(context, 1).handlers.pointerenter[0]();
+  ts1h.setVisibleLogicalRange({ from: 10, to: 26 });           // 鼠标在 1h 图上把它拖到最新, 末根是第 23 根
+  chartEl(context, 0).handlers.pointerenter[0]();
+  ts1m.setVisibleLogicalRange({ from: 1400, to: 1443 });       // 1m 图也到最新(末根是第 1439 根)
+  near(ts1h.getVisibleLogicalRange(), { from: 10, to: 26 });
+  // 1m 图拖回去: 1h 图跟着把右边缘移到同一时刻
+  ts1m.setVisibleLogicalRange({ from: 1100, to: 1140 });
+  near(ts1h.getVisibleLogicalRange(), { from: 1140 / 60 - 16, to: 1140 / 60 });
+  // 反过来: 1m 图停在过去, 鼠标在 1h 图上把它拖到最新(右侧留白 3 根 = 3 小时 = 180 根 1m)。
+  // 1m 图只到最新、留自己的 3 根留白, 不能被推进 180 根空白里
+  chartEl(context, 1).handlers.pointerenter[0]();
+  ts1h.setVisibleLogicalRange({ from: 10, to: 26 });
+  near(ts1m.getVisibleLogicalRange(), { from: 1442 - 40, to: 1442 });
 });
 
 // ---------- 自选请求乱序 ----------

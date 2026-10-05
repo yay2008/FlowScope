@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import os
 import queue
 import threading
@@ -39,18 +40,16 @@ import numpy as np
 import pandas as pd
 
 import ingest
-from indicator import (BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, ROLLUP_BASE_TF, TZ_SHIFT_S, finalize_bars,
-                       is_rollup, ltf_options)
-from ingest import COMPUTE_RETRY_SEC, MAX_KLINES, feed_key, feed_label, validate_symbol
-from rollup import CANDLE_COLUMNS, RollupMixin, join_candles, resample_candles
+from indicator import (BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, ROLLUP_BASE_TF, TZ_SHIFT_S, VOLUME_ROUND,
+                       finalize_bars, is_rollup, ltf_options)
+from history_store import ChangeLog
+from ingest import COMPUTE_RETRY_SEC, MAX_KLINES, SNAPSHOT_BARS, feed_key, feed_label, validate_symbol
+from rollup import INT64_MAX, CANDLE_COLUMNS, ClosedCache, RollupMixin, candle_buckets, utc_bucket
 
 VENUE_NAMES = {"BINANCE": "币安", "OKX": "OKX", "AGG": "多所汇总"}
 # 默认常驻采集: 币安与 OKX 的 BTC 永续(多所汇总 AGG.BTC 由这两路合成)。自选里的加密合约追加在后。
 DEFAULT_SYMBOLS = ("BINANCE.BTCUSDT.P", "OKX.BTC-USDT-SWAP")
 MAX_PINNED = 12            # 常驻采集最多几个合约(每个两路主周期)
-# 成交量累加会带出浮点尾数(0.1 + 0.2), 出表前统一取到 8 位小数, 否则同一根 bar 每次重算的值
-# 差一点点, 会被 HistoryStore 当成变化反复追加。
-VOLUME_ROUND = 8
 RECOMPUTE_SEC = 0.5        # 有页面在看的合约: 有新成交时最多每这么久重算一次快照
 IDLE_RECOMPUTE_SEC = 5.0   # 没人看的合约: 有 bar 走完才算(要落盘), 否则最多每这么久算一次
 RECV_TIMEOUT_SEC = 0.25    # 收消息的等待上限, 也决定停止与订阅变更的响应速度
@@ -397,47 +396,64 @@ class CandleStore:
         self._written: dict[int, tuple] = {}   # 最近写过(或读回)的行, 值没变就不再写
         self._needs_header = True
         self._needs_newline = False
-        # 整个文件的内容(大周期合成用, 见 history): 时间 -> 开高低收量, 读到的字节偏移
+        # 整个文件的内容(大周期往前合成很多根, load 只读窗口内的; 见 refresh / rows):
+        # 时间 -> 开高低收量、升序的时间、读到的字节偏移、改动记录
         self._all: dict[int, tuple] = {}
+        self._times: list[int] = []
         self._all_offset = 0
-        self._all_frame: pd.DataFrame | None = None
-        self.revision = 0
+        self.changes = ChangeLog()
 
-    def history(self) -> pd.DataFrame:
-        """整个文件的开高低收量(大周期要往前合成很多根, load 只读窗口内的)。
+    @property
+    def revision(self):
+        return self.changes.revision
 
-        按文件大小增量读: 只解析上次之后新追加的整行, 后写的行优先; 文件变短(被替换)就从头读。
-        revision 在内容变了时加一, 供调用方判断缓存还能不能用。
-        """
+    def changed_since(self, revision):
+        return self.changes.since(revision)
+
+    def refresh(self):
+        """把文件新追加的整行读进来(后写的行优先); 文件变短(被替换)就从头读。无变化时只是一次 stat。"""
         size = self.path.stat().st_size if self.path.exists() else 0
         if size < self._all_offset:
-            self._all, self._all_offset, self._all_frame = {}, 0, None
-            self.revision += 1
-        if size > self._all_offset:
-            with open(self.path, "rb") as handle:
-                handle.seek(self._all_offset)
-                chunk = handle.read(size - self._all_offset)
-            end = chunk.rfind(b"\n") + 1      # 最后半行(正在写)留到下次
-            for line in chunk[:end].decode("utf-8", "replace").splitlines():
-                cells = line.split(",")
-                if len(cells) != len(self.COLUMNS):
-                    continue
-                try:
-                    values = [float(cell) for cell in cells]
-                except ValueError:
-                    continue                  # 表头或坏行
-                if all(np.isfinite(values)):
-                    self._all[int(values[0])] = tuple(values[1:])
-            if end:
-                self._all_offset += end
-                self._all_frame = None
-                self.revision += 1
-        if self._all_frame is None:
-            times = sorted(self._all)
-            frame = pd.DataFrame([self._all[t] for t in times], columns=BAR_FIELDS, dtype=float)
-            frame.insert(0, "time", np.array(times, dtype=np.int64))
-            self._all_frame = frame
-        return self._all_frame
+            self._all, self._times, self._all_offset = {}, [], 0
+            self.changes.mark(float("-inf"))
+        if size <= self._all_offset:
+            return
+        with open(self.path, "rb") as handle:
+            handle.seek(self._all_offset)
+            chunk = handle.read(size - self._all_offset)
+        end = chunk.rfind(b"\n") + 1          # 最后半行(正在写)留到下次
+        earliest = None
+        for line in chunk[:end].decode("utf-8", "replace").splitlines():
+            cells = line.split(",")
+            if len(cells) != len(self.COLUMNS):
+                continue
+            try:
+                values = [float(cell) for cell in cells]
+            except ValueError:
+                continue                      # 表头或坏行
+            if not all(np.isfinite(values)):
+                continue
+            t = int(values[0])
+            if t not in self._all:
+                if not self._times or t > self._times[-1]:
+                    self._times.append(t)     # 实时追加的行时间递增, 绝大多数走这里
+                else:
+                    bisect.insort(self._times, t)
+            self._all[t] = tuple(values[1:])
+            earliest = t if earliest is None else min(earliest, t)
+        self._all_offset += end
+        if earliest is not None:
+            self.changes.mark(earliest)
+
+    def rows(self, since: int, before: int) -> pd.DataFrame:
+        """文件里 [since, before) 的开高低收量(先 refresh 才是最新的)。"""
+        times = self._times[bisect.bisect_left(self._times, since):bisect.bisect_left(self._times, before)]
+        frame = pd.DataFrame([self._all[t] for t in times], columns=BAR_FIELDS, dtype=float)
+        frame.insert(0, "time", np.array(times, dtype=np.int64))
+        return frame
+
+    def last_time(self) -> int | None:
+        return self._times[-1] if self._times else None
 
     def load(self) -> pd.DataFrame:
         """读回最近 window 根; 文件不存在或读不了按没有历史处理, 坏行跳过。"""
@@ -519,11 +535,8 @@ class CryptoFeed(ingest.Feed):
         return {(int(t) - TZ_SHIFT_S) * 1000 for t in store.values}
 
     def footprint_snapshot(self, demand=True):
-        """足迹图暂不做: 给一份空足迹, 页面切到足迹图时不会一直等快照。"""
-        self.request(demand=demand)
-        with self._state_lock:
-            return {"symbol": self.symbol, "tf": self.tf, "revision": self.revision,
-                    "tickSize": None, "bars": []}
+        """足迹图暂不做(BTC 最小价位太细, 要先做价格分档)。"""
+        return self._empty_footprint(demand)
 
     def apply_backfill(self, bars: pd.DataFrame):
         """回填结果(aggregate_trades 的输出, 只含完整的 bar)写进各粒度历史与开高低收量文件。"""
@@ -581,47 +594,79 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
 
     base_lookup 返回买卖量的底层(单个交易所是它的 30s CryptoFeed, 多所汇总是汇总的 30s);
     candle_feeds 返回开高低收量的来源: 单个交易所就是它自己, 多所汇总是各交易所的 30s,
-    开高低收取第一个交易所的、成交量相加(同 AggregateFeed)。只在管理线程里重算。
+    开高低收取第一个交易所的、成交量相加, 某家这根的 30s 不全时成交量记为缺(同 AggregateFeed)。
+    桶按交易所时间(UTC)整除对齐, 同交易所 K 线惯例; 只合成最近 max_bars 根。只在管理线程里重算。
     """
 
     rule = "slots"
 
     def __init__(self, symbol: str, tf: int, base_lookup, candle_feeds):
         super().__init__(symbol, tf)
-        self._init_rollup(base_lookup)
+        self._init_rollup(base_lookup, SNAPSHOT_BARS)
         self.candle_feeds = candle_feeds
         self.last_compute = 0.0
-        self._candle_cache: dict[int, tuple] = {}   # id(来源 Feed) -> (缓存键, 窗口之前那段合成好的 K 线)
+        self._candle_cache: dict[int, ClosedCache] = {}   # id(来源 Feed) -> 它已收尾各桶的开高低收量
 
     def candles(self, base) -> pd.DataFrame:
         feeds = self.candle_feeds()
         if not feeds or feeds[0] is None:
             return pd.DataFrame(columns=CANDLE_COLUMNS)
-        out = self._source_candles(feeds[0])
-        if len(feeds) > 1 and not out.empty:
-            volume = out.set_index("time")["volume"]
+        starts = self._grid(feeds[0])
+        if starts is None:
+            return pd.DataFrame(columns=CANDLE_COLUMNS)
+        self._candle_cache = {id(feed): self._candle_cache.get(id(feed)) or ClosedCache()
+                              for feed in feeds if feed is not None}
+        out = self._source_buckets(feeds[0], starts)
+        if len(feeds) > 1:
+            volume = out["volume"]
             for feed in feeds[1:]:
-                if feed is not None:
-                    other = self._source_candles(feed).set_index("time")["volume"]
-                    volume = volume.add(other.reindex(volume.index), fill_value=0.0)
-            out = out.assign(volume=volume.round(VOLUME_ROUND).to_numpy())
-        return out
+                other = self._source_buckets(feed, starts) if feed is not None else None
+                if other is None:
+                    volume = volume * np.nan
+                else:
+                    volume = (volume + other["volume"]).where(other["count"] == out["count"])
+            out = out.assign(volume=volume.round(VOLUME_ROUND))
+        return out[out["count"] > 0].reset_index()[CANDLE_COLUMNS]
 
-    def _source_candles(self, feed: CryptoFeed) -> pd.DataFrame:
-        """一个 30s 来源 -> 本周期开高低收量: 文件里窗口之前那段按文件版本缓存, 最近窗口每次现算。"""
-        latest = feed.latest.get(0)
-        window = (latest[CANDLE_COLUMNS] if latest is not None and not latest.empty
-                  else pd.DataFrame(columns=CANDLE_COLUMNS))
-        start = int(window["time"].iloc[0]) if not window.empty else None
-        # history() 没有新内容时只是一次 stat; 先读一下, 版本号才是新的
-        history = feed.candles.history() if feed.candles is not None else window.iloc[:0]
-        key = (id(feed.candles), feed.candles.revision if feed.candles is not None else None, start)
-        cached = self._candle_cache.get(id(feed))
-        if cached is None or cached[0] != key:
-            older = history[history["time"] < start] if start is not None else history
-            cached = (key, resample_candles(older, self.tf))
-            self._candle_cache[id(feed)] = cached
-        return join_candles(cached[1], resample_candles(window, self.tf))
+    def _grid(self, feed: CryptoFeed):
+        """最近 max_bars 根桶的起点(展示秒), 以来源最新一根 30s 所在的桶收尾; 还没有数据时为 None。"""
+        window = feed.latest_window(0)
+        if window is not None and not window.empty:
+            latest = int(window["time"].iloc[-1])
+        elif feed.candles is not None:
+            feed.candles.refresh()
+            latest = feed.candles.last_time()
+        else:
+            latest = None
+        if latest is None:
+            return None
+        last = utc_bucket(latest, self.tf)
+        return np.arange(last - (self.max_bars - 1) * self.tf, last + self.tf, self.tf, dtype=np.int64)
+
+    def _source_buckets(self, feed: CryptoFeed, starts: np.ndarray) -> pd.DataFrame:
+        """一个 30s 来源 -> 各桶的开高低收量与 30s 根数(按桶起点索引)。
+
+        整根都早于来源最近窗口的桶只看文件, 按文件的改动记录增量维护; 其余由文件里窗口之前那截加窗口现算。
+        """
+        ends = starts + self.tf
+        window = feed.latest_window(0)
+        window = window[CANDLE_COLUMNS] if window is not None and not window.empty else None
+        edge = int(window["time"].iloc[0]) if window is not None else INT64_MAX
+        closed = ends <= edge
+        store = feed.candles
+        if store is not None:
+            store.refresh()
+            parts = [self._candle_cache[id(feed)].get(
+                [store], starts[closed], ends[closed], lambda lo, hi, s, e: candle_buckets(store.rows(lo, hi), s, e))]
+        else:
+            parts = [candle_buckets(None, starts[closed], ends[closed])]
+        if not closed.all():
+            lo = int(starts[~closed][0])
+            rows = [frame for frame in (store.rows(lo, edge) if store is not None else None, window)
+                    if frame is not None and not frame.empty]
+            parts.append(candle_buckets(pd.concat(rows, ignore_index=True) if rows else None,
+                                        starts[~closed], ends[~closed]))
+        return pd.concat(parts) if len(parts) > 1 else parts[0]
 
 
 def _connect(url: str):
@@ -867,6 +912,11 @@ class CryptoManager:
             subscription = self.clients.pop(queue_, None)
             if subscription is not None and subscription[0] in self._demand:
                 self._demand[subscription[0]] = time.monotonic()   # 闲置期从最后一个客户端离开后起算
+        if subscription is not None:
+            # 大周期按它自己的最近需求回收(见 _sync): 也从客户端离开时起算, 不然看久了一离开就被删
+            feed = self._feed_of(subscription[:2])
+            if feed is not None:
+                feed.request(demand=True)
 
     def set_pinned(self, symbols) -> list[str]:
         """常驻采集集合: 默认合约 + 自选里的加密合约; 不认识的代码与超出名额的不常驻。
@@ -1202,7 +1252,7 @@ class CryptoManager:
             feed = self._feed_of((symbol, tf))
             if feed is not None:
                 feed.request(ltf=ltf, demand=False)   # 保持在看的拆分粒度不过期(大周期会转给 30s)
-        watched |= rollup_bases(watched)       # 看着大周期, 也就是看着它的 30s
+        watched |= self._rollup_sources(watched)   # 看着大周期, 也就是看着合成它要用的 30s
         dirty, self._dirty = self._dirty, set()
         for key, feed in feeds:
             if not feed.loaded:
@@ -1230,6 +1280,14 @@ class CryptoManager:
             self.aggregates.compute(self, dirty | {key[0] for key, _ in feeds if key in watched})
         self._compute_rollups(now, watched)
 
+    def _rollup_sources(self, keys) -> set[tuple[str, int]]:
+        """在看的大周期要用到的 30s: 买卖量的底层; 多所汇总的开高低收量还来自各交易所的 30s。"""
+        bases = rollup_bases(keys)
+        if self.aggregates is not None:
+            bases |= {(part, ROLLUP_BASE_TF) for symbol, _ in bases if venue_of(symbol) == "AGG"
+                      for part in self.aggregates.components(symbol)}
+        return bases
+
     def _compute_rollups(self, now: float, watched: set):
         """底层 30s 又算了一轮(或有新需求)的大周期才重算; 没人看的最多每 IDLE_RECOMPUTE_SEC 一次。"""
         with self._lock:
@@ -1239,7 +1297,8 @@ class CryptoManager:
             with feed._state_lock:
                 stale = feed._computed_version != feed._demand_version or feed.error is not None
             moved = base is not None and base.revision != feed.base_revision
-            due = moved and (key in watched or now - feed.last_compute >= IDLE_RECOMPUTE_SEC)
+            # 还没出过快照(刚建、底层刚有数据)的不等: 页面在等它的第一份快照
+            due = moved and (key in watched or not feed.snapshots or now - feed.last_compute >= IDLE_RECOMPUTE_SEC)
             if not (stale or due) or now < feed.compute_retry_at:
                 continue
             try:

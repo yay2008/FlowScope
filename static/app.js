@@ -62,16 +62,22 @@ function saveChartTfs() {
 
 const chartTfs = loadChartTfs();
 
-// 各图主图指标的显示开关记在 localStorage, 格式 {"10": {ema, band, wt}, "30": {...}}: 切合约是整页重载,
-// 不记的话每切一次都被打回默认。旧版只记一份 {ema, band, wt}, 两张图都按它初始化;
-// 读不到(隐私模式、旧值不合法)就用默认值。
+// 各图主图指标的显示开关记在 localStorage, 按左右图各记一份 [{ema, band, wt}, {...}]: 切合约是整页重载,
+// 不记的话每切一次都被打回默认。开关跟着图走, 不跟周期走(两张图可以选同一个周期, 切周期也不换开关)。
+// 旧版按周期记 flowscope.mainShown = {"10": {...}, "30": {...}}(更早只记一份 {ema, band, wt}),
+// 新键还没有时按旧值初始化; 读不到(隐私模式、旧值不合法)就用默认值。
+const CHART_SHOWN_KEY = "flowscope.chartShown";
 const MAIN_SHOWN_KEY = "flowscope.mainShown";
 
-function loadShown(tf) {
+function loadShown(index, tf) {
   const shown = { ema: true, band: false, wt: true };
   try {
-    const saved = JSON.parse(localStorage.getItem(MAIN_SHOWN_KEY) || "{}");
-    const mine = saved && typeof saved[tf] === "object" ? saved[tf] : saved;
+    const perChart = JSON.parse(localStorage.getItem(CHART_SHOWN_KEY) || "null");
+    let mine = Array.isArray(perChart) ? perChart[index] : null;
+    if (!mine || typeof mine !== "object") {
+      const legacy = JSON.parse(localStorage.getItem(MAIN_SHOWN_KEY) || "{}");
+      mine = legacy && typeof legacy[tf] === "object" ? legacy[tf] : legacy;
+    }
     for (const key of Object.keys(shown)) {
       if (typeof mine?.[key] === "boolean") shown[key] = mine[key];
     }
@@ -79,13 +85,9 @@ function loadShown(tf) {
   return shown;
 }
 
-// 只改当前两张图所在周期的那几项, 其它周期记下的开关留着(切回去、重载后还用得上)
 function saveShown() {
   try {
-    let saved = JSON.parse(localStorage.getItem(MAIN_SHOWN_KEY) || "{}");
-    if (!saved || typeof saved !== "object" || typeof saved.ema === "boolean") saved = {};   // 旧版单份格式
-    for (const c of charts) saved[c.tf] = c.shown();
-    localStorage.setItem(MAIN_SHOWN_KEY, JSON.stringify(saved));
+    localStorage.setItem(CHART_SHOWN_KEY, JSON.stringify(charts.map((c) => c.shown())));
   } catch (error) { /* 记不住不影响使用 */ }
 }
 
@@ -100,7 +102,7 @@ function makeChart(tf, index) {
     tf,
     symbol,
     settings,
-    shown: loadShown(tf),
+    shown: loadShown(index, tf),
     onStatus: (ok, text) => setChartStatus(index, ok, text),
     onLegend: (text, coverage) => showLegend(chartView, text, coverage),
     onConfig: refreshLtfOptions,
@@ -113,7 +115,6 @@ function makeChart(tf, index) {
     onTfChange: () => {
       chartTfs[index] = chartView.tf;
       saveChartTfs();
-      saveShown();
       refreshLtfOptions();
       showChartStatus();
       if (chartView === activeChart) chartView.refreshLegend();

@@ -18,7 +18,7 @@ import pandas as pd
 
 import ingest
 from crypto_feed import IDLE_RECOMPUTE_SEC, VENUE_NAMES, rollup_bases, venue_of
-from indicator import BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, finalize_bars, ltf_options
+from indicator import BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, VOLUME_ROUND, finalize_bars, ltf_options
 from ingest import feed_key
 
 PREFIX = "AGG."
@@ -49,9 +49,7 @@ class AggregateFeed(ingest.Feed):
         return {**super().cfg(), "priceDigits": self.price_digits, "volumeDigits": self.qty_digits}
 
     def footprint_snapshot(self, demand=True):
-        self.request(demand=demand)
-        with self._state_lock:
-            return {"symbol": self.symbol, "tf": self.tf, "revision": self.revision, "tickSize": None, "bars": []}
+        return self._empty_footprint(demand)
 
     def sync_history(self, manager):
         """各交易所历史文件里都完整的 bar, 相加后写进汇总自己的历史文件(只补没有或不一样的)。"""
@@ -69,8 +67,8 @@ class AggregateFeed(ingest.Feed):
             mine.refresh()
             rows = []
             for t in sorted(times):
-                buy = round(sum(values[t][0] for values in stores), 8)
-                sell = round(sum(values[t][1] for values in stores), 8)
+                buy = round(sum(values[t][0] for values in stores), VOLUME_ROUND)
+                sell = round(sum(values[t][1] for values in stores), VOLUME_ROUND)
                 if mine.values.get(t) != (buy, sell):
                     rows.append((t, buy, sell))
             if rows:
@@ -104,7 +102,7 @@ class AggregateFeed(ingest.Feed):
         for column in ("volume", "buy", "sell"):
             # 任何一家缺这根(NaN)就整根缺: min_count 要求每家都有值
             df[column] = pd.concat([part.get(column, pd.Series(np.nan, index=times)) for part in parts],
-                                   axis=1).sum(axis=1, min_count=len(parts)).round(8)
+                                   axis=1).sum(axis=1, min_count=len(parts)).round(VOLUME_ROUND)
         rank = pd.concat([part.get("coverage", pd.Series("missing", index=times)).fillna("missing")
                           .map(COVERAGE_RANK).fillna(2) for part in parts], axis=1).max(axis=1)
         df["coverage"] = rank.map(RANK_COVERAGE)

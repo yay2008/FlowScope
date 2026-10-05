@@ -171,7 +171,8 @@ class Feed:
         self._computed_version = -1
         self.revision = 0
         self.stores = {}
-        # 各粒度最近一次合并历史、算好 CVD 的完整窗口; 大周期由它合成(见 rollup.py)。
+        # 各粒度最近一次合并历史、算好 CVD 的完整窗口(连同那一轮的 revision); 大周期由它合成,
+        # 只认最近一轮算出来的(见 latest_window)。
         self.latest = {}
         self.analytics = TickAnalytics(self.bar_ns)
         self.lower_klines = {}
@@ -274,6 +275,18 @@ class Feed:
         with self._state_lock:
             return self.footprint
 
+    def _empty_footprint(self, demand=True):
+        """不做足迹图的 Feed(加密、大周期)给一份空足迹, 页面切到足迹图时不会一直等快照。"""
+        self.request(demand=demand)
+        with self._state_lock:
+            return {"symbol": self.symbol, "tf": self.tf, "revision": self.revision,
+                    "tickSize": None, "bars": []}
+
+    def latest_window(self, ltf):
+        """最近一轮重算出的 ltf 粒度完整窗口; 那一轮没算这个粒度(已停用、还没算到)就是 None。"""
+        entry = self.latest.get(ltf)
+        return entry[1] if entry is not None and entry[0] == self.revision else None
+
     def _store(self, ltf):
         if ltf not in self.stores:
             key = _csv_key(self.symbol)
@@ -370,7 +383,7 @@ class Feed:
         bars = store.merge(bars)
         store.save_completed(bars)
         bars = store.with_cvd(bars)
-        self.latest[ltf] = bars
+        self.latest[ltf] = (revision, bars)
         return self._snapshot_message(ltf, bars, previous, revision, store.base)
 
     def _snapshot_message(self, ltf, bars, previous, revision, cvd_base):
@@ -398,7 +411,7 @@ class FuturesRollupFeed(RollupMixin, Feed):
 
     def __init__(self, symbol: str, tf: int, base_lookup):
         super().__init__(symbol, tf)
-        self._init_rollup(base_lookup)
+        self._init_rollup(base_lookup, SNAPSHOT_BARS)
 
     def subscribe(self, api: TqApi):
         ensure_listed(api, self.symbol)
@@ -420,7 +433,7 @@ class FuturesRollupFeed(RollupMixin, Feed):
         return api.is_changing(self.klines) or (base is not None and base.revision != self.base_revision)
 
     def candles(self, base) -> pd.DataFrame:
-        return candles_from_klines(self.klines)
+        return candles_from_klines(self.klines).tail(self.max_bars).reset_index(drop=True)
 
 
 def _query_cache(api):
@@ -653,11 +666,14 @@ class FeedManager:
                 feed.request(demand=True)
             self._prune(now)
             if feed is None:
-                if is_rollup(key[1]):
-                    # 大周期的买卖量由同合约 30s 合成: 底层没在采集就一并建上
-                    self.ensure(key[0], ROLLUP_BASE_TF)
-                if len(self.feeds) >= MAX_FEEDS:
+                # 大周期的买卖量由同合约 30s 合成: 底层没在采集就一并建上, 名额要按两路算,
+                # 否则底层建好了大周期却建不了, 留下一路没人要的订阅
+                base_key = (key[0], ROLLUP_BASE_TF)
+                needed = 2 if is_rollup(key[1]) and base_key not in self.feeds else 1
+                if len(self.feeds) + needed > MAX_FEEDS:
                     raise ValueError("订阅合约数量已达上限")
+                if is_rollup(key[1]):
+                    self.ensure(*base_key)
                 feed = self._new_feed(key)
                 feed.request(demand=True)
                 self.feeds[key] = feed
@@ -742,18 +758,21 @@ class FeedManager:
             busy = {key[:2] for key in self.clients.values()} | set(self.pinned)
             idle = {key: feed.idle_for(now) for key, feed in self.feeds.items()
                     if key not in busy and not feed.has_demand(now)}
-            due = [key for key, seconds in idle.items() if seconds >= IDLE_EVICT_SEC]
+            expired = {key for key, seconds in idle.items() if seconds >= IDLE_EVICT_SEC}
+            due = self._without_kept_bases(expired)
+            # 先排除留下的底层再判断: 否则一路被留下的底层每轮都会让其它订阅提前回收
             if any(self.feeds[key] in self._sdk_feeds for key in due):
-                due += [key for key, seconds in idle.items()
-                        if IDLE_EVICT_SEC - EVICT_BATCH_SEC <= seconds < IDLE_EVICT_SEC
-                        and self.feeds[key] in self._sdk_feeds]
-            # 大周期还留着, 它的 30s 底层就不能回收(只开着 WS 时底层收不到真实请求)。
-            # 与大周期同一轮到期的底层照常一起回收, 合并成一次连接重建。
-            kept = {(symbol, ROLLUP_BASE_TF) for symbol, tf in self.feeds
-                    if is_rollup(tf) and (symbol, tf) not in due}
+                soon = {key for key, seconds in idle.items()
+                        if seconds >= IDLE_EVICT_SEC - EVICT_BATCH_SEC and self.feeds[key] in self._sdk_feeds}
+                due = self._without_kept_bases(expired | soon)
             for key in due:
-                if key not in kept:
-                    self._forget(key)
+                self._forget(key)
+
+    def _without_kept_bases(self, keys):
+        """必须持有 self._lock。大周期还留着, 它的 30s 底层就不能回收(只开着 WS 时底层收不到真实请求);
+        与大周期同一轮回收的底层照常一起回收, 合并成一次连接重建。"""
+        kept = {(symbol, ROLLUP_BASE_TF) for symbol, tf in self.feeds if is_rollup(tf) and (symbol, tf) not in keys}
+        return {key for key in keys if key not in kept}
 
     def _forget(self, key: tuple[str, int]):
         """必须在持有 self._lock 时调用。"""

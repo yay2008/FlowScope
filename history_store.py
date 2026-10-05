@@ -30,6 +30,7 @@
   无变化时 ``refresh()`` 只是一次 ``stat``。
 """
 import os
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +103,33 @@ def _extras_columns(frame):
     return columns
 
 
+class ChangeLog:
+    """内容版本号 + 每次改动涉及的最早时间戳(只留最近一段)。
+
+    大周期合成缓存了"已收尾"的桶, 来源一改就要知道从哪根开始作废: 问 since(上次的版本号)。
+    """
+
+    def __init__(self, size=512):
+        self.revision = 0
+        self._entries = deque(maxlen=size)     # (版本号, 这次改动涉及的最早时间戳)
+
+    def mark(self, earliest):
+        """内容变了: 版本号加一, 记下这次改动涉及的最早时间戳(-inf 表示整表都可能变了)。"""
+        self.revision += 1
+        self._entries.append((self.revision, earliest))
+
+    def since(self, revision):
+        """revision 之后的改动涉及的最早时间戳; 没改过返回 None。
+
+        记录已经不全(隔了太多版本没来问)或中间整表重读过时返回 -inf, 调用方应当全部重算。
+        """
+        if revision >= self.revision:
+            return None
+        if not self._entries or self._entries[0][0] > revision + 1:
+            return float("-inf")
+        return min(earliest for version, earliest in self._entries if version > revision)
+
+
 class HistoryStore:
     """单合约单周期的历史 bar 表; 只有采集线程读写, 不做跨线程加锁。"""
 
@@ -119,8 +147,8 @@ class HistoryStore:
         # 旧估算文件的对照列, 优先级低于主文件。
         self.estimated_extra: dict[int, dict] = {}
         self._legacy_paths = [Path(item) for item in legacy_paths]
-        # 内容版本号: 读入新行或落盘改了内容就加一; 大周期合成据此判断缓存还能不能用。
-        self.revision = 0
+        # 内容的改动记录: 大周期合成据此只重算受影响的那几根(见 changed_since)。
+        self.changes = ChangeLog()
         self._offset = 0
         self._size = 0
         self._needs_header = True
@@ -186,7 +214,7 @@ class HistoryStore:
         顺序与旧版完全一致(旧版先读主文件与估算文件, 再 ``extra.update`` 覆盖),
         因此同一时间戳上 complete 压 partial、主文件压旧估算。
         """
-        self.revision += 1
+        self.changes.mark(float("-inf"))
         self.values.clear()
         self.estimates.clear()
         self._legacy.clear()
@@ -342,8 +370,8 @@ class HistoryStore:
         if batch is None:
             return
         self._dirty = True
-        self.revision += 1
         times, buys, sells, codes, extras = batch
+        self.changes.mark(int(times.min()) if len(times) else float("inf"))
         partial_mask = codes == 1
         legacy_mask = codes == 2
         complete_mask = ~(partial_mask | legacy_mask)
@@ -512,7 +540,7 @@ class HistoryStore:
         done = bars if final else bars.iloc[:-1]
         estimated = (done.coverage.eq(SOURCE_PARTIAL)
                      & (done.get("hasBaseline", False) | ~done.time.isin(self.estimates)))
-        changed = False
+        earliest = None
         for mask, values, quality in [(done.coverage.eq(SOURCE_COMPLETE), self.values,
                                        SOURCE_COMPLETE),
                                       (estimated, self.estimates, SOURCE_PARTIAL)]:
@@ -531,11 +559,24 @@ class HistoryStore:
                     lines.append(_row_line(timestamp, buy, sell, extras, quality))
                     values[timestamp] = (buy, sell)
                     self.extra[timestamp] = dict(extras)
-                    changed = True
+                    earliest = timestamp if earliest is None else min(earliest, timestamp)
             self._append(lines)
-        if changed:
+        if earliest is not None:
             self._dirty = True
-            self.revision += 1
+            self.changes.mark(earliest)
+
+    @property
+    def revision(self):
+        return self.changes.revision
+
+    def changed_since(self, revision):
+        return self.changes.since(revision)
+
+    def times_between(self, since, before):
+        """[since, before) 里有记录(complete / partial / legacy 任一)的时间戳, 升序。"""
+        self._ensure_index()
+        start, end = np.searchsorted(self.display_times, [since, before], side="left")
+        return self.display_times[start:end]
 
     def with_cvd(self, bars):
         """显示 CVD 累计可用估算量；核对通过的累计量独立保留，二者均固定基准。"""

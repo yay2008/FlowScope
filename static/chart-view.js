@@ -33,6 +33,8 @@
   // 加载失败后自动重试: 订阅失败是暂时的(冷却期一过后端会自动重订),
   // 所以页面不该停在"加载失败"上等用户手动刷新。
   const RETRY_DELAY_MS = 5000;
+  // 最后一根右边留几根的空白(图表的 rightOffset), 联动对齐右边缘时也按它留
+  const RIGHT_OFFSET = 3;
   const RETRY_MAX_ATTEMPTS = 24;
   const noop = () => {};
 
@@ -485,7 +487,7 @@
         horzLines: { color: "#1e222d" },
       },
       crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-      timeScale: { borderColor: "#2a2e39", timeVisible: true, secondsVisible: tf < 60, rightOffset: 3 },
+      timeScale: { borderColor: "#2a2e39", timeVisible: true, secondsVisible: tf < 60, rightOffset: RIGHT_OFFSET },
       rightPriceScale: { borderColor: "#2a2e39" },
     });
 
@@ -1262,13 +1264,14 @@
         chart.timeScale().setVisibleLogicalRange({ from, to });
       },
       // 只对齐右边缘(两张图周期差太多, 完整同步会把大周期压成一两根时用): 本图可视的 bar 数不变,
-      // 右边缘移到 time; 两边都已看到最新时, 本图保留自己的右侧留白
+      // 右边缘移到 time。time 越过了本图最后一根(对方在看最新; 大周期图的留白折成小周期能有上百根)时,
+      // 本图停在最新、只留自己的右侧留白, 不跟着推进一大片空白
       alignRightEdge(time) {
         const current = chart.timeScale().getVisibleLogicalRange();
         if (!current || !bars.length) return;
         const last = bars.length - 1;
         let to = logicalAtTime(bars, tf, time);
-        if (to > last && current.to > last) to = current.to;
+        if (to > last) to = current.to > last ? current.to : last + RIGHT_OFFSET;
         if (Math.abs(current.to - to) < 0.01) return;
         chart.timeScale().setVisibleLogicalRange({ from: to - (current.to - current.from), to });
       },

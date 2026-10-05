@@ -164,8 +164,8 @@ body { display: flex; flex-direction: column; }
 }
 .chart-view + .chart-view { border-left: 1px solid #2a2e39; }
 
-/* 每张图的左上角(也就是主图窗格的左上角): 周期标签, 下面挂主图指标图例。
-   容器不挡十字光标, 只有标签和图例的每一行接收鼠标(悬停看说明、点眼睛) */
+/* 每张图的左上角(也就是主图窗格的左上角): 周期下拉框, 下面挂主图指标图例。
+   容器不挡十字光标, 只有下拉框和图例的每一行接收鼠标(选周期、悬停看说明、点眼睛) */
 .chart-corner {
   position: absolute;
   top: 4px;
@@ -177,19 +177,6 @@ body { display: flex; flex-direction: column; }
   gap: 3px;
   pointer-events: none;
 }
-.tf-badge {
-  padding: 0 6px;
-  border: 1px solid #2a2e39;
-  border-radius: 3px;
-  background: rgba(30, 34, 45, 0.85);
-  color: #f0b90d;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 18px;
-  cursor: default;
-  pointer-events: auto;
-}
-/* 周期下拉框: 外观同原来的周期标签 */
 .tf-select {
   padding: 0 4px;
   border: 1px solid #2a2e39;
