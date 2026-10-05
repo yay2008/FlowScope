@@ -22,7 +22,7 @@ from indicator import (BAR_COLUMNS, NATIVE_TFS, ROLLUP_BASE_TF, TF_OPTIONS, TZ_S
                        ltf_options)
 from okx_feed import OkxAdapter
 from rollup import (ROW_COLUMNS, ClosedCache, bucket_ends, bucket_stats, candle_buckets, candles_from_klines,
-                    rollup_bars, store_rows, utc_bucket)
+                    finish_bars, store_rows, utc_bucket)
 from test_crypto import make_trades
 
 T0 = 1_789_200_000          # 展示秒, 4 小时的整数倍(按 UTC 也是)
@@ -59,6 +59,14 @@ def base_bars(items):
     frame["deltaLegacy"] = frame["delta"]
     frame["cvd"] = np.nan
     return frame[BAR_COLUMNS]
+
+
+def rollup_bars(candles, rows, tf, rule="volume"):
+    """一次算完(不走 ClosedCache): 大周期开高低收量 + 底层 30s 行 -> 大周期 bars 表, 当对照用。"""
+    if candles is None or candles.empty:
+        return pd.DataFrame(columns=BAR_COLUMNS)
+    starts = candles["time"].to_numpy(dtype=np.int64)
+    return finish_bars(candles, bucket_stats(rows, starts, bucket_ends(starts, tf)), tf, rule)
 
 
 def klines_at(*items):
@@ -178,6 +186,23 @@ class StoreRowsTests(unittest.TestCase):
         self.save([(T0, 1, 1), (T0 + 30, 2, 2), (T0 + 60, 3, 3)])
         self.assertEqual(store_rows(self.store, before=T0 + 60)["time"].tolist(), [T0, T0 + 30])
 
+    def test_a_deleted_file_reads_back_as_empty(self):
+        self.save([(T0, 1, 1), (T0 + 30, 2, 2)])
+        self.assertEqual(len(store_rows(self.store)), 2)
+        self.store.path.unlink()                # 手工删掉历史文件: refresh 整表重读, 索引也要跟着清空
+        self.store.refresh()
+        self.assertTrue(store_rows(self.store).empty)
+
+    def test_legacy_rows_are_their_own_comparison_columns(self):
+        legacy = Path(self.temp.name) / "x_30s.csv"
+        legacy.write_text(f"time,buy,sell\n{T0 - 30},4,5\n", encoding="utf-8")
+        store = HistoryStore(Path(self.temp.name) / "y_30s_ltf0_v3.csv", [legacy])
+        store.save_completed(rows((T0, 1, 2, "partial")), final=True)
+        out = store_rows(store, volume_store=store)
+        self.assertEqual(out["coverage"].tolist(), ["legacy", "partial"])
+        self.assertEqual(out.iloc[0][["unknown", "buyLegacy", "sellLegacy"]].tolist(), [0.0, 4.0, 5.0])
+        self.assertTrue(out["volume"].isna().all())               # 只有核对通过的行才有已知成交量
+
     def test_revision_moves_when_content_changes(self):
         start = self.store.revision
         self.save([(T0, 1, 1)])
@@ -288,8 +313,8 @@ class ManagerRollupTests(unittest.TestCase):
             self.assertEqual(manager.feeds, {})
 
 
-class CryptoRollupTests(unittest.TestCase):
-    """加密大周期: 开高低收量与买卖量都由 30s 合成, 不收逐笔成交; 多所汇总的量相加。"""
+class CryptoRollupCase(unittest.TestCase):
+    """加密大周期测试的公共部分(没有测试方法, 子类各自的测试只跑一遍)。"""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -316,6 +341,10 @@ class CryptoRollupTests(unittest.TestCase):
         self.manager._compute(now)
         # 底层算完、大周期再算一轮(不依赖 _compute 内部的先后)
         self.manager._compute(time.monotonic() + IDLE_RECOMPUTE_SEC)
+
+
+class CryptoRollupTests(CryptoRollupCase):
+    """加密大周期: 开高低收量与买卖量都由 30s 合成, 不收逐笔成交; 多所汇总的量相加。"""
 
     def test_rollup_has_no_trade_window_and_matches_bulk_aggregation(self):
         feed = self.manager.ensure(BTC, 300)
@@ -413,6 +442,11 @@ class ChangeLogTests(unittest.TestCase):
         log.mark(float("-inf"))                           # 整表重读
         self.assertEqual(log.since(3), float("-inf"))
 
+    def test_a_revision_from_another_log_means_recompute_everything(self):
+        log = ChangeLog()
+        log.mark(100)
+        self.assertEqual(log.since(51), float("-inf"))    # 比当前还大: 是旧实例发出去的版本号
+
 
 class ClosedCacheTests(unittest.TestCase):
     """已收尾的桶走缓存: 结果与每次全量现算一致, 平时不再扫描窗口之前的历史。"""
@@ -487,6 +521,26 @@ class ClosedCacheTests(unittest.TestCase):
         self.assertTrue(calls)
         self.assertTrue(all(since >= window_start - 300 for since, _ in calls), calls)
 
+    def test_a_rebuilt_store_is_recomputed_even_at_the_same_address(self):
+        path = Path(self.temp.name) / "rebuilt_v3.csv"
+        store = HistoryStore(path)
+        for i in range(10):
+            store.save_completed(rows((T0 + 30 * i, 1.0, 1.0, "complete")), final=True)
+        cache = ClosedCache()
+        starts, ends = np.array([T0], dtype=np.int64), np.array([T0 + 300], dtype=np.int64)
+
+        def compute(source):
+            return lambda lo, hi, s, e: bucket_stats(store_rows(source, lo, hi), s, e)
+
+        # 底层回收重建: CPython 常把新实例放在刚释放的地址上(这里让 id() 恒等来模拟), 版本号却从头数
+        with patch.object(rollup_module, "id", lambda source: 0, create=True):
+            self.assertEqual(cache.get([store], starts, ends, compute(store))["buy"].iloc[0], 10.0)
+            del store
+            rebuilt = HistoryStore(path)
+            rebuilt.save_completed(rows((T0, 9.0, 1.0, "complete")), final=True)
+            self.assertLess(rebuilt.revision, cache.revisions[0])
+            self.assertEqual(cache.get([rebuilt], starts, ends, compute(rebuilt))["buy"].iloc[0], 18.0)
+
     def test_only_the_latest_bars_are_rolled_up(self):
         self.feed.klines = klines_at(*[(T0 + 300 * i, 1.0) for i in range(ingest.SNAPSHOT_BARS + 100)])
         candles = self.feed.candles(self.base)
@@ -516,6 +570,19 @@ class LatestWindowTests(unittest.TestCase):
         feed.klines = klines_at((T0, 10))
         feed.recompute(Mock())
         self.assertNotIn(5, feed.snapshots)
+
+    def test_a_round_that_fails_halfway_still_counts_for_the_ltfs_it_finished(self):
+        base = ingest.Feed(SYMBOL, 30)
+        feed = ingest.FuturesRollupFeed(SYMBOL, 300, lambda: base)
+        feed.request(ltf=0)
+        base._publish(0, base_bars([(T0, 10.0, 4.0, 5.0)]), {}, 1)
+        base.revision = 1
+        # 第 2 轮算完 ltf=0 之后在别的粒度上出错(比如文件被锁): revision 没前进, ltf=0 的窗口已是新的
+        base._publish(0, base_bars([(T0, 10.0, 4.0, 5.0), (T0 + 30, 10.0, 6.0, 3.0)]), {}, 2)
+        self.assertEqual(base.latest_window(0)["time"].tolist(), [T0, T0 + 30])
+        feed.klines = klines_at((T0, 20))
+        feed.recompute(Mock())
+        self.assertEqual(feed.snapshots[0]["bars"][0]["buy"], 10.0)
 
 
 class ManagerLifecycleTests(unittest.TestCase):
@@ -566,15 +633,49 @@ class CandleStoreHistoryTests(unittest.TestCase):
             self.assertEqual(store.last_time(), 160)
 
 
-class CryptoRollupLifecycleTests(CryptoRollupTests):
-    def test_leaving_after_a_long_session_keeps_the_rollup_for_the_idle_period(self):
-        feed = self.manager.ensure(BTC, 300)
-        q = asyncio.Queue()
-        self.manager.add_client(q, BTC, 0, False, 300)
-        feed._last_demand = time.monotonic() - 900          # 看了 15 分钟
-        self.manager.remove_client(q)
-        self.manager._sync(time.monotonic())
-        self.assertIn((BTC, 300), self.manager.rollups)
+class CryptoRollupLifecycleTests(CryptoRollupCase):
+    def test_leaving_after_a_long_session_keeps_the_rollup_and_its_base_for_the_idle_period(self):
+        eth = "BINANCE.ETHUSDT.P"                           # 不常驻: 底层只靠页面的需求留着
+        clock = [1000.0]
+        with patch.object(crypto_feed.time, "monotonic", lambda: clock[0]):      # 与 ingest 是同一个 time 模块
+            feed = self.manager.ensure(eth, 300)
+            q = asyncio.Queue()
+            self.manager.add_client(q, eth, 0, False, 300)
+            for _ in range(8):                              # 看了 800 秒: 打开时登记的需求早已过期
+                clock[0] += 100
+                self.manager._sync(clock[0])
+            self.manager.remove_client(q)
+            clock[0] += 1
+            self.manager._sync(clock[0])
+            self.assertIn((eth, 300), self.manager.rollups)
+            self.assertIn((eth, 30), self.manager.feeds)
+            self.assertIs(feed.base(), self.manager.feeds[(eth, 30)])
+            clock[0] += crypto_feed.IDLE_EVICT_SEC
+            self.manager._sync(clock[0])                    # 闲置期满: 大周期回收
+            self.assertNotIn((eth, 300), self.manager.rollups)
+            self.manager._sync(clock[0] + 1)                # 下一轮底层跟着回收
+            self.assertNotIn((eth, 30), self.manager.feeds)
+
+    def test_a_kept_rollup_keeps_its_base_collected(self):
+        eth = "BINANCE.ETHUSDT.P"
+        clock = [1000.0]
+        with patch.object(crypto_feed.time, "monotonic", lambda: clock[0]):
+            feed = self.manager.ensure(eth, 300)
+            clock[0] += crypto_feed.IDLE_EVICT_SEC + 10     # 30s 的需求过期了, 大周期刚被页面要过
+            feed.request(demand=True)
+            self.manager._sync(clock[0])
+            self.assertIn(eth, self.manager.trade_symbols(clock[0]))
+            self.assertIs(feed.base(), self.manager.feeds[(eth, 30)])
+
+    def test_aggregate_rollup_keeps_the_aggregate_base(self):
+        clock = [1000.0]
+        with patch.object(crypto_feed.time, "monotonic", lambda: clock[0]):
+            feed = self.manager.ensure("AGG.BTC", 300)
+            clock[0] += crypto_feed.IDLE_EVICT_SEC + 10
+            feed.request(demand=True)
+            self.manager._sync(clock[0])
+            self.manager.aggregates.compute(self.manager, set())
+            self.assertIs(feed.base(), self.manager.aggregates.feeds[("AGG.BTC", 30)])
 
     def test_first_snapshot_does_not_wait_for_the_idle_interval(self):
         feed = self.manager.ensure(BTC, 300)
@@ -600,6 +701,19 @@ class CryptoRollupLifecycleTests(CryptoRollupTests):
         first, second = START_MS // 1000 + TZ_SHIFT_S, START_MS // 1000 + TZ_SHIFT_S + 300
         self.assertIsNone(bars[first]["volume"])
         self.assertIsNotNone(bars[second]["volume"])
+
+    def test_aggregate_volume_of_the_forming_bar_does_not_wait_for_a_quiet_venue(self):
+        feed = self.manager.ensure("AGG.BTC", 300)
+        trades = make_trades(START_MS, 100, step_ms=4000)              # 到 398 秒: 第二根 5 分钟正在走
+        quiet = trades[trades.t < START_MS + 330_000]                  # OKX 最近 70 秒没成交, 少最新 3 根 30s
+        self.feed_trades(BTC, trades)
+        self.feed_trades(OKX, quiet)
+        self.compute()
+        bars = feed.snapshot_for(0)["bars"]
+        self.assertEqual(bars[-1]["time"], START_MS // 1000 + TZ_SHIFT_S + 300)
+        expected = (trades[trades.t >= START_MS + 300_000].qty.sum() + quiet[quiet.t >= START_MS + 300_000].qty.sum())
+        self.assertAlmostEqual(bars[-1]["volume"], expected)
+        self.assertAlmostEqual(bars[0]["volume"], 2 * trades[trades.t < START_MS + 300_000].qty.sum())
 
 
 if __name__ == "__main__":

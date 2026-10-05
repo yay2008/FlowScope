@@ -283,9 +283,13 @@ class Feed:
                     "tickSize": None, "bars": []}
 
     def latest_window(self, ltf):
-        """最近一轮重算出的 ltf 粒度完整窗口; 那一轮没算这个粒度(已停用、还没算到)就是 None。"""
+        """最近一轮重算出的 ltf 粒度完整窗口; 那一轮没算这个粒度(已停用、还没算到)就是 None。
+
+        某一轮算到一半出错时 revision 不前进, 已经算好的粒度带的是下一个 revision: 也认, 照样是最新的;
+        出错的粒度还留着上一轮(当前 revision)的。
+        """
         entry = self.latest.get(ltf)
-        return entry[1] if entry is not None and entry[0] == self.revision else None
+        return entry[1] if entry is not None and entry[0] >= self.revision else None
 
     def _store(self, ltf):
         if ltf not in self.stores:

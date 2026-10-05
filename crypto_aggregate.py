@@ -223,6 +223,8 @@ class AggregateBook:
             wanted = set(manager.pinned_aggregates()) | {symbol for symbol in manager._demand
                                                          if venue_of(symbol) == "AGG"}
             wanted |= {symbol for symbol, _ in watched if venue_of(symbol) == "AGG"}
+            # 汇总的大周期还留着, 它的底层(汇总的 30s)就不能回收(见 CryptoManager.trade_symbols)
+            wanted |= {symbol for symbol, _ in manager.rollups if venue_of(symbol) == "AGG"}
             for key in [key for key in self.feeds if key[0] not in wanted]:
                 del self.feeds[key]
             for symbol in wanted:

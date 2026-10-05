@@ -44,7 +44,7 @@ from indicator import (BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, ROLLUP_BASE_TF, 
                        finalize_bars, is_rollup, ltf_options)
 from history_store import ChangeLog
 from ingest import COMPUTE_RETRY_SEC, MAX_KLINES, SNAPSHOT_BARS, feed_key, feed_label, validate_symbol
-from rollup import INT64_MAX, CANDLE_COLUMNS, ClosedCache, RollupMixin, candle_buckets, utc_bucket
+from rollup import INT64_MAX, CANDLE_COLUMNS, ClosedCache, RollupMixin, candle_buckets, split_buckets, utc_bucket
 
 VENUE_NAMES = {"BINANCE": "币安", "OKX": "OKX", "AGG": "多所汇总"}
 # 默认常驻采集: 币安与 OKX 的 BTC 永续(多所汇总 AGG.BTC 由这两路合成)。自选里的加密合约追加在后。
@@ -423,6 +423,7 @@ class CandleStore:
             chunk = handle.read(size - self._all_offset)
         end = chunk.rfind(b"\n") + 1          # 最后半行(正在写)留到下次
         earliest = None
+        shuffled = False                      # 有没有比已有的更早的新行(回填)
         for line in chunk[:end].decode("utf-8", "replace").splitlines():
             cells = line.split(",")
             if len(cells) != len(self.COLUMNS):
@@ -435,12 +436,13 @@ class CandleStore:
                 continue
             t = int(values[0])
             if t not in self._all:
-                if not self._times or t > self._times[-1]:
-                    self._times.append(t)     # 实时追加的行时间递增, 绝大多数走这里
-                else:
-                    bisect.insort(self._times, t)
+                shuffled = shuffled or (bool(self._times) and t < self._times[-1])
+                self._times.append(t)
             self._all[t] = tuple(values[1:])
             earliest = t if earliest is None else min(earliest, t)
+        if shuffled:
+            # 回填的一批都比已有的早: 逐条插入每条都要挪整个列表, 攒到最后排一次(两段有序, 近似线性)
+            self._times.sort()
         self._all_offset += end
         if earliest is not None:
             self.changes.mark(earliest)
@@ -594,7 +596,8 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
 
     base_lookup 返回买卖量的底层(单个交易所是它的 30s CryptoFeed, 多所汇总是汇总的 30s);
     candle_feeds 返回开高低收量的来源: 单个交易所就是它自己, 多所汇总是各交易所的 30s,
-    开高低收取第一个交易所的、成交量相加, 某家这根的 30s 不全时成交量记为缺(同 AggregateFeed)。
+    开高低收取第一个交易所的、成交量相加, 某家这根的 30s 不全时成交量记为缺(同 AggregateFeed);
+    正在走的那根各家只数到自己最新一根 30s(最近没成交的那家还没有最新那几根)。
     桶按交易所时间(UTC)整除对齐, 同交易所 K 线惯例; 只合成最近 max_bars 根。只在管理线程里重算。
     """
 
@@ -605,7 +608,8 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
         self._init_rollup(base_lookup, SNAPSHOT_BARS)
         self.candle_feeds = candle_feeds
         self.last_compute = 0.0
-        self._candle_cache: dict[int, ClosedCache] = {}   # id(来源 Feed) -> 它已收尾各桶的开高低收量
+        # 来源合约 -> 它已收尾各桶的开高低收量; 来源 Feed 回收重建后 ClosedCache 自己认得出换了文件实例
+        self._candle_cache: dict[str, ClosedCache] = {}
 
     def candles(self, base) -> pd.DataFrame:
         feeds = self.candle_feeds()
@@ -614,19 +618,28 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
         starts = self._grid(feeds[0])
         if starts is None:
             return pd.DataFrame(columns=CANDLE_COLUMNS)
-        self._candle_cache = {id(feed): self._candle_cache.get(id(feed)) or ClosedCache()
+        self._candle_cache = {feed.symbol: self._candle_cache.get(feed.symbol) or ClosedCache()
                               for feed in feeds if feed is not None}
         out = self._source_buckets(feeds[0], starts)
         if len(feeds) > 1:
-            volume = out["volume"]
-            for feed in feeds[1:]:
-                other = self._source_buckets(feed, starts) if feed is not None else None
-                if other is None:
-                    volume = volume * np.nan
-                else:
-                    volume = (volume + other["volume"]).where(other["count"] == out["count"])
+            parts = [out, *(self._source_buckets(feed, starts) if feed is not None else None for feed in feeds[1:])]
+            if any(part is None for part in parts):
+                volume = out["volume"] * np.nan
+            else:
+                # 各家这根的 30s 根数一样才相加, 某家缺 bar 就记为缺。正在走的那根(最后一桶)各家只数到
+                # 自己最新一根: 逐笔成交到了才建 bar, 某家最近几秒没成交时就是比别家少最新那几根, 不算缺
+                whole = np.logical_and.reduce([part["count"].to_numpy() == out["count"].to_numpy()
+                                               for part in parts[1:]])
+                whole[-1] |= all(self._forming_whole(part, int(starts[-1])) for part in parts)
+                volume = sum(part["volume"] for part in parts).where(whole)
             out = out.assign(volume=volume.round(VOLUME_ROUND))
         return out[out["count"] > 0].reset_index()[CANDLE_COLUMNS]
+
+    @staticmethod
+    def _forming_whole(part: pd.DataFrame, start: int) -> bool:
+        """正在走的那根里, 这家的 30s 是否从桶起点一根不缺地连到它自己最新一根(一根都没有不算)。"""
+        count, last = part["count"].iloc[-1], part["last"].iloc[-1]
+        return bool(count > 0 and count == (int(last) - start) // ROLLUP_BASE_TF + 1)
 
     def _grid(self, feed: CryptoFeed):
         """最近 max_bars 根桶的起点(展示秒), 以来源最新一根 30s 所在的桶收尾; 还没有数据时为 None。"""
@@ -646,27 +659,26 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
     def _source_buckets(self, feed: CryptoFeed, starts: np.ndarray) -> pd.DataFrame:
         """一个 30s 来源 -> 各桶的开高低收量与 30s 根数(按桶起点索引)。
 
-        整根都早于来源最近窗口的桶只看文件, 按文件的改动记录增量维护; 其余由文件里窗口之前那截加窗口现算。
+        整根都早于来源最近窗口的桶只看文件, 按文件的改动记录增量维护; 其余由文件里窗口之前那截加窗口现算
+        (见 rollup.split_buckets)。还没读回文件时只有窗口。
         """
-        ends = starts + self.tf
         window = feed.latest_window(0)
         window = window[CANDLE_COLUMNS] if window is not None and not window.empty else None
         edge = int(window["time"].iloc[0]) if window is not None else INT64_MAX
-        closed = ends <= edge
         store = feed.candles
         if store is not None:
             store.refresh()
-            parts = [self._candle_cache[id(feed)].get(
-                [store], starts[closed], ends[closed], lambda lo, hi, s, e: candle_buckets(store.rows(lo, hi), s, e))]
-        else:
-            parts = [candle_buckets(None, starts[closed], ends[closed])]
-        if not closed.all():
-            lo = int(starts[~closed][0])
-            rows = [frame for frame in (store.rows(lo, edge) if store is not None else None, window)
-                    if frame is not None and not frame.empty]
-            parts.append(candle_buckets(pd.concat(rows, ignore_index=True) if rows else None,
-                                        starts[~closed], ends[~closed]))
-        return pd.concat(parts) if len(parts) > 1 else parts[0]
+
+        def stored(lo, hi):
+            return store.rows(lo, hi) if store is not None else None
+
+        def fresh(lo, s, e):
+            rows = [frame for frame in (stored(lo, edge), window) if frame is not None and not frame.empty]
+            return candle_buckets(pd.concat(rows, ignore_index=True) if rows else None, s, e)
+
+        return split_buckets(starts, starts + self.tf, edge, self._candle_cache[feed.symbol],
+                             [store] if store is not None else [],
+                             lambda lo, hi, s, e: candle_buckets(stored(lo, hi), s, e), fresh)
 
 
 def _connect(url: str):
@@ -910,8 +922,10 @@ class CryptoManager:
     def remove_client(self, queue_: asyncio.Queue):
         with self._lock:
             subscription = self.clients.pop(queue_, None)
-            if subscription is not None and subscription[0] in self._demand:
-                self._demand[subscription[0]] = time.monotonic()   # 闲置期从最后一个客户端离开后起算
+            if subscription is not None:
+                # 闲置期从最后一个客户端离开后起算; 看了很久的合约, 打开时登记的需求早已过期被清掉,
+                # 所以不管还在不在都要重新登记
+                self._demand[subscription[0]] = time.monotonic()
         if subscription is not None:
             # 大周期按它自己的最近需求回收(见 _sync): 也从客户端离开时起算, 不然看久了一离开就被删
             feed = self._feed_of(subscription[:2])
@@ -1052,12 +1066,17 @@ class CryptoManager:
         return lambda: self._topics.get(key, frozenset())
 
     def trade_symbols(self, now=None) -> list[str]:
-        """要收逐笔成交的合约: 常驻 + 页面临时打开且未闲置的 + 正被页面看着的。"""
+        """要收逐笔成交的合约: 常驻 + 页面临时打开且未闲置的 + 正被页面看着的 + 大周期还留着的。
+
+        大周期留着, 合成它的 30s 就不能回收(同期货 FeedManager._without_kept_bases), 否则留下的
+        大周期不再更新, 再打开时底层在它下面重建。
+        """
         now = time.monotonic() if now is None else now
         with self._lock:
             symbols = list(self.pinned)
             symbols += [symbol for symbol, seen in self._demand.items() if now - seen < IDLE_EVICT_SEC]
             symbols += [symbol for symbol, _, _ in self.clients.values()]
+            symbols += [symbol for symbol, _ in self.rollups]
         if self.aggregates is not None:
             symbols = [part for symbol in symbols for part in
                        (self.aggregates.components(symbol) if venue_of(symbol) == "AGG" else [symbol])]

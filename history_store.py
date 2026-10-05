@@ -31,6 +31,7 @@
 """
 import os
 from collections import deque
+from itertools import chain
 from pathlib import Path
 
 import numpy as np
@@ -70,6 +71,12 @@ def _number_or_nan(value):
     """空字段/NaN -> NaN, 其余 -> float; 增量行组装成数组时用。"""
     number = _norm(value)
     return np.nan if number is None else number
+
+
+def _pairs(table, times):
+    """{时间: (买, 卖)} 按 times 的顺序 -> (n, 2) 数组; 比逐根组元组再转数组快一倍多。"""
+    flat = np.fromiter(chain.from_iterable(map(table.__getitem__, times.tolist())), float, 2 * len(times))
+    return flat.reshape(-1, 2)
 
 
 def _extras_from_values(values):
@@ -122,10 +129,11 @@ class ChangeLog:
         """revision 之后的改动涉及的最早时间戳; 没改过返回 None。
 
         记录已经不全(隔了太多版本没来问)或中间整表重读过时返回 -inf, 调用方应当全部重算。
+        revision 比当前还大说明不是这份记录发出去的(来源换了实例), 同样返回 -inf。
         """
-        if revision >= self.revision:
+        if revision == self.revision:
             return None
-        if not self._entries or self._entries[0][0] > revision + 1:
+        if revision > self.revision or not self._entries or self._entries[0][0] > revision + 1:
             return float("-inf")
         return min(earliest for version, earliest in self._entries if version > revision)
 
@@ -215,6 +223,8 @@ class HistoryStore:
         因此同一时间戳上 complete 压 partial、主文件压旧估算。
         """
         self.changes.mark(float("-inf"))
+        # 清空了内存表, 索引也得跟着重建: 文件被删时下面一行都读不到, _accept 不会替我们标脏
+        self._dirty = True
         self.values.clear()
         self.estimates.clear()
         self._legacy.clear()
@@ -437,12 +447,24 @@ class HistoryStore:
 
     # ------------------------------------------------------------------ 索引
     def _index(self):
-        """重建排序时间轴与累计和(仅在历史内容变化后调用)。"""
+        """重建排序时间轴与累计和(仅在历史内容变化后调用)。
+
+        display_* 是三档记录合起来(complete > partial > legacy)按时间排好的买卖量与来源码(0/1/2),
+        大周期合成按区间直接切片(见 display_between), 不必逐根查字典。
+        """
         display = {**self._legacy, **self.estimates, **self.values}
         self.times = np.array(sorted(self.values), dtype=np.int64)
-        self.sums = np.r_[0., np.cumsum([self.values[t][0] - self.values[t][1] for t in self.times])]
+        confirmed = _pairs(self.values, self.times)
+        self.sums = np.r_[0., np.cumsum(confirmed[:, 0] - confirmed[:, 1])]
         self.display_times = np.array(sorted(display), dtype=np.int64)
-        self.display_sums = np.r_[0., np.cumsum([display[t][0] - display[t][1] for t in self.display_times])]
+        pairs = _pairs(display, self.display_times)
+        self.display_buy, self.display_sell = pairs[:, 0], pairs[:, 1]
+        self.display_sums = np.r_[0., np.cumsum(self.display_buy - self.display_sell)]
+        # 估算与核对通过的时间戳都在 display_times 里, 直接定位
+        codes = np.full(len(self.display_times), 2, dtype=np.int8)
+        codes[np.searchsorted(self.display_times, np.fromiter(self.estimates, np.int64, len(self.estimates)))] = 1
+        codes[np.searchsorted(self.display_times, self.times)] = 0
+        self.display_codes = codes
         self._dirty = False
 
     def _ensure_index(self):
@@ -572,11 +594,13 @@ class HistoryStore:
     def changed_since(self, revision):
         return self.changes.since(revision)
 
-    def times_between(self, since, before):
-        """[since, before) 里有记录(complete / partial / legacy 任一)的时间戳, 升序。"""
+    def display_between(self, since, before):
+        """[since, before) 里有记录(complete / partial / legacy 任一)的各根, 升序:
+        (时间戳, 买, 卖, 来源码 0/1/2), 取值的优先级同 merge。"""
         self._ensure_index()
         start, end = np.searchsorted(self.display_times, [since, before], side="left")
-        return self.display_times[start:end]
+        return (self.display_times[start:end], self.display_buy[start:end], self.display_sell[start:end],
+                self.display_codes[start:end])
 
     def with_cvd(self, bars):
         """显示 CVD 累计可用估算量；核对通过的累计量独立保留，二者均固定基准。"""

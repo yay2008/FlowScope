@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import time
+import weakref
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,8 @@ CANDLE_COLUMNS = ["time", "open", "high", "low", "close", "volume"]
 STAT_COLUMNS = [*SUM_COLUMNS, "count", "complete", "legacy", "data", "known", "baseline", "last"]
 INT64_MIN = np.iinfo(np.int64).min
 INT64_MAX = np.iinfo(np.int64).max
+COVERAGES = np.array(["complete", "partial", "legacy"], dtype=object)   # HistoryStore 的来源码 -> 覆盖
+_NO_EXTRA = {}             # 没有对照列的行(只读)
 
 
 def candles_from_klines(klines) -> pd.DataFrame:
@@ -66,19 +69,21 @@ def _owners(times: np.ndarray, starts: np.ndarray, ends: np.ndarray):
 
 
 def _ohlcv(groups) -> pd.DataFrame:
-    """按桶分组的 30s 开高低收量 -> 每桶的开高低收量与 30s 根数。"""
+    """按桶分组的 30s 开高低收量 -> 每桶的开高低收量、30s 根数与最后一根 30s 的起点。"""
     return pd.DataFrame({"open": groups["open"].first(), "high": groups["high"].max(),
                          "low": groups["low"].min(), "close": groups["close"].last(),
-                         "volume": groups["volume"].sum().round(VOLUME_ROUND), "count": groups["volume"].size()})
+                         "volume": groups["volume"].sum().round(VOLUME_ROUND), "count": groups["volume"].size(),
+                         "last": groups["time"].max()})
 
 
 def candle_buckets(frame: pd.DataFrame, starts: np.ndarray, ends: np.ndarray) -> pd.DataFrame:
-    """30s 开高低收量(time 为展示秒) -> 给定各桶的开高低收量与 30s 根数; 按桶起点索引, 每个桶一行
-    (桶里没有 30s 的开高低收为 NaN、根数为 0)。"""
+    """30s 开高低收量(time 为展示秒) -> 给定各桶的开高低收量、30s 根数与最后一根 30s 的起点(last);
+    按桶起点索引, 每个桶一行(桶里没有 30s 的开高低收与 last 为 NaN、根数为 0)。"""
     index = pd.Index(np.asarray(starts, dtype=np.int64), name="time")
     if frame is None or frame.empty or not len(index):
         out = pd.DataFrame(np.nan, index=index, columns=["open", "high", "low", "close", "volume"])
         out["count"] = 0
+        out["last"] = np.nan
         return out
     data = frame[CANDLE_COLUMNS].sort_values("time")
     owner = _owners(data["time"].to_numpy(dtype=np.int64), index.to_numpy(), np.asarray(ends, dtype=np.int64))
@@ -98,36 +103,29 @@ def store_rows(store, since=INT64_MIN, before=INT64_MAX, volume_store=None) -> p
 
     volume 列是这根 30s 已知的成交量, 只有期货的覆盖判定用得到: 来自 volume_store(tick 口径
     的历史文件)里核对通过的行, buy + sell + unknown 就是 K 线成交量; 其余为 NaN。
+    买卖量与来源直接切 HistoryStore 的索引数组; 对照列与成交量存在按时间的字典里, 只能逐根取。
     """
-    times = store.times_between(since, before)
+    times, buy, sell, codes = store.display_between(since, before)
     if not len(times):
         return pd.DataFrame(columns=ROW_COLUMNS)
-    values, estimates, legacy = store.values, store.estimates, None   # legacy 要复制一份, 用到才取
+    keys = times.tolist()
+    # 对照列: 主文件的优先, 其次旧估算文件的(同 HistoryStore._fill_extra); 旧历史本身就是旧算法口径
     extra, estimated_extra = store.extra, store.estimated_extra
-    reference = volume_store.values if volume_store is not None else {}
-    reference_extra = volume_store.extra if volume_store is not None else {}
-    rows = []
-    for t in times.tolist():
-        if t in values:
-            (buy, sell), coverage = values[t], "complete"
-        elif t in estimates:
-            (buy, sell), coverage = estimates[t], "partial"
-        else:
-            legacy = store.legacy if legacy is None else legacy
-            (buy, sell), coverage = legacy[t], "legacy"
-        if coverage == "legacy":       # 旧历史本身就是旧算法口径
-            unknown, buy_legacy, sell_legacy = 0.0, buy, sell
-        else:                          # 对照列: 主文件的优先, 其次旧估算文件的(同 HistoryStore._fill_extra)
-            columns = extra.get(t) or estimated_extra.get(t) or {}
-            unknown = columns.get("unknown", np.nan)
-            buy_legacy, sell_legacy = columns.get("buyLegacy", np.nan), columns.get("sellLegacy", np.nan)
-        known = reference.get(t)
-        volume = (known[0] + known[1] + ((reference_extra.get(t) or {}).get("unknown") or 0.0)
-                  if known is not None else np.nan)
-        rows.append((t, buy, sell, unknown, buy_legacy, sell_legacy, coverage, False, volume))
-    frame = pd.DataFrame(rows, columns=ROW_COLUMNS)
-    frame[[*SUM_COLUMNS, "volume"]] = frame[[*SUM_COLUMNS, "volume"]].astype(float)
-    return frame
+    columns = [extra.get(t) or estimated_extra.get(t) or _NO_EXTRA for t in keys]
+    unknown, buy_legacy, sell_legacy = (np.array([row.get(name, np.nan) for row in columns], dtype=float)
+                                        for name in ("unknown", "buyLegacy", "sellLegacy"))
+    legacy = codes == 2
+    unknown[legacy], buy_legacy[legacy], sell_legacy[legacy] = 0.0, buy[legacy], sell[legacy]
+    volume = np.full(len(keys), np.nan)
+    if volume_store is not None:
+        reference, reference_extra = volume_store.values, volume_store.extra
+        known = [reference.get(t) for t in keys]
+        volume = np.array([np.nan if k is None else
+                           k[0] + k[1] + ((reference_extra.get(t) or _NO_EXTRA).get("unknown") or 0.0)
+                           for t, k in zip(keys, known)], dtype=float)
+    return pd.DataFrame({"time": times, "buy": buy, "sell": sell, "unknown": unknown, "buyLegacy": buy_legacy,
+                         "sellLegacy": sell_legacy, "coverage": COVERAGES[codes], "hasBaseline": False,
+                         "volume": volume}, columns=ROW_COLUMNS)
 
 
 def recent_rows(recent: pd.DataFrame | None) -> pd.DataFrame:
@@ -201,14 +199,6 @@ def finish_bars(candles: pd.DataFrame, stats: pd.DataFrame, tf: int, rule: str =
     return out[BAR_COLUMNS]
 
 
-def rollup_bars(candles: pd.DataFrame, rows: pd.DataFrame, tf: int, rule: str = "volume") -> pd.DataFrame:
-    """一次算完: 大周期开高低收量 + 底层 30s 行 -> 大周期 bars 表(不走缓存, 见 finish_bars)。"""
-    if candles is None or candles.empty:
-        return pd.DataFrame(columns=BAR_COLUMNS)
-    starts = candles["time"].to_numpy(dtype=np.int64)
-    return finish_bars(candles, bucket_stats(rows, starts, bucket_ends(starts, tf)), tf, rule)
-
-
 class ClosedCache:
     """已收尾的桶(30s 全在历史文件里)的合成结果, 按来源历史文件的改动记录增量维护。
 
@@ -217,18 +207,22 @@ class ClosedCache:
     """
 
     def __init__(self):
-        self.ident = None
+        # 来源的弱引用: 认实例不能用 id(), 底层回收重建后新实例可能正好落在旧地址上, 版本号却从头数起
+        self.sources = []
         self.revisions = []
         self.frame = None      # 按桶起点索引; _known 列标出算过的桶
 
+    def _same_sources(self, sources) -> bool:
+        return (len(self.sources) == len(sources)
+                and all(ref() is source for ref, source in zip(self.sources, sources)))
+
     def get(self, sources, starts, ends, compute) -> pd.DataFrame:
         """starts/ends: 现在要的已收尾各桶; compute(lo, hi, starts, ends) 算出这些桶(每桶一行)。"""
-        ident = tuple(id(source) for source in sources)
         starts = np.asarray(starts, dtype=np.int64)
         ends = np.asarray(ends, dtype=np.int64)
         if not len(starts):
             return compute(0, 0, starts, ends)     # 一根已收尾的都没有: 给一张同列的空表
-        if self.ident != ident or self.frame is None:
+        if not self._same_sources(sources) or self.frame is None:
             known = np.zeros(len(starts), dtype=bool)
             frame = None
         else:
@@ -244,10 +238,23 @@ class ClosedCache:
             fresh["_known"] = True
             parts = [fresh] if frame is None or not known.any() else [frame[known], fresh]
             frame = pd.concat(parts).sort_index() if len(parts) > 1 else fresh
-        self.ident = ident
+        self.sources = [weakref.ref(source) for source in sources]
         self.revisions = [source.revision for source in sources]
         self.frame = frame
         return frame.drop(columns="_known")
+
+
+def split_buckets(starts, ends, edge, cache: ClosedCache, sources, closed, recent) -> pd.DataFrame:
+    """各桶分两段算, 按桶起点索引拼起来(每桶一行)。
+
+    整根早于 edge(底层最近窗口的第一根)的已收尾, 30s 全在历史文件里: closed(lo, hi, starts, ends) 从文件算,
+    经 cache 按 sources 的改动记录增量维护。其余由 recent(lo, starts, ends) 用文件里 [lo, edge) 加最近窗口现算。
+    """
+    done = ends <= edge
+    parts = [cache.get(sources, starts[done], ends[done], closed)]
+    if not done.all():
+        parts.append(recent(int(starts[~done][0]), starts[~done], ends[~done]))
+    return pd.concat(parts) if len(parts) > 1 else parts[0]
 
 
 class RollupMixin:
@@ -306,20 +313,17 @@ class RollupMixin:
         if volume_store is not None and volume_store is not store:
             volume_store.refresh()
         starts = candles["time"].to_numpy(dtype=np.int64)
-        ends = bucket_ends(starts, self.tf)
-        window = int(recent["time"].iloc[0]) if not recent.empty else INT64_MAX
-        closed = ends <= window
-        sources = [store] if volume_store is None or volume_store is store else [store, volume_store]
-        cache = self._closed.setdefault(ltf, ClosedCache())
-        parts = [cache.get(sources, starts[closed], ends[closed],
-                           lambda lo, hi, s, e: bucket_stats(store_rows(store, lo, hi, volume_store), s, e))]
-        if not closed.all():
-            lo = int(starts[~closed][0])
-            rows = [frame for frame in (store_rows(store, lo, window, volume_store), recent_rows(recent))
+        edge = int(recent["time"].iloc[0]) if not recent.empty else INT64_MAX
+
+        def fresh(lo, s, e):
+            rows = [frame for frame in (store_rows(store, lo, edge, volume_store), recent_rows(recent))
                     if not frame.empty]
-            parts.append(bucket_stats(pd.concat(rows, ignore_index=True) if rows else None,
-                                      starts[~closed], ends[~closed]))
-        return pd.concat(parts) if len(parts) > 1 else parts[0]
+            return bucket_stats(pd.concat(rows, ignore_index=True) if rows else None, s, e)
+
+        sources = [store] if volume_store is None or volume_store is store else [store, volume_store]
+        return split_buckets(starts, bucket_ends(starts, self.tf), edge, self._closed.setdefault(ltf, ClosedCache()),
+                             sources, lambda lo, hi, s, e: bucket_stats(store_rows(store, lo, hi, volume_store), s, e),
+                             fresh)
 
     def recompute(self, broadcast):
         """各粒度: 合成 -> 用底层历史文件的累计和算 CVD -> 出快照与增量消息。"""
