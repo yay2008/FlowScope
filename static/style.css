@@ -204,6 +204,37 @@ body { display: flex; flex-direction: column; }
   pointer-events: auto;
 }
 .tf-select option { background: #1e222d; color: #d1d4dc; }
+.chart-corner-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+/* 测量按钮: 正在量(等点起点 / 拉区间)时高亮 */
+.measure-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid #2a2e39;
+  border-radius: 3px;
+  background: rgba(30, 34, 45, 0.85);
+  color: #9598a1;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.measure-btn:hover { color: #d1d4dc; }
+.measure-btn.on { color: #131722; background: #f0b90d; border-color: #f0b90d; }
+.measure-hint {
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(30, 34, 45, 0.85);
+  color: #f0b90d;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.measure-hint[hidden] { display: none; }
 
 /* 主图指标图例: 名称 + 眼睛按钮(显示/隐藏), 每张图一份 */
 .main-legend {
@@ -226,7 +257,20 @@ body { display: flex; flex-direction: column; }
 .ml-item:hover { background: rgba(42, 46, 57, 0.85); }
 .ml-name { font-weight: 600; cursor: default; }
 .ml-params { display: inline-flex; gap: 4px; color: #9598a1; }
-.ml-item.off .ml-name, .ml-item.off .ml-params { opacity: 0.4; }
+/* FlowWave带 的带宽是按钮(点一下切下一档), 外观与其他参数一致, 只在悬停时提示可点;
+   后面的「中线」开关同样是文字按钮: 亮 = 显示, 暗 = 隐藏 */
+button.ml-params, .ml-toggle {
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  cursor: pointer;
+}
+button.ml-params:hover:not(:disabled), .ml-toggle:hover:not(:disabled) { color: #d1d4dc; text-decoration: underline dotted; }
+button.ml-params:disabled, .ml-toggle:disabled { cursor: default; }
+.ml-toggle { color: #9598a1; opacity: 0.45; }
+.ml-toggle.on { color: #d1d4dc; opacity: 1; }
+.ml-item.off .ml-name, .ml-item.off .ml-params, .ml-item.off .ml-toggle { opacity: 0.4; }
 .ml-eye {
   display: inline-flex;
   padding: 0;

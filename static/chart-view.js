@@ -5,15 +5,15 @@
  * 渲染: 三个 pane: K线(可叠加 WaveTrend) / Volume Suite / LSMA×CRVOL;
  * 阈值与配色按 Volume Suite (By Leviathan) 口径在前端实时计算(纯计算在 indicators.js)。
  *
- * 工具栏状态(模式/阈值/视图/带宽/WT信号/CVD口径与拆分粒度)由页面持有, 以 settings 对象按引用传进来、
- * 多张图共用; 组件只读不写, 页面改完再调对应的刷新入口(见 create 的返回值)。
+ * 工具栏状态(模式/阈值/视图/WT信号/CVD口径与拆分粒度, 加上图例里切的带宽)由页面持有, 以 settings 对象按引用
+ * 传进来、多张图共用; 组件只读不写, 页面改完再调对应的刷新入口(见 create 的返回值)。
  * 主图指标的显示开关不在 settings 里: 每张图左上角各有一份图例, 眼睛按钮只管本图。
  * 连接状态、顶部读数和多图联动(十字光标、可视时间范围)是页面的事, 组件通过回调报出事件、
  * 提供按时间操作的入口, 时间在不同周期之间怎么对应由组件按本图的 bar 换算。
  */
 (function (root) {
   "use strict";
-  const { LW, WT, EMA_PERIODS, buyOf, sellOf, deltaOf } = FlowIndicators;
+  const { LW, BAND, WT, EMA_PERIODS, buyOf, sellOf, deltaOf } = FlowIndicators;
 
   // 可选主周期(秒), 与后端 indicator.TF_OPTIONS 一致(tests/test_rollup.py 核对两边相同)
   const TF_CHOICES = [10, 30, 60, 300, 900, 3600, 14400];
@@ -182,15 +182,22 @@
   }
 
   // ---------- FlowWave 主图叠加: 价格回归通道带(custom series) ----------
-  // lightweight-charts v5 没有"两条线之间填充"的原生 series, 所以和足迹图一样走 addCustomSeries,
-  // 自己在画布上填多边形: 相邻两根 bar 之间画一个梯形(颜色取左端那根的状态), 再描上下轨。
+  // lightweight-charts v5 没有"两条线之间填充"的原生 series, 所以和足迹图一样走 addCustomSeries, 自己在画布上画。
+  // 平时只描两条很淡的上下轨(不填底色: 中性段占大半, 铺满灰底会压暗 K 线)。中线默认不画(和 EMA21 挤在一起),
+  // 图例里的「中线」开关打开时画成淡虚线, 和 EMA 的实线分得开; 开关经 series 选项 midVisible 传进来。
+  // 只有 wt2 超买/超卖的 bar 才上色 —— 把中线到触发那条轨(超买上轨 / 超卖下轨)之间的半边填红/绿,
+  // 并把那条轨加粗加深, 一眼看出"价格压在上轨/贴着下轨"。首次越界不再另外打点: 上色段的起点就是它。
+  // 颜色按 bar 归属: 相邻两根在中点切开, 左半段归左边那根、右半段归右边那根, 所以只超买一根也有一小段颜色,
+  // 最新一根(右边还没有 bar)的状态也画得出来。
   // 只在时间上真正相邻的 bar 之间连(idx 差 1), 否则会横跨休市拉出一条假带。
   class BandRenderer {
     constructor() {
       this._data = null;
+      this._midVisible = false;
     }
-    update(data) {   // 第二个参数是 series 选项(足迹图用它取 tickSize), 这条带没有可配置项
+    update(data, options) {   // options 是 series 选项, 这条带只认 midVisible
       this._data = data;
+      this._midVisible = !!options?.midVisible;
     }
     _color(state, alpha) {   // 与副图配色同源: 超买红 / 超卖绿 / 中性灰
       if (state > 0) return `rgba(242, 54, 69, ${alpha})`;
@@ -208,36 +215,58 @@
         for (let i = range.from; i < range.to; i++) {
           const d = bars[i].originalData;
           const yUp = priceConverter(d.up), yDn = priceConverter(d.dn), yMid = priceConverter(d.mid);
-          pts.push(yUp == null || yDn == null
+          pts.push(yUp == null || yDn == null || yMid == null
             ? null
             : { x: bars[i].x, yUp, yDn, yMid, state: d.state, idx: d.idx });
         }
-        for (let i = 1; i < pts.length; i++) {          // 带底填充
+        // 相邻两根在中点切成两段, 各按自己那根的状态分进三类; 同类的段并进同一条路径一次画完:
+        // 相邻多边形之间不会有抗锯齿细缝, 半透明的轨线在接头处也不会叠深
+        const quiet = [], hotUp = [], hotDn = [];   // 段 [左端, 右端], 端点 {x, yUp, yDn, yMid}
+        const whole = [];                           // 不切开的相邻两根, 中线用(虚线要一笔画完, 切开会打乱虚线节奏)
+        for (let i = 1; i < pts.length; i++) {
           const a = pts[i - 1], b = pts[i];
           if (!a || !b || b.idx !== a.idx + 1) continue;
-          ctx.fillStyle = this._color(a.state, 0.10);
-          ctx.beginPath();
-          ctx.moveTo(a.x, a.yUp); ctx.lineTo(b.x, b.yUp);
-          ctx.lineTo(b.x, b.yDn); ctx.lineTo(a.x, a.yDn);
-          ctx.closePath();
-          ctx.fill();
-        }
-        for (let i = 1; i < pts.length; i++) {          // 上下轨 + 中线
-          const a = pts[i - 1], b = pts[i];
-          if (!a || !b || b.idx !== a.idx + 1) continue;
-          // 触到超买/超卖的段把对应轨线加深(填充仍是淡的), 一眼能看出"价格压在上轨/贴着下轨"
-          const hotUp = a.state > 0 || b.state > 0;
-          const hotDn = a.state < 0 || b.state < 0;
-          ctx.lineWidth = 1;
-          ctx.strokeStyle = this._color(a.state, hotUp ? 0.85 : 0.35);
-          ctx.beginPath(); ctx.moveTo(a.x, a.yUp); ctx.lineTo(b.x, b.yUp); ctx.stroke();
-          ctx.strokeStyle = this._color(a.state, hotDn ? 0.85 : 0.35);
-          ctx.beginPath(); ctx.moveTo(a.x, a.yDn); ctx.lineTo(b.x, b.yDn); ctx.stroke();
-          if (a.yMid != null && b.yMid != null) {
-            ctx.strokeStyle = "rgba(209, 212, 220, 0.35)";
-            ctx.beginPath(); ctx.moveTo(a.x, a.yMid); ctx.lineTo(b.x, b.yMid); ctx.stroke();
+          whole.push([a, b]);
+          const m ={ x: (a.x + b.x) / 2, yUp: (a.yUp + b.yUp) / 2, yDn: (a.yDn + b.yDn) / 2,
+                      yMid: (a.yMid + b.yMid) / 2 };
+          for (const [p, q, state] of [[a, m, a.state], [m, b, b.state]]) {
+            (state > 0 ? hotUp : state < 0 ? hotDn : quiet).push([p, q]);
           }
         }
+        const fillHalf = (segs, edge, color) => {     // 中线到 edge 那条轨之间
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          for (const [p, q] of segs) {
+            ctx.moveTo(p.x, p[edge]); ctx.lineTo(q.x, q[edge]);
+            ctx.lineTo(q.x, q.yMid); ctx.lineTo(p.x, p.yMid);
+            ctx.closePath();
+          }
+          ctx.fill();
+        };
+        const stroke = (parts, color, width) => {     // parts: [[段列表, 哪条轨], ...]
+          ctx.strokeStyle = color;
+          ctx.lineWidth = width;
+          ctx.beginPath();
+          for (const [segs, edge] of parts) {
+            let last = null;   // 前一段的右端就是这一段的左端(同一个对象)时接着画, 拐角才有正常的折线接头
+            for (const [p, q] of segs) {
+              if (p !== last) ctx.moveTo(p.x, p[edge]);
+              ctx.lineTo(q.x, q[edge]);
+              last = q;
+            }
+          }
+          ctx.stroke();
+        };
+        fillHalf(hotUp, "yUp", this._color(1, 0.16));
+        fillHalf(hotDn, "yDn", this._color(-1, 0.16));
+        if (this._midVisible) {
+          ctx.setLineDash([4, 4]);
+          stroke([[whole, "yMid"]], this._color(0, 0.45), 1);
+          ctx.setLineDash([]);
+        }
+        stroke([[quiet, "yUp"], [quiet, "yDn"], [hotUp, "yDn"], [hotDn, "yUp"]], this._color(0, 0.28), 1);
+        stroke([[hotUp, "yUp"]], this._color(1, 0.9), 1.5);
+        stroke([[hotDn, "yDn"]], this._color(-1, 0.9), 1.5);
       });
     }
   }
@@ -246,7 +275,7 @@
     constructor() {
       this._renderer = new BandRenderer();
     }
-    defaultOptions() { return { priceLineVisible: false, lastValueVisible: false }; }
+    defaultOptions() { return { priceLineVisible: false, lastValueVisible: false, midVisible: false }; }
     renderer() { return this._renderer; }
     update(data, options) { this._renderer.update(data, options); }
     priceValueBuilder(plotRow) {
@@ -316,7 +345,7 @@
     { key: "ema", name: "EMA", params: true,
       title: "主图指数移动平均线, 周期 21 / 55 / 100 / 200, 按收盘价计算" },
     { key: "band", name: "FlowWave带", params: true,
-      title: "FlowWave 的回归通道(不影响副图 FlowWave): 中线 = 收盘价线性回归 21 根, 上下轨 = 中线 ±k 倍回归残差标准差(k 由工具栏「带宽」选); wt2 超买(大于80)段染红、超卖(小于20)段染绿, 首次越界处在上/下轨打点。轨道是真实价格, 可当动态支撑压力看。" },
+      title: "FlowWave 的回归通道(不影响副图 FlowWave): 中线 = 收盘价线性回归 21 根(默认不画, 点后面的「中线」显示成淡虚线), 上下轨 = 中线 ±k 倍回归残差标准差(k 点后面的「2σ」切换)。平时只有两条淡轨线; wt2 超买(大于80)时中线到上轨之间染红、上轨加粗, 超卖(小于20)时中线到下轨之间染绿、下轨加粗, 上色段的起点就是首次越界。轨道是真实价格, 可当动态支撑压力看。" },
     { key: "wt", name: "WaveTrend", params: false,
       title: "WaveTrend(LazyBear / DGT vX)。主图上画三样: ① 交叉箭头 —— 振荡线穿越信号线(振荡值的 4 根均线)时, K 线下方绿色金叉、上方红色死叉(档位在工具栏「WT信号」); ② 背离 —— 在 K 线低点/高点之间连线(RB/HB 常规/隐藏看涨, RS/HS 常规/隐藏看跌, 枢轴要等右侧 5 根才确认); ③ ±53/±60/0 参考线 —— 按每根最近 200 根的最高/最低价通道换算成价格(±60 在通道上下沿、0 在中线), 所以随通道起伏、不是水平线, 跟着价格轴拖动缩放, 不参与价格轴自动缩放。振荡线、信号线本身不画, 原数看顶部图例的 WT。" },
   ];
@@ -369,6 +398,130 @@
     return i + (t - bars[i].time) / (bars[i + 1].time - bars[i].time);
   }
 
+  // ---------- 测量工具 ----------
+  // 每张图左上角的尺子按钮(或按住 Shift 点主图)开始测量: 第一下点起点, 移动鼠标拉出区间, 第二下定住终点,
+  // 定住后再点一下图表(或按 Esc、点尺子)清掉。两端的时间吸附到最近的 bar(不越出首末根), 价格取鼠标所在价位。
+  // 读数三行: 涨跌(终点相对起点, 按点击先后)、K 线根数与时长、起止时刻。根数是两端 bar 的下标差(同 TradingView,
+  // 只数真实存在的 bar), 时长是两端 bar 起点之间的钟面时间, 跨了休市两者对不上是正常的。
+
+  // 与自选面板、交易面板一致: 涨红跌绿
+  const MEASURE_COLORS = {
+    up: { line: "#f23645", fill: "rgba(242, 54, 69, 0.14)", text: "#ffffff" },
+    down: { line: "#00e676", fill: "rgba(0, 230, 118, 0.12)", text: "#131722" },
+  };
+  const MEASURE_FONT = '12px -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
+
+  // 时长(秒) -> 「40秒」「6分钟30秒」「2小时5分钟」「1天3小时」: 只留最大的两级单位, 下一级为 0 就不写
+  function formatDuration(seconds) {
+    const units = [[86400, "天"], [3600, "小时"], [60, "分钟"], [1, "秒"]];
+    const total = Math.round(Math.abs(seconds));
+    for (let k = 0; k < units.length; k++) {
+      const [size, name] = units[k];
+      if (total < size) continue;
+      const head = `${Math.floor(total / size)}${name}`;
+      const next = units[k + 1];
+      const tail = next ? Math.floor((total % size) / next[0]) : 0;
+      return tail ? `${head}${tail}${next[1]}` : head;
+    }
+    return "0秒";
+  }
+
+  // 测量读数: a 起点、b 终点, 都是 {time, price}(time 是 bar 的时间)。调用方保证 bars 非空
+  function measureStats(bars, tf, a, b) {
+    const change = b.price - a.price;
+    return {
+      count: Math.round(Math.abs(logicalAtTime(bars, tf, b.time) - logicalAtTime(bars, tf, a.time))),
+      seconds: Math.abs(b.time - a.time),
+      change,
+      pct: a.price ? (change / a.price) * 100 : null,
+    };
+  }
+
+  // 带正负号, 四舍五入成 0 时不带号(不显示「-0」)
+  function signed(v, digits) {
+    const text = v.toFixed(digits);
+    return Number(text) > 0 ? `+${text}` : Number(text) < 0 ? text : text.replace("-", "");
+  }
+
+  // 读数框的三行。价格位数同顶栏读数; 起止时刻与时间轴同一口径(UTC 显示), 两端在同一天就只写时刻
+  function measureLines(stats, a, b, tf, digits) {
+    const from = Math.min(a.time, b.time), to = Math.max(a.time, b.time);
+    const stamp = (t) => new Date(t * 1000).toISOString().slice(5, tf < 60 ? 19 : 16).replace("T", " ");
+    const sameDay = stamp(from).slice(0, 5) === stamp(to).slice(0, 5);
+    const clock = (t) => (sameDay ? stamp(t).slice(6) : stamp(t));
+    return [
+      `${signed(stats.change, digits)}  ${stats.pct == null ? "-" : signed(stats.pct, 2) + "%"}`,
+      `${stats.count} 根 · ${formatDuration(stats.seconds)}`,
+      `${clock(from)} → ${clock(to)}`,
+    ];
+  }
+
+  function drawArrow(ctx, xa, ya, xb, yb) {
+    ctx.beginPath(); ctx.moveTo(xa, ya); ctx.lineTo(xb, yb); ctx.stroke();
+    const len = Math.hypot(xb - xa, yb - ya);
+    if (len < 8) return;   // 太短就不画箭头
+    const ux = (xb - xa) / len, uy = (yb - ya) / len, s = 5;
+    ctx.beginPath();
+    ctx.moveTo(xb - ux * s - uy * s, yb - uy * s + ux * s);
+    ctx.lineTo(xb, yb);
+    ctx.lineTo(xb - ux * s + uy * s, yb - uy * s - ux * s);
+    ctx.stroke();
+  }
+
+  // 测量区间挂在 K 线 series 上, zOrder 为 top: 画在所有 series(EMA、参考线、足迹格子)之上。不挂窗格
+  // (pane primitive): 实测窗格图元的 top 仍画在 series 之下, 读数框会被 K 线压住。series 隐藏(足迹图视图)时
+  // 它的 top 图元照画。坐标每次绘制时按时间/价格现算, 跟着滚动缩放走; geometry() 返回 null 就不画。
+  class MeasurePrimitive {
+    constructor(geometry) {
+      this._geometry = geometry;
+      this._requestUpdate = null;
+      this._view = { zOrder: () => "top", renderer: () => ({ draw: (target) => this._draw(target) }) };
+    }
+    attached({ requestUpdate }) { this._requestUpdate = requestUpdate; }
+    detached() { this._requestUpdate = null; }
+    refresh() {
+      if (this._requestUpdate) this._requestUpdate();
+    }
+    updateAllViews() {}
+    paneViews() { return [this._view]; }
+    _draw(target) {
+      const g = this._geometry();
+      if (!g) return;
+      const color = g.up ? MEASURE_COLORS.up : MEASURE_COLORS.down;
+      target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
+        const left = Math.min(g.x1, g.x2), top = Math.min(g.y1, g.y2);
+        const width = Math.abs(g.x2 - g.x1), height = Math.abs(g.y2 - g.y1);
+        ctx.fillStyle = color.fill;
+        ctx.fillRect(left, top, width, height);
+        // 区间中间一横一竖两支箭头, 都从起点那一侧指向终点
+        const cx = (g.x1 + g.x2) / 2, cy = (g.y1 + g.y2) / 2;
+        ctx.strokeStyle = color.line;
+        ctx.lineWidth = 1;
+        drawArrow(ctx, g.x1, cy, g.x2, cy);
+        drawArrow(ctx, cx, g.y1, cx, g.y2);
+        // 读数框贴在终点价位那一侧(涨在区间上方、跌在下方), 挤不下时收进窗格内; 区间整个滚出左右两侧就不画
+        if (left + width < 0 || left > mediaSize.width) return;
+        ctx.font = MEASURE_FONT;
+        const pad = 6, lineH = 16;
+        const boxW = Math.max(...g.lines.map((s) => ctx.measureText(s).width)) + pad * 2;
+        const boxH = g.lines.length * lineH + pad;
+        const bx = Math.min(Math.max(cx - boxW / 2, 4), mediaSize.width - boxW - 4);
+        const by = Math.min(Math.max(g.up ? top - boxH - 6 : top + height + 6, 4), mediaSize.height - boxH - 4);
+        ctx.fillStyle = color.line;
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(bx, by, boxW, boxH, 4);
+        else ctx.rect(bx, by, boxW, boxH);
+        ctx.fill();
+        ctx.fillStyle = color.text;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        g.lines.forEach((s, k) => ctx.fillText(s, bx + boxW / 2, by + pad / 2 + lineH * (k + 0.5)));
+      });
+    }
+  }
+  // 尺子图标
+  const RULER_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 17 17 3l4 4L7 21z"/><path d="M6.5 13.5l2 2M9.5 10.5l1.5 1.5M12.5 7.5l2 2M15.5 4.5l1.5 1.5"/></svg>';
+
   function fmt(v, digits = 0) {
     return v == null ? "-" : Number(v).toFixed(digits);
   }
@@ -382,20 +535,23 @@
    *   tf        初始主周期(秒), 之后由左上角的下拉框切换(setTf)
    *   symbol    合约代码(切合约是整页重载, 所以也不变)
    *   settings  页面的工具栏状态, 按引用共用, 组件只读
-   *   shown     本图主图指标的初始显示开关 {ema, band, wt}, 之后由本图图例的眼睛按钮切换
+   *   shown     本图主图指标的初始显示开关 {ema, band, wt, bandMid}, 之后由本图图例的眼睛按钮切换
+   *             (bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换)
    * 回调(都可省略):
    *   onStatus(ok, text)        连接状态变了
    *   onLegend(text, coverage)  十字光标所在 bar(或最新一根)的读数与覆盖标记
    *   onConfig()                拿到服务端下发的 cfg(本周期合法的拆分粒度以它为准)
    *   onShownChange()           用户点了本图图例的眼睛按钮(新状态用 shown() 取)
+   *   onBandK(k)                用户点了本图图例里的带宽, k 是循环到的下一档(两张图共用, 由页面写进 settings
+   *                             再调各图的 rebuildBand)
    *   onCrosshair(time, price)  本图十字光标动了(用户移动, 或光标停着时本图数据变了); 移出图表时
    *                             time 为 null, 光标不在主图窗格时 price 为 null
    *   onRangeChange()           本图的可视范围变了(用户缩放拖动, 也包括新 bar 自动右移、加载后滚到最新)
    *   onTfChange()              用户在左上角切换了本图周期(新周期用 tf 取, 本图已开始按新周期加载)
    */
   function create({ host, tf, symbol, settings, shown: initialShown, onStatus = noop, onLegend = noop,
-                    onConfig = noop, onShownChange = noop, onCrosshair = noop, onRangeChange = noop,
-                    onTfChange = noop }) {
+                    onConfig = noop, onShownChange = noop, onBandK = noop, onCrosshair = noop,
+                    onRangeChange = noop, onTfChange = noop }) {
     let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
     let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
     let derived = null;   // 派生数组(rolling sma/zscore 等)
@@ -412,7 +568,7 @@
     let loadController = null;
     let retryTimer = null;
     let retryAttempts = 0;
-    const shown = { ema: true, band: false, wt: true, ...initialShown };   // 本图主图指标的显示开关
+    const shown = { ema: true, band: false, wt: true, bandMid: false, ...initialShown };   // 本图主图指标的显示开关
 
     // ---------- 容器: 图表本身 + 左上角的周期下拉框和主图指标图例 ----------
 
@@ -432,11 +588,27 @@
     badge.title = "主图周期：K 线、成交量、CVD 都按该周期计算，1 分钟及以上由 30s 合成（足迹图只有 10s、30s）。" +
                   "指标长度按根数固定（与 TradingView 切周期行为一致），周期越大，同样根数覆盖的时长越长。";
     badge.addEventListener("change", () => setTf(Number(badge.value)));
-    corner.appendChild(badge);
+    // 周期下拉框右边是测量按钮(说明见文件上部「测量工具」), 量的过程中旁边提示下一步
+    const measureBtn = document.createElement("button");
+    measureBtn.type = "button";
+    measureBtn.className = "measure-btn";
+    measureBtn.innerHTML = RULER_SVG;
+    measureBtn.title = "测量：点击起点、再点击终点，显示涨跌幅、K 线根数、时长和起止时刻；" +
+                       "也可以按住 Shift 在主图上点击直接开始。量完再点一下图表或按 Esc 清除。";
+    measureBtn.addEventListener("click", () => toggleMeasure());
+    const measureHint = document.createElement("span");
+    measureHint.className = "measure-hint";
+    measureHint.hidden = true;
+    const cornerRow = document.createElement("div");
+    cornerRow.className = "chart-corner-row";
+    cornerRow.append(badge, measureBtn, measureHint);
+    corner.appendChild(cornerRow);
     el.appendChild(corner);
     host.appendChild(el);
 
-    // 主图指标图例: 每行 名称 + 参数 + 眼睛按钮, 眼睛只管本图
+    // 主图指标图例: 每行 名称 + 参数 + 眼睛按钮, 眼睛只管本图。
+    // FlowWave带 的参数(带宽)是个按钮, 点一下按 BAND.kOptions 循环到下一档; 两张图共用, 交给页面去改。
+    // 它后面还有「中线」开关(亮 = 显示), 和眼睛一样只管本图、记进显示开关。
     const legendEl = document.createElement("div");
     legendEl.className = "main-legend";
     const legendRows = {};
@@ -449,11 +621,27 @@
       name.title = item.title;
       name.textContent = item.name;
       row.appendChild(name);
-      let params = null;
+      let params = null, mid = null;
       if (item.params) {
-        params = document.createElement("span");
+        params = document.createElement(item.key === "band" ? "button" : "span");
         params.className = "ml-params";
         row.appendChild(params);
+      }
+      if (item.key === "band") {
+        params.type = "button";
+        params.title = "带宽 k: 上下轨 = 中线 ±k 倍回归残差标准差。点击按 " +
+          BAND.kOptions.map((k) => `${k}σ`).join(" → ") + " 循环切换, 两张图共用; 本图的带关着时不能点。" +
+          "实测 800 根 fu 30s 的收盘包含率: 1.5σ 81.1% / 2σ 91.0% / 2.5σ 96.6%。越窄触碰越多、假信号也越多, 越宽越少被穿。";
+        params.addEventListener("click", () => {
+          const ks = BAND.kOptions;
+          onBandK(ks[(ks.indexOf(settings.bandK) + 1) % ks.length]);
+        });
+        mid = document.createElement("button");
+        mid.className = "ml-toggle";
+        mid.type = "button";
+        mid.textContent = "中线";
+        mid.addEventListener("click", () => toggleShown("bandMid"));
+        row.appendChild(mid);
       }
       const eye = document.createElement("button");
       eye.className = "ml-eye";
@@ -462,7 +650,7 @@
       eye.addEventListener("click", () => toggleShown(item.key));
       row.appendChild(eye);
       legendEl.appendChild(row);
-      legendRows[item.key] = { row, params, eye };
+      legendRows[item.key] = { row, params, mid, eye };
     }
     EMA_PERIODS.forEach((p, j) => {   // EMA 的周期按各自线色列出, 兼当色标
       const span = document.createElement("span");
@@ -515,11 +703,6 @@
 
     // 主图可选叠加: FlowWave 回归通道带(默认隐藏, 由主图左上角图例的眼睛按钮控制)
     const bandSeries = chart.addCustomSeries(new BandSeries(), { visible: false }, 0);
-    const bandDotOpts = { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 3,
-                          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
-                          visible: false };
-    const bandDotHigh = chart.addSeries(LightweightCharts.LineSeries, { ...bandDotOpts, color: "#f7525f" }, 0);
-    const bandDotLow = chart.addSeries(LightweightCharts.LineSeries, { ...bandDotOpts, color: "#00e676" }, 0);
     // 初始可见性由状态变量决定(而不是只靠 series 创建时的 visible:false), 否则默认值一改就会状态与画面不一致
     applyBandVisibility();
 
@@ -818,43 +1001,18 @@
       return out;
     }
 
-    // 越界打点只打在"首次越界"那一根: 连续越界每根都打会把主图糊满
-    // (实测 800 根 fu 30s: 上穿 80 共 22 次、下穿 20 共 15 次, 合计约 4.6% 的 bar, 密度正好)
-    // 复算脚本: docs/flowwave_band_probe.py
-    function buildBandDots() {
-      const { up, dn } = derived.band;
-      const wt2 = derived.lw.wt2;
-      const high = [], low = [];
-      for (let i = 0; i < bars.length; i++) {
-        if (up[i] == null || dn[i] == null || wt2[i] == null) continue;
-        // 上一根没有带(预热期)时把本根当作这一轮的第一根: 否则在预热期里开始的超买/超卖
-        // 会一根点都打不出来, 而带本身已经按状态着色了, 两者会对不上。
-        const prev = i > 0 && up[i - 1] != null ? wt2[i - 1] : null;
-        if (wt2[i] > LW.ob && (prev == null || prev <= LW.ob)) high.push({ time: bars[i].time, value: up[i] });
-        if (wt2[i] < LW.os && (prev == null || prev >= LW.os)) low.push({ time: bars[i].time, value: dn[i] });
-      }
-      return { high, low };
-    }
-
     function renderBand() {
       if (!derived || !derived.band) return;
       bandSeries.setData(buildBandData());
-      const { high, low } = buildBandDots();
-      bandDotHigh.setData(high);
-      bandDotLow.setData(low);
     }
 
     // 叠加只在 K 线视图生效: 足迹图本身已经很密, 再叠带会糊成一片; 切回 K 线按开关恢复。
-    // 图例与可见性共用这一个判据, 否则会出现"足迹图里图例报着带值、画面上却没有带"。
     function bandShown() {
       return shown.band && settings.view !== "footprint";
     }
 
-    function applyBandVisibility() {
-      const on = bandShown();
-      bandSeries.applyOptions({ visible: on });
-      bandDotHigh.applyOptions({ visible: on });
-      bandDotLow.applyOptions({ visible: on });
+    function applyBandVisibility() {   // 中线开关随带一起交给 series(带隐藏时中线自然也不画)
+      bandSeries.applyOptions({ visible: bandShown(), midVisible: shown.bandMid });
     }
 
     function emaShown() {
@@ -866,7 +1024,8 @@
       emaSeries.forEach((s) => s.applyOptions({ visible: on }));
     }
 
-    const APPLY_SHOWN = { ema: applyEmaVisibility, band: applyBandVisibility, wt: applyWtVisibility };
+    const APPLY_SHOWN = { ema: applyEmaVisibility, band: applyBandVisibility, wt: applyWtVisibility,
+                          bandMid: applyBandVisibility };
 
     // ---------- 图例 ----------
 
@@ -891,9 +1050,7 @@
       // 判向对照: 同一根 bar 同时给出新算法(买/卖/未知)与旧算法(买/卖)
       const fp = isFp ? fpBars.find((item) => item.time === b.time) : null;
       const unknown = fp ? fp.levels.reduce((sum, lv) => sum + (lv[3] || 0), 0) : (b.unknown ?? 0);
-      // 叠加带只在"画面上真有带"且这根基线可取时进图例, 免得白占位置
-      const band = bandShown() && derived.band && derived.band.up[i] != null
-        ? `  带:${px(derived.band.dn[i])}/${px(derived.band.mid[i])}/${px(derived.band.up[i])}` : "";
+      // FlowWave带 的轨道值不进读数(这一行已经很长, 轨道看价格轴即可);
       // WaveTrend 叠加轴不显示刻度, 数值只能从这里读
       const wt = wtShown() && derived.wt.osc[i] != null
         ? `  WT:${fmt(derived.wt.osc[i], 1)}/${fmt(derived.wt.sig[i], 1)}` : "";
@@ -901,13 +1058,98 @@
         `${t}  O:${px(b.open)} H:${px(b.high)} L:${px(b.low)} C:${px(b.close)}  ` +
       `  ${mode.toUpperCase()}:${suiteVal}  Δ:${vol(deltaOf(b))}  CVD:${vol(b.cvd)}` +
       `  新买/卖:${vol(b.buy)}/${vol(b.sell)} 未知:${vol(unknown)} 旧买/卖:${vol(b.buyLegacy)}/${vol(b.sellLegacy)}` +
-      `  LSMA:${fmt(derived.lw.wave[i], 1)} RVOL:${fmt(d.rvol[i], 2)} 斜率:${fmt(derived.lw.crvSlope[i], 2)}${band}${wt}`;
+      `  LSMA:${fmt(derived.lw.wave[i], 1)} RVOL:${fmt(d.rvol[i], 2)} 斜率:${fmt(derived.lw.crvSlope[i], 2)}${wt}`;
       onLegend(text, coverage);
     }
+
+    // ---------- 测量工具(交互说明见文件上部) ----------
+
+    // off: 没有测量 / armed: 等点起点 / drawing: 起点已定, 终点跟着鼠标 / done: 两端都定了, 留在图上
+    let measurePhase = "off";
+    let measureA = null, measureB = null;   // 起点、终点 {time, price}
+    const MEASURE_HINTS = { armed: "点击起点 · Esc 取消", drawing: "点击终点 · Esc 取消" };
+    const measurePrimitive = new MeasurePrimitive(measureGeometry);
+    candleSeries.attachPrimitive(measurePrimitive);
+
+    function setMeasurePhase(phase) {
+      measurePhase = phase;
+      if (phase === "off" || phase === "armed") measureA = measureB = null;
+      measureBtn.classList.toggle("on", phase === "armed" || phase === "drawing");
+      measureHint.textContent = MEASURE_HINTS[phase] || "";
+      measureHint.hidden = !MEASURE_HINTS[phase];
+      measurePrimitive.refresh();
+    }
+
+    // 正在量(等起点 / 拉区间)时点尺子是取消, 否则(没在量、已量完)是开始新的一次
+    function toggleMeasure() {
+      setMeasurePhase(measurePhase === "armed" || measurePhase === "drawing" ? "off" : "armed");
+    }
+
+    // 鼠标事件 -> 测量端点: 时间吸附到最近的 bar(不越出首末根); 价格取鼠标所在价位,
+    // 鼠标不在主图窗格时价格没有意义, 用 fallbackPrice(拉区间时就是终点原来的价位, 只动时间)
+    function measurePoint(param, fallbackPrice = null) {
+      if (!bars.length || param.logical == null || !param.point) return null;
+      const i = Math.min(Math.max(Math.round(param.logical), 0), bars.length - 1);
+      const price = param.paneIndex === 0 ? candleSeries.coordinateToPrice(param.point.y) : fallbackPrice;
+      return price == null ? null : { time: bars[i].time, price };
+    }
+
+    // 每次绘制现算: 两端按时间换成逻辑坐标(端点被裁出数据窗口时按周期外推), 读数跟着当前 bars 走
+    function measureGeometry() {
+      if (!measureA || !measureB || !bars.length) return null;
+      const ts = chart.timeScale();
+      const x1 = ts.logicalToCoordinate(logicalAtTime(bars, tf, measureA.time));
+      const x2 = ts.logicalToCoordinate(logicalAtTime(bars, tf, measureB.time));
+      const y1 = candleSeries.priceToCoordinate(measureA.price), y2 = candleSeries.priceToCoordinate(measureB.price);
+      if (x1 == null || x2 == null || y1 == null || y2 == null) return null;
+      const stats = measureStats(bars, tf, measureA, measureB);
+      return { x1, y1, x2, y2, up: stats.change >= 0,
+               lines: measureLines(stats, measureA, measureB, tf, cfg?.priceDigits ?? 0) };
+    }
+
+    // param 是十字光标事件的参数({logical, point, paneIndex}), 鼠标不在窗格里时是 null
+    function onMeasureClick(param, shiftKey) {
+      if (measurePhase === "drawing") {
+        measureB = (param && measurePoint(param, measureB.price)) || measureB;
+        setMeasurePhase("done");
+      } else if (measurePhase === "armed" || shiftKey) {
+        const point = param && param.paneIndex === 0 ? measurePoint(param) : null;   // 起点只认主图窗格
+        if (!point) return;
+        measureA = measureB = point;
+        setMeasurePhase("drawing");
+      } else if (measurePhase === "done") {
+        setMeasurePhase("off");
+      }
+    }
+
+    // 点击自己用 DOM 事件判, 不用 chart.subscribeClick: 库把间隔很短(约 300ms 内)的两下当成双击的前半截,
+    // 第二下不报, 快速量一小段时终点会点不住。位置取十字光标最近一次报的(按下之前鼠标一定先移到了那里);
+    // 按下后挪动超过几像素是拖动(平移、拉窗格), 不算点击; 左上角的按钮和图例不归这里管。
+    let lastPointer = null;
+    let pressAt = null;
+    el.addEventListener("pointerdown", (event) => {
+      pressAt = event.button === 0 && !event.target.closest(".chart-corner")
+        ? { x: event.clientX, y: event.clientY } : null;
+    });
+    el.addEventListener("pointerup", (event) => {
+      const press = pressAt;
+      pressAt = null;
+      if (press && Math.hypot(event.clientX - press.x, event.clientY - press.y) <= 4) {
+        onMeasureClick(lastPointer, event.shiftKey);
+      }
+    });
 
     // 用户移动光标时触发; 光标停着(包括 setCrosshairPosition 摆上去的)而本图数据变了, 库也会再报一次。
     // setCrosshairPosition 本身不触发。
     chart.subscribeCrosshairMove((param) => {
+      lastPointer = param.point ? param : null;
+      if (measurePhase === "drawing") {
+        const point = measurePoint(param, measureB.price);
+        if (point) {
+          measureB = point;
+          measurePrimitive.refresh();
+        }
+      }
       const price = param.time != null && param.point && param.paneIndex === 0
         ? candleSeries.coordinateToPrice(param.point.y) : null;
       onCrosshair(param.time ?? null, price);
@@ -922,6 +1164,12 @@
     function renderLegend() {
       legendEl.hidden = settings.view === "footprint";   // 足迹图下三个指标都强制隐藏, 图例也收起
       legendRows.band.params.textContent = `${settings.bandK}σ`;
+      legendRows.band.params.disabled = !shown.band;   // 带关着时调宽度看不到效果; 足迹图下图例整个收起, 不用另管
+      const mid = legendRows.band.mid;                 // 中线开关同理, 开关状态本身照旧保留
+      mid.disabled = !shown.band;
+      mid.classList.toggle("on", shown.bandMid);
+      mid.title = "中线 = 收盘价线性回归 21 根, 画成淡虚线(和 EMA 的实线分得开), 只管本图。" +
+                  (shown.bandMid ? "现在显示, 点击隐藏" : "现在隐藏, 点击显示");
       for (const key of Object.keys(legendRows)) {
         legendRows[key].row.classList.toggle("off", !shown[key]);
         legendRows[key].eye.title = shown[key] ? "隐藏" : "显示";
@@ -932,7 +1180,7 @@
       shown[key] = !shown[key];
       APPLY_SHOWN[key]();
       renderLegend();
-      updateLegend(bars.length - 1);   // 带 / WT 的读数只在显示时进顶部图例
+      updateLegend(bars.length - 1);   // WT 的读数只在显示时进顶部图例
       onShownChange();
     }
 
@@ -1205,6 +1453,7 @@
       }
       tf = next;
       badge.value = String(tf);
+      setMeasurePhase("off");   // 量的是旧周期的 bar, 换周期就清掉
       bars = [];
       fpBars = [];
       barRevision = -1;
@@ -1236,7 +1485,7 @@
       renderWtMarks() {                // WT信号档位变了: 只换箭头, 振荡线不用重画
         if (derived && derived.wt) renderWtMarks();
       },
-      rebuildBand() {                  // 带宽变了: 中线/状态/越界点都不受影响, 不必整体 derive(), 重算带即可
+      rebuildBand() {                  // 带宽变了: 中线/状态都不受影响, 不必整体 derive(), 重算带即可
         if (derived && derived.lw) {
           derived.band = deriveBand();
           renderBand();
@@ -1281,17 +1530,25 @@
         else chart.setCrosshairPosition(price ?? bar.close, bar.time, candleSeries);
       },
       hideCrosshair: () => chart.clearCrosshairPosition(),
+      cancelMeasure() {                // Esc: 取消测量, 已量完留在图上的也清掉
+        if (measurePhase !== "off") setMeasurePhase("off");
+      },
+      // 当前测量: 阶段、两端与读数(两端还没定时 stats 为 null)
+      measurement() {
+        return { phase: measurePhase, a: measureA, b: measureB,
+                 stats: measureA && measureB && bars.length ? measureStats(bars, tf, measureA, measureB) : null };
+      },
       // 以下只供测试直接读写图表内部状态
       get bars() { return bars; },
       set bars(value) { bars = value; },
       get cfg() { return cfg; },
       set cfg(value) { cfg = value; },
       get derived() { return derived; },
-      derive, levelOf, buildBandDots, renderAll, wtDivergence,
+      derive, levelOf, renderAll, wtDivergence,
     };
   }
 
   // 渲染类与时间换算一并导出, 测试直接检查
   root.ChartView = { create, FootprintRenderer, BandRenderer, BandSeries, TF_CHOICES, tfLabel, localLtfOptions,
-                     indexAtOrBefore, timeAtLogical, logicalAtTime };
+                     indexAtOrBefore, timeAtLogical, logicalAtTime, formatDuration, measureStats, measureLines };
 })(typeof globalThis !== "undefined" ? globalThis : this);

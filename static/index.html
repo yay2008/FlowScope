@@ -33,13 +33,6 @@
       <option value="footprint">足迹图</option>
     </select>
   </label>
-  <label>带宽
-    <select id="band-k" title="主图 FlowWave带 的带宽倍数 k: 上下轨 = 中线 ±k 倍回归残差标准差。实测 800 根 fu 30s 的收盘包含率: 1.5σ 81.1% / 2σ 91.0% / 2.5σ 96.6%。越窄触碰信号越多但假信号也越多, 越宽越少被穿。只在 FlowWave带 显示时可调(主图左上角的眼睛按钮)。" disabled>
-      <option value="1.5">1.5σ</option>
-      <option value="2" selected>2σ</option>
-      <option value="2.5">2.5σ</option>
-    </select>
-  </label>
   <label>WT信号
     <select id="wt-signal" title="主图 WaveTrend 的交叉箭头: 振荡线穿越信号线(振荡值的 4 根均线; 两条线图上都不画)的那一根, 金叉打在 K 线下方(绿)、死叉打在上方(红)。强信号(原版默认): 只标超卖区(振荡值低于 -56.5)的金叉与超买区(高于 56.5)的死叉; 全部信号: 另外标 0 轴下方金叉/上方死叉(中号)与顺势交叉(小号); 无信号: 不标箭头。WaveTrend 本身的显示/隐藏在主图左上角的眼睛按钮。">
       <option value="strong" selected>强信号</option>

@@ -86,7 +86,8 @@ function createDocument() {
     createElement(tag) { return new StubElement(tag); },
     createElementNS(_ns, tag) { return new StubElement(tag); },
     createTextNode(text) { const node = new StubElement("#text"); node.textContent = text; return node; },
-    addEventListener() {},
+    handlers: {},
+    addEventListener(type, fn) { (document.handlers[type] = document.handlers[type] || []).push(fn); },
     removeEventListener() {},
     querySelector() { return null; },
     querySelectorAll() { return []; },
@@ -101,13 +102,14 @@ function createDocument() {
 //   markers            K 线 markers 插件每次 setMarkers 的内容
 //   timeScale          可视逻辑范围有状态, set 时同步通知订阅者; sets 记 set 的次数
 //   crosshairHandlers  十字光标订阅, 测试直接调它模拟用户移动光标
+//   primitives         挂在 series 上的图元(背离连线、测量工具)
 //   crosshair          程序设置的十字光标 {price, time}, 清掉记 null
 let stubCharts = [];
 // 模拟交易叠加画到图上的价格线(两张图合在一起)
 let createdPriceLines = [];
 
 function createChartStub() {
-  const record = { applied: [], markers: [], crosshair: [], crosshairHandlers: [] };
+  const record = { applied: [], markers: [], crosshair: [], crosshairHandlers: [], primitives: [] };
   stubCharts.push(record);
   const series = () => ({
     _record: record,
@@ -115,7 +117,7 @@ function createChartStub() {
     createPriceLine(options) { createdPriceLines.push(options); return { applyOptions() {} }; }, removePriceLine() {},
     priceScale() { return { applyOptions() {} }; },
     setVisibleRange() {}, coordinateToPrice(y) { return 4000 + y; }, priceToCoordinate() { return 0; },
-    attachPrimitive() {}, detachPrimitive() {},
+    attachPrimitive(primitive) { record.primitives.push(primitive); }, detachPrimitive() {},
   });
   let range = null;
   const rangeHandlers = [];
@@ -129,7 +131,7 @@ function createChartStub() {
       range = { from: next.from, to: next.to };
       rangeHandlers.forEach((fn) => fn({ ...range }));
     },
-    timeToCoordinate() { return 0; }, coordinateToTime() { return 0; },
+    timeToCoordinate() { return 0; }, coordinateToTime() { return 0; }, logicalToCoordinate(x) { return x * 6; },
     options: () => ({ barSpacing: 6 }),
   };
   return {
@@ -335,7 +337,6 @@ test("工具栏默认值与 app.js 初始状态一致", () => {
     ["threshtype", /\bthreshtype: "([^"]+)"/],
     ["cvd-source", /\bcvdSource: "([^"]+)"/],
     ["ltf", /\bklineLtf: (\d+)/],
-    ["band-k", /\bbandK: ([\d.]+)/],
     ["wt-signal", /\bwtSignal: "([^"]+)"/],
   ];
   for (const [id, pattern] of table) {
@@ -374,11 +375,14 @@ test("工具栏的周期下拉框已移除: 默认 10s、30s 两张图左右并�
   const context = runBrowser();
   assert.equal(vm.runInContext("charts.map((c) => c.tf).join()", context), "10,30", "左 10s、右 30s");
   const corners = findAll(context.document.getElementById("chart"), (node) => node.className === "chart-corner");
-  assert.deepEqual(corners.map((corner) => corner.children[0].value), ["10", "30"]);
-  assert.deepEqual(corners[0].children[0].children.map((o) => o.textContent),
+  const selects = corners.map((corner) => corner.children[0].children[0]);
+  assert.deepEqual(selects.map((select) => select.value), ["10", "30"]);
+  assert.deepEqual(selects[0].children.map((o) => o.textContent),
                    ["10s", "30s", "1m", "5m", "15m", "1h", "4h"]);
   for (const corner of corners) {
-    assert.equal(corner.children[0].className, "tf-select");
+    assert.equal(corner.children[0].className, "chart-corner-row");
+    assert.deepEqual(corner.children[0].children.map((node) => node.className),
+                     ["tf-select", "measure-btn", "measure-hint"], "周期下拉框右边是测量按钮");
     assert.equal(corner.children[1].className, "main-legend", "主图图例应挂在周期标签下面");
   }
 });
@@ -476,57 +480,82 @@ test("主图叠加带: 着色状态由 wt2 超买超卖决定", () => {
   assert.ok(tagged > 0, "样本里应至少出现一次超买或超卖着色, 否则这个断言是空跑");
 });
 
-test("主图叠加带: 打点只落在首次越界那一根, 且贴在对应的轨道上", () => {
+// 用记录型画布画一次叠加带, 返回画上去的每次 fill / stroke(样式、线宽、虚线、路径点; 空路径不算)。
+// 5 根相邻 bar, x = 0/10/20/30/40; 价格直接当 y: 上轨 12、中线 10、下轨 8。
+// 第 2 根超买、最后一根(右边没有 bar)超卖, 其余中性。options 是 series 选项(中线开关 midVisible)。
+function drawBandOps(options) {
   const context = runBrowser();
-  const r = vm.runInContext(`(() => {
-    const c = charts[1];
-    c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
-    c.bars = [];
-    let price = 4000;
-    for (let i = 0; i < 160; i++) {
-      price += Math.sin(i / 3) * 4 + (i % 5 === 0 ? 3 : -1);
-      c.bars.push({ time: 1700000000 + i * 30, open: price - 1, high: price + 2, low: price - 2,
-                    close: price, volume: 100 + (i % 7) * 10, buy: 60, sell: 40, delta: 20 });
-    }
-    c.derive();
-    const dots = c.buildBandDots();
-    const derived = c.derived;
-    return { times: c.bars.map((b) => b.time), wt2: derived.lw.wt2, up: derived.band.up,
-             dn: derived.band.dn, high: dots.high, low: dots.low,
-             ob: FlowIndicators.LW.ob, os: FlowIndicators.LW.os };
-  })()`, context);
+  const ops = vm.runInContext(`((options) => {
+    const ops = [];
+    let path = [], dash = [];
+    const ctx = {
+      fillStyle: "", strokeStyle: "", lineWidth: 1,
+      setLineDash(d) { dash = d.slice(); },
+      beginPath() { path = []; },
+      moveTo(x, y) { path.push([x, y]); },
+      lineTo(x, y) { path.push([x, y]); },
+      closePath() {},
+      fill() { ops.push({ kind: "fill", style: this.fillStyle, pts: path.slice() }); },
+      stroke() { ops.push({ kind: "stroke", style: this.strokeStyle, width: this.lineWidth, dash, pts: path.slice() }); },
+    };
+    const target = { useMediaCoordinateSpace: (fn) => fn({ context: ctx }) };
+    const states = [0, 0, 1, 0, -1];
+    const band = new ChartView.BandRenderer();
+    band.update({ barSpacing: 10, visibleRange: { from: 0, to: 5 }, bars: states.map((state, i) => ({
+      x: i * 10, originalData: { mid: 10, up: 12, dn: 8, state, idx: i } })) }, options);
+    band.draw(target, (p) => p);
+    return ops;
+  })(${JSON.stringify(options ?? null)})`, context);
+  // 转成本 realm 的普通对象: vm 里的数组原型不同, deepStrictEqual 会判不等
+  return JSON.parse(JSON.stringify(ops)).filter((op) => op.pts.length);
+}
+const BAND_RED = "rgba(242, 54, 69", BAND_GREEN = "rgba(0, 230, 118", BAND_GRAY = "rgba(149, 152, 161";
+const opXs = (op) => op.pts.map(([x]) => x);
+const opYs = (op) => [...new Set(op.pts.map(([, y]) => y))].sort((a, b) => a - b);
 
-  const indexOfTime = new Map(r.times.map((t, i) => [t, i]));
-  const crossings = (above) => {   // 独立复算: 每轮只算第一根能打点的 bar(上一根还没带也算这一轮的第一根)
-    const out = [];
-    for (let i = 0; i < r.wt2.length; i++) {
-      const cur = r.wt2[i];
-      if (cur == null || r.up[i] == null) continue;
-      const prev = i > 0 && r.up[i - 1] != null ? r.wt2[i - 1] : null;
-      if (above ? (cur > r.ob && (prev == null || prev <= r.ob))
-                : (cur < r.os && (prev == null || prev >= r.os))) out.push(i);
-    }
-    return out;
-  };
-  const expectHigh = crossings(true);
-  const expectLow = crossings(false);
-  assert.ok(expectHigh.length + expectLow.length > 0, "样本里应至少有一次越界, 否则这个断言是空跑");
+test("主图叠加带的画法: 中性段只描两条淡轨, 超买/超卖只填中线到触发那条轨的半边并加粗那条轨, 默认不画中线", () => {
+  const drawn = drawBandOps();
+  const RED = BAND_RED, GREEN = BAND_GREEN, GRAY = BAND_GRAY, xs = opXs, ys = opYs;
 
-  for (const [dots, expect, edge] of [[r.high, expectHigh, r.up], [r.low, expectLow, r.dn]]) {
-    assert.equal(dots.length, expect.length, "打点数量应等于首次越界的次数(连续越界不重复打)");
-    dots.forEach((dot, k) => {
-      const i = indexOfTime.get(dot.time);
-      assert.equal(i, expect[k], `第 ${k} 个点应打在第 ${expect[k]} 根上, 实际 ${i}`);
-      assert.equal(dot.value, edge[i], "点应贴在对应的轨道(上穿贴上轨, 下穿贴下轨)");
-    });
-  }
-  // 连续越界的第二根起不能再打点
-  for (const i of expectHigh) {
-    const again = r.times[i + 1];
-    if (again != null && r.wt2[i + 1] > r.ob) {
-      assert.ok(!r.high.some((d) => d.time === again), `第 ${i + 1} 根仍在超买区, 不该再打点`);
-    }
-  }
+  const fills = drawn.filter((op) => op.kind === "fill");
+  const redFill = fills.find((op) => op.style.startsWith(RED));
+  const greenFill = fills.find((op) => op.style.startsWith(GREEN));
+  assert.equal(fills.length, 2, "只有超买、超卖两块填色, 中性段不填底色");
+  assert.ok(redFill && greenFill, "超买填红、超卖填绿");
+  // 颜色按 bar 归属: 超买那根(x=20)占它左右各半根, 最新一根(x=40)只有左半根
+  assert.deepEqual([Math.min(...xs(redFill)), Math.max(...xs(redFill))], [15, 25]);
+  assert.deepEqual(ys(redFill), [10, 12], "超买只填中线到上轨");
+  assert.deepEqual([Math.min(...xs(greenFill)), Math.max(...xs(greenFill))], [35, 40], "最新一根的状态也要画出来");
+  assert.deepEqual(ys(greenFill), [8, 10], "超卖只填中线到下轨");
+
+  const strokes = drawn.filter((op) => op.kind === "stroke");
+  assert.ok(strokes.every((op) => ys(op).every((y) => y === 8 || y === 12)), "只描上下轨, 不画中线");
+  const redRail = strokes.find((op) => op.style.startsWith(RED));
+  const greenRail = strokes.find((op) => op.style.startsWith(GREEN));
+  const quietRail = strokes.find((op) => op.style.startsWith(GRAY));
+  assert.ok(redRail && greenRail && quietRail);
+  assert.deepEqual([ys(redRail), Math.min(...xs(redRail)), Math.max(...xs(redRail))], [[12], 15, 25], "超买加粗的是上轨那一段");
+  assert.deepEqual([ys(greenRail), Math.min(...xs(greenRail)), Math.max(...xs(greenRail))], [[8], 35, 40], "超卖加粗的是下轨那一段");
+  assert.ok(redRail.width > quietRail.width && greenRail.width > quietRail.width, "触发那条轨比淡轨粗");
+  // 淡轨: 超买那段的上轨已经由红线画了, 不能再叠一条灰线; 对面那条轨照常是淡线
+  const quietAt = (y) => quietRail.pts.filter(([, py]) => py === y).map(([x]) => x);
+  assert.ok(quietAt(12).every((x) => x <= 15 || x >= 25), `超买段的上轨不该再描灰线: ${quietAt(12)}`);
+  assert.ok(quietAt(8).includes(20), "超买段的下轨仍是淡线");
+  assert.ok(quietAt(12).includes(0) && quietAt(8).includes(0), "中性段两条轨都描");
+});
+
+test("叠加带的中线开关打开时: 中线画成贯穿整段的淡虚线, 其余照旧", () => {
+  const plain = drawBandOps({ midVisible: false });
+  const drawn = drawBandOps({ midVisible: true });
+  const strokes = drawn.filter((op) => op.kind === "stroke");
+  const dashed = strokes.filter((op) => op.dash.length);
+  assert.equal(dashed.length, 1, "只有中线是虚线");
+  const mid = dashed[0];
+  assert.deepEqual(opYs(mid), [10], "虚线画在中线上");
+  assert.ok(mid.style.startsWith(BAND_GRAY), "中线是淡灰色, 不随超买超卖变色");
+  // 超买、超卖段也照样画中线, 而且一笔画完(只 moveTo 一次): 中途断开会打乱虚线的节奏
+  assert.deepEqual(opXs(mid), [0, 10, 20, 30, 40]);
+  assert.deepEqual(drawn.filter((op) => op !== mid), plain, "填色和上下轨与不开中线时完全一样(画完中线要把虚线复位)");
 });
 
 // 主图左上角的图例每张图一份, 由图表组件建在自己的容器里。stub 里没有真实点击, 直接调眼睛按钮的
@@ -537,35 +566,36 @@ const legendRow = (context, index, key) =>
   findAll(chartEl(context, index), (node) => node.className === "ml-item" && node.getAttribute("data-key") === key)[0];
 const eyeOf = (context, index, key) => findByClass(legendRow(context, index, key), "ml-eye");
 const clickEye = (context, index, key) => eyeOf(context, index, key).handlers.click[0]();
+const bandKOf = (context, index) => findByClass(legendRow(context, index, "band"), "ml-params");   // 带宽按钮
 const viewSetter = (context) => (value) =>
   context.document.getElementById("view").handlers.change[0]({ target: { value } });
 
-test("FlowWave带 眼睛按钮: 打开后主图三个叠加系列可见, 切足迹图强制隐藏, 切回来按开关恢复", () => {
+test("FlowWave带 眼睛按钮: 打开后带可见, 切足迹图强制隐藏, 切回来按开关恢复", () => {
   const context = runBrowser();
   const applied = stubCharts[1].applied;
   const setView = viewSetter(context);
-  const lastThree = () => applied.slice(-3).map((o) => o.visible);
+  const visible = () => applied.at(-1).visible;
 
-  assert.equal(lastThree().every((v) => v === false), true, "默认关: 三个叠加系列都应隐藏");
+  assert.equal(visible(), false, "默认关: 带应隐藏");
 
   clickEye(context, 1, "band");
-  assert.equal(lastThree().every((v) => v === true), true, "打开后带与两个打点系列都应可见");
+  assert.equal(visible(), true, "打开后带应可见");
 
   setView("footprint");
-  assert.equal(lastThree().every((v) => v === false), true, "足迹图下叠加必须强制隐藏");
+  assert.equal(visible(), false, "足迹图下叠加必须强制隐藏");
 
   setView("candle");
-  assert.equal(lastThree().every((v) => v === true), true, "切回 K 线应按开关恢复可见");
+  assert.equal(visible(), true, "切回 K 线应按开关恢复可见");
 
   clickEye(context, 1, "band");
-  assert.equal(lastThree().every((v) => v === false), true, "再点一下应重新隐藏");
+  assert.equal(visible(), false, "再点一下应重新隐藏");
 });
 
 test("两张图的眼睛按钮各管各的: 点 10s 图的 FlowWave带 不动 30s 图", () => {
   const context = runBrowser();
   const applied30 = stubCharts[1].applied.length;
   clickEye(context, 0, "band");
-  assert.deepEqual(stubCharts[0].applied.slice(-3).map((o) => o.visible), [true, true, true], "10s 图的带应打开");
+  assert.equal(stubCharts[0].applied.at(-1).visible, true, "10s 图的带应打开");
   assert.equal(stubCharts[1].applied.length, applied30, "30s 图的系列不该被动到");
   assert.equal(legendRow(context, 0, "band").classList.contains("off"), false);
   assert.equal(legendRow(context, 1, "band").classList.contains("off"), true, "30s 图的图例行保持关闭");
@@ -630,7 +660,7 @@ test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各
   assert.deepEqual(applied.slice(-4).map((o) => o.visible), [false, false, false, false]);
   assert.equal(eyeOf(context, 1, "ema").title, "显示");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")),
-                   [{ ema: true, band: false, wt: true }, { ema: false, band: false, wt: true }]);
+                   [{ ema: true, band: false, wt: true, bandMid: false }, { ema: false, band: false, wt: true, bandMid: false }]);
 
   // 切合约是整页重载: 新页面的两张图各按记下的状态画
   storage.setItem("flowscope.chartShown", JSON.stringify([
@@ -638,7 +668,7 @@ test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各
   const again = runBrowser({ localStorage: storage });
   assert.deepEqual(offFlags(again, 0), [false, true, false]);
   assert.deepEqual(offFlags(again, 1), [true, false, true]);
-  assert.equal(again.document.getElementById("band-k").disabled, false, "右图的带记成打开, 带宽应可调");
+  assert.equal(bandKOf(again, 1).disabled, false, "右图的带记成打开, 它图例里的带宽应可点");
 
   // 旧版按周期记 {"10": {...}, "30": {...}}: 新键还没有时各图按自己的周期初始化
   storage.removeItem("flowscope.chartShown");
@@ -658,7 +688,7 @@ test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各
   storage.setItem("flowscope.chartShown", "not json");
   const third = runBrowser({ localStorage: storage });
   assert.deepEqual(offFlags(third, 1), [false, true, false]);
-  assert.equal(third.document.getElementById("band-k").disabled, true);
+  assert.equal(bandKOf(third, 1).disabled, true);
 });
 
 test("两张图选同一个周期时开关各管各的, 重载后不串; 切周期不换本图的开关", () => {
@@ -674,30 +704,58 @@ test("两张图选同一个周期时开关各管各的, 重载后不串; 切周�
   select.value = "300";
   select.handlers.change[0]();
   assert.deepEqual(offFlags(again, 0), [false, true, true], "切周期后本图开关不变");
-  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0], { ema: true, band: false, wt: false });
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0], { ema: true, band: false, wt: false, bandMid: false });
 });
 
-test("「带宽」只在有图打开 FlowWave带 时可调(足迹图下不置灰, 因为只是临时藏起来)", () => {
+test("图例里的带宽只在本图打开 FlowWave带 时能点", () => {
   const context = runBrowser();
-  const bandK = context.document.getElementById("band-k");
-  const setView = viewSetter(context);
 
-  assert.equal(bandK.disabled, true, "默认关: 带宽不可调");
+  assert.deepEqual([bandKOf(context, 0).disabled, bandKOf(context, 1).disabled], [true, true], "默认关: 都不能点");
+  assert.equal(bandKOf(context, 1).tagName, "button", "带宽是按钮(其他参数是普通文字)");
 
   clickEye(context, 1, "band");
-  assert.equal(bandK.disabled, false, "打开带后带宽可调");
+  assert.equal(bandKOf(context, 1).disabled, false, "打开带后本图的带宽可点");
+  assert.equal(bandKOf(context, 0).disabled, true, "另一张图的带还关着, 它的带宽仍不能点");
 
-  setView("footprint");
-  assert.equal(bandK.disabled, false, "足迹图只是临时隐藏带, 不该把宽度选择也锁掉");
-
-  clickEye(context, 0, "band");
   clickEye(context, 1, "band");
-  assert.equal(bandK.disabled, false, "10s 图还开着带, 带宽仍可调");
-  clickEye(context, 0, "band");
-  assert.equal(bandK.disabled, true, "两张图都关掉后重新置灰");
+  assert.equal(bandKOf(context, 1).disabled, true, "关掉带后重新不能点");
 });
 
-test("带宽 k 可切换: 半宽按 k 线性变化, 非法值回落到默认 2σ", () => {
+test("FlowWave带 的「中线」开关: 默认不画, 带关着时不能点; 只管本图, 记进 localStorage, 重载后照旧", () => {
+  const storage = createLocalStorage();
+  const context = runBrowser({ localStorage: storage });
+  const midOf = (ctx, index) => findByClass(legendRow(ctx, index, "band"), "ml-toggle");
+  const applied = stubCharts[1].applied;
+
+  assert.equal(midOf(context, 1).textContent, "中线");
+  assert.equal(midOf(context, 1).disabled, true, "带关着: 中线开关不能点");
+  assert.equal(midOf(context, 1).classList.contains("on"), false, "默认不画中线");
+
+  clickEye(context, 1, "band");
+  assert.equal(midOf(context, 1).disabled, false, "带打开后可点");
+  assert.deepEqual([applied.at(-1).visible, applied.at(-1).midVisible], [true, false]);
+
+  midOf(context, 1).handlers.click[0]();
+  assert.deepEqual([applied.at(-1).visible, applied.at(-1).midVisible], [true, true], "中线开关交给带的 series 去画");
+  assert.equal(midOf(context, 1).classList.contains("on"), true, "按钮变亮");
+  assert.equal(legendRow(context, 1, "band").classList.contains("off"), false, "带本身仍是打开的");
+  assert.equal(midOf(context, 0).classList.contains("on"), false, "另一张图不受影响");
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")).map((s) => s.bandMid), [false, true]);
+
+  // 关掉带再打开, 中线开关保持原样
+  clickEye(context, 1, "band");
+  assert.equal(midOf(context, 1).classList.contains("on"), true);
+  clickEye(context, 1, "band");
+  assert.deepEqual([applied.at(-1).visible, applied.at(-1).midVisible], [true, true]);
+
+  const again = runBrowser({ localStorage: storage });
+  assert.equal(midOf(again, 1).classList.contains("on"), true, "重载后照旧显示中线");
+  assert.ok(stubCharts[1].applied.some((o) => o.midVisible === true), "重载后 series 也按记下的状态画");
+  midOf(again, 1).handlers.click[0]();
+  assert.equal(stubCharts[1].applied.at(-1).midVisible, false, "再点一下隐藏");
+});
+
+test("点图例里的带宽按 1.5σ → 2σ → 2.5σ 循环, 两张图共用, 半宽按 k 线性变化; 顶部读数不再列带", () => {
   const context = runBrowser();
   vm.runInContext(`(() => {
     const c = charts[1];
@@ -713,27 +771,30 @@ test("带宽 k 可切换: 半宽按 k 线性变化, 非法值回落到默认 2σ
   })()`, context);
 
   const halfWidth = () => vm.runInContext("charts[1].derived.band.up[100] - charts[1].derived.band.mid[100]", context);
-  const select = context.document.getElementById("band-k");
-  // 按浏览器的顺序来: 先由控件持有新值, 再带着控件本身触发 change
-  // (处理器会写回 e.target.value, 用假 target 就观察不到这个纠正行为)
-  const setK = (value) => { select.value = value; select.handlers.change[0]({ target: select }); };
+  const labels = () => [0, 1].map((index) => bandKOf(context, index).textContent);
+  clickEye(context, 1, "band");
+  const clickK = () => bandKOf(context, 1).handlers.click[0]();
 
   const base = halfWidth();
   assert.ok(base > 0, "2σ 下第 100 根应有正的半宽(否则这个用例是空跑)");
+  assert.deepEqual(labels(), ["2σ", "2σ"], "默认 2σ");
 
-  setK("2.5");
+  clickK();
   assert.ok(Math.abs(halfWidth() - base * 1.25) < 1e-9, "2.5σ 的半宽应是 2σ 的 1.25 倍");
-  assert.equal(select.value, "2.5", "合法值应写回下拉框");
-  for (const index of [0, 1]) {
-    assert.equal(findByClass(legendRow(context, index, "band"), "ml-params").textContent, "2.5σ", "两张图的图例都显示新带宽");
-  }
+  assert.deepEqual(labels(), ["2.5σ", "2.5σ"], "两张图的图例都显示新带宽");
 
-  setK("1.5");
+  clickK();   // 到头了绕回第一档
   assert.ok(Math.abs(halfWidth() - base * 0.75) < 1e-9, "1.5σ 的半宽应是 2σ 的 0.75 倍");
+  assert.deepEqual(labels(), ["1.5σ", "1.5σ"]);
 
-  setK("9");   // 目录之外的倍数: 不按垃圾值画带, 回落到默认并纠正下拉框显示
-  assert.equal(select.value, "2", "非法值应回落到默认 2σ");
-  assert.ok(Math.abs(halfWidth() - base) < 1e-9, "非法值不得改变带宽");
+  clickK();
+  assert.ok(Math.abs(halfWidth() - base) < 1e-9, "回到 2σ");
+  assert.deepEqual(labels(), ["2σ", "2σ"]);
+
+  vm.runInContext("charts[1].refreshLegend()", context);
+  const legend = context.document.getElementById("legend").textContent;
+  assert.match(legend, /LSMA:/, "顶部读数应已刷新(否则下一条断言是空跑)");
+  assert.doesNotMatch(legend, /带:/, "带开着也不往顶部读数里塞轨道值");
 });
 
 test("自定义 series 只画 visibleRange 内的 bar: 区间外的旧坐标不能画成残影", () => {
@@ -994,6 +1055,146 @@ test("顶栏连接状态: 两张图都连上才显示「已连接」, 否则带�
   assert.equal(status.className, "on");
   vm.runInContext(`setChartStatus(0, false, "已断开, 重连补齐中…"); setChartStatus(1, false, "加载中…");`, context);
   assert.equal(status.textContent, "10s: 已断开, 重连补齐中…  30s: 加载中…");
+});
+
+// ---------- 测量工具 ----------
+
+test("测量读数: 时长只留两级单位; 根数只数真实的 bar, 时长按钟面时间; 涨跌按点击先后", () => {
+  const context = runBrowser();
+  const r = JSON.parse(vm.runInContext(`JSON.stringify((() => {
+    const durations = [0, 40, 360, 390, 7205, 7500, 97200, -60].map(ChartView.formatDuration);
+    // 10s 图跨了一段休市: 第 1 根(T+10) 到第 4 根(T+3610) 之间只有 3 根真实的 bar
+    const bars = [0, 10, 20, 3600, 3610].map((t) => ({ time: t }));
+    const gap = ChartView.measureStats(bars, 10, { time: 3610, price: 95 }, { time: 10, price: 100 });
+    const back = ChartView.measureStats(bars, 10, { time: 10, price: 100 }, { time: 3610, price: 95 });
+    const T = ${T0};
+    const lines = (a, b, tf, digits, count) =>
+      ChartView.measureLines({ ...ChartView.measureStats(bars, tf, a, b), count }, a, b, tf, digits);
+    return {
+      durations, gap, back,
+      sameDay: lines({ time: T + 60, price: 4000 }, { time: T + 390, price: 4200 }, 10, 0, 33),
+      crossDay: lines({ time: T, price: 4200 }, { time: T + 7200, price: 4000 }, 60, 1, 120),
+      flat: lines({ time: T, price: 100 }, { time: T + 30, price: 99.8 }, 30, 0, 1),
+    };
+  })())`, context));
+  assert.deepEqual(r.durations, ["0秒", "40秒", "6分钟", "6分钟30秒", "2小时", "2小时5分钟", "1天3小时", "1分钟"]);
+  assert.deepEqual(r.gap, { count: 3, seconds: 3600, change: 5, pct: (5 / 95) * 100 },
+                   "终点在起点左边时涨跌仍是终点相对起点");
+  assert.deepEqual(r.back, { count: 3, seconds: 3600, change: -5, pct: -5 });
+  // T0 = 2023-11-14 22:13:00(时间轴按 UTC 显示); 10s 图的时刻带秒, 1m 及以上不带
+  assert.deepEqual(r.sameDay, ["+200  +5.00%", "33 根 · 5分钟30秒", "22:14:00 → 22:19:30"]);
+  assert.deepEqual(r.crossDay, ["-200.0  -4.76%", "120 根 · 2小时", "11-14 22:13 → 11-15 00:13"]);
+  assert.deepEqual(r.flat, ["0  -0.20%", "1 根 · 30秒", "22:13:00 → 22:13:30"], "四舍五入成 0 不写 -0");
+});
+
+// 在第 index 张图上按下再抬起鼠标左键: dx 是按下后挪动的像素(拖动), onCorner 表示点在左上角的按钮/图例上
+function pressChart(context, index, { shiftKey = false, dx = 0, onCorner = false } = {}) {
+  const el = chartEl(context, index);
+  const target = { closest: (selector) => (onCorner && selector === ".chart-corner" ? {} : null) };
+  el.handlers.pointerdown.forEach((fn) => fn({ button: 0, clientX: 100, clientY: 100, target }));
+  el.handlers.pointerup.forEach((fn) => fn({ button: 0, clientX: 100 + dx, clientY: 100, target, shiftKey }));
+}
+
+test("测量交互: 尺子按钮 → 点起点 → 终点跟鼠标 → 点终点定住 → 再点清掉; Shift+点击直接开始; 只动本图", () => {
+  const context = runBrowser();
+  feedBothCharts(context);
+  const chart30 = stubCharts[1];
+  const button = findByClass(chartEl(context, 1), "measure-btn");
+  const hint = findByClass(chartEl(context, 1), "measure-hint");
+  const move = (param) => chart30.crosshairHandlers[0](param);
+  // 点击的位置取十字光标最近一次报的: 先把鼠标移过去再按
+  const click = (param, options) => {
+    move(param);
+    pressChart(context, 1, options);
+  };
+  const measurement = () => vm.runInContext("charts[1].measurement()", context);
+  const measureGeometry = () => chart30.primitives.find((p) => p._geometry)._geometry();
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+
+  assert.equal(measurement().phase, "off");
+  assert.equal(hint.hidden, true);
+  button.handlers.click[0]();
+  assert.equal(measurement().phase, "armed");
+  assert.ok(button.classList.contains("on"));
+  assert.equal(hint.hidden, false);
+  assert.match(hint.textContent, /点击起点/);
+
+  // 起点只认主图窗格; 时间吸附到最近的 bar, 价格取鼠标所在价位(stub 的价格 = 4000 + y)
+  click({ logical: 2.4, point: { x: 14, y: 100 }, paneIndex: 1 });
+  assert.equal(measurement().phase, "armed", "点在副图上不算起点");
+  click({ logical: 2.4, point: { x: 14, y: 100 }, paneIndex: 0 }, { dx: 20 });
+  assert.equal(measurement().phase, "armed", "拖动(平移)不算点击");
+  click({ logical: 2.4, point: { x: 14, y: 100 }, paneIndex: 0 }, { onCorner: true });
+  assert.equal(measurement().phase, "armed", "点在左上角的按钮/图例上不算");
+  click({ logical: 2.4, point: { x: 14, y: 100 }, paneIndex: 0 });
+  assert.equal(measurement().phase, "drawing");
+  assert.match(hint.textContent, /点击终点/);
+  assert.deepEqual(plain(measurement().a), { time: T0 + 60, price: 4100 });
+
+  move({ time: T0 + 390, logical: 12.6, point: { x: 76, y: 300 }, paneIndex: 0 });
+  assert.deepEqual(plain(measurement().b), { time: T0 + 390, price: 4300 });
+  assert.deepEqual(plain(measurement().stats), { count: 11, seconds: 330, change: 200, pct: 200 / 41 });
+  const geometry = measureGeometry();
+  assert.equal(geometry.up, true);
+  assert.deepEqual(plain(geometry.lines.slice(0, 2)), ["+200  +4.88%", "11 根 · 5分钟30秒"]);
+  assert.deepEqual([geometry.x1, geometry.x2], [12, 78], "两端画在所吸附那根 bar 的中心");
+
+  // 鼠标在副图窗格: 只动时间, 价位不变; 越出数据就停在最后一根
+  move({ time: T0 + 600, logical: 20, point: { x: 120, y: 600 }, paneIndex: 1 });
+  assert.deepEqual(plain(measurement().b), { time: T0 + 600, price: 4300 });
+  move({ logical: 500, point: { x: 3000, y: 50 }, paneIndex: 0 });
+  assert.deepEqual(plain(measurement().b), { time: T0 + 3570, price: 4050 });
+  move({ time: undefined, point: undefined });
+  assert.deepEqual(plain(measurement().b), { time: T0 + 3570, price: 4050 }, "移出图表时终点留在原处");
+
+  move({ logical: 30, point: { x: 180, y: 0 }, paneIndex: 0 });
+  pressChart(context, 1, { dx: 30 });
+  assert.equal(measurement().phase, "drawing", "拉区间时拖动图表不会把终点定住");
+  pressChart(context, 1);
+  assert.equal(measurement().phase, "done");
+  assert.deepEqual(plain(measurement().b), { time: T0 + 900, price: 4000 });
+  assert.equal(button.classList.contains("on"), false);
+  assert.equal(hint.hidden, true);
+  move({ time: T0 + 1200, logical: 40, point: { x: 240, y: 10 }, paneIndex: 0 });
+  assert.deepEqual(plain(measurement().b), { time: T0 + 900, price: 4000 }, "定住之后不再跟鼠标");
+  assert.equal(vm.runInContext("charts[0].measurement().phase", context), "off", "另一张图不受影响");
+
+  click({ logical: 30, point: { x: 180, y: 0 }, paneIndex: 0 });
+  assert.equal(measurement().phase, "off", "量完再点一下图表就清掉");
+  assert.equal(measurement().a, null);
+  assert.equal(measureGeometry(), null);
+  click({ logical: 30, point: { x: 180, y: 0 }, paneIndex: 0 });
+  assert.equal(measurement().phase, "off", "没在量时普通点击什么都不做");
+
+  click({ logical: 5, point: { x: 30, y: 20 }, paneIndex: 0 }, { shiftKey: true });
+  assert.equal(measurement().phase, "drawing", "Shift+点击直接定起点");
+  button.handlers.click[0]();
+  assert.equal(measurement().phase, "off", "量的过程中点尺子是取消");
+});
+
+test("测量: Esc 取消所有图上的测量(合约选择器已处理的 Esc 除外), 切周期清掉本图的测量", () => {
+  const context = runBrowser();
+  feedBothCharts(context);
+  const start = (index) => {
+    stubCharts[index].crosshairHandlers[0]({ logical: 3, point: { x: 18, y: 0 }, paneIndex: 0 });
+    pressChart(context, index, { shiftKey: true });
+  };
+  const phases = () => vm.runInContext("charts.map((c) => c.measurement().phase).join()", context);
+  const esc = (defaultPrevented) => context.document.handlers.keydown.forEach((fn) => fn({ key: "Escape", defaultPrevented }));
+
+  start(0);
+  start(1);
+  assert.equal(phases(), "drawing,drawing");
+  esc(true);
+  assert.equal(phases(), "drawing,drawing", "选择器收菜单的那一下 Esc 不清测量");
+  esc(false);
+  assert.equal(phases(), "off,off");
+
+  start(1);
+  const select = tfSelectOf(context, 1);
+  select.value = "60";
+  select.handlers.change[0]();
+  assert.equal(phases(), "off,off");
 });
 
 // ---------- 切换周期 ----------

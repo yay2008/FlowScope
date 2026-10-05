@@ -12,8 +12,8 @@
   const LW = { n1: 9, n2: 6, n3: 3, n4: 21, ob: 80, os: 20, slopeLen: 10 };
 
   // 主图叠加的回归通道参数: 中线 = linreg(close, n), 上下轨 = 中线 ± k 倍回归残差标准差。
-  // 残差标准差取与中线同一个窗口, 用总体标准差(除以 n)。k 由工具栏「带宽」选(kOptions 必须与
-  // index.html 的 <option> 一致, 也用来挡非法值); 三档包含率与选型依据见 docs/flowwave_band_probe.py。
+  // 残差标准差取与中线同一个窗口, 用总体标准差(除以 n)。k 在主图图例里点「2σ」按 kOptions 的顺序循环切换,
+  // 两张图共用; 三档包含率与选型依据见 docs/flowwave_band_probe.py。
   const BAND = { n: 21, kOptions: [1.5, 2, 2.5], kDefault: 2 };
 
   // 主图 EMA 周期
@@ -184,7 +184,7 @@
   // 为什么不能直接把 wave/wt2 画到主图: 它们是 0~100 的振荡值(实测还会溢出到 -14~108), 没有价格量纲,
   // 画到价格轴上必须选一种映射。这里选"轨道由价格自证"的映射 —— 中线仍用同一个 linreg 核, 只把输入
   // 从振荡值换成收盘价, 带宽用回归残差标准差; 于是轨道本身是真实价格(可当动态支撑/压力),
-  // 而 wt2 的信息转成两件事: 带的着色状态(state) 与首次越界的打点(调用方按 wt2 与轨道自行生成)。
+  // 而 wt2 的信息转成带的着色状态(state): 超买/超卖的 bar 在图上染色(画法见 chart-view.js 的 BandRenderer)。
   function deriveBand(bars, wt2, k) {
     const n = bars.length;
     const close = bars.map((b) => b.close);

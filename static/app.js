@@ -17,7 +17,7 @@ const settings = {
   cvdSource: "tick",
   klineLtf: 10,        // 切回 K线口径时保留上次选择，默认同 Pine 的 10S。
   view: "candle",      // 主图视图: candle=K线, footprint=足迹图
-  bandK: 2,            // 叠加带的带宽倍数 k(回归残差标准差的倍数)
+  bandK: BAND.kDefault,   // 叠加带的带宽倍数 k(回归残差标准差的倍数), 不在工具栏: 点主图图例里的「2σ」切换
   wtSignal: "strong",  // 主图 WaveTrend 的交叉箭头: strong=只标强交叉(原版默认) / all=全部 / none=不标
 };
 let symbol = new URLSearchParams(location.search).get("symbol") || "KQ.m@SHFE.fu";
@@ -62,15 +62,16 @@ function saveChartTfs() {
 
 const chartTfs = loadChartTfs();
 
-// 各图主图指标的显示开关记在 localStorage, 按左右图各记一份 [{ema, band, wt}, {...}]: 切合约是整页重载,
-// 不记的话每切一次都被打回默认。开关跟着图走, 不跟周期走(两张图可以选同一个周期, 切周期也不换开关)。
+// 各图主图指标的显示开关记在 localStorage, 按左右图各记一份 [{ema, band, wt, bandMid}, {...}]: 切合约是整页重载,
+// 不记的话每切一次都被打回默认(bandMid 是 FlowWave带 的中线, 后来才加, 旧值里没有就按默认不画)。
+// 开关跟着图走, 不跟周期走(两张图可以选同一个周期, 切周期也不换开关)。
 // 旧版按周期记 flowscope.mainShown = {"10": {...}, "30": {...}}(更早只记一份 {ema, band, wt}),
 // 新键还没有时按旧值初始化; 读不到(隐私模式、旧值不合法)就用默认值。
 const CHART_SHOWN_KEY = "flowscope.chartShown";
 const MAIN_SHOWN_KEY = "flowscope.mainShown";
 
 function loadShown(index, tf) {
-  const shown = { ema: true, band: false, wt: true };
+  const shown = { ema: true, band: false, wt: true, bandMid: false };
   try {
     const perChart = JSON.parse(localStorage.getItem(CHART_SHOWN_KEY) || "null");
     let mine = Array.isArray(perChart) ? perChart[index] : null;
@@ -106,10 +107,8 @@ function makeChart(tf, index) {
     onStatus: (ok, text) => setChartStatus(index, ok, text),
     onLegend: (text, coverage) => showLegend(chartView, text, coverage),
     onConfig: refreshLtfOptions,
-    onShownChange: () => {
-      saveShown();
-      refreshBandControl();
-    },
+    onShownChange: saveShown,
+    onBandK: setBandK,
     onCrosshair: (time, price) => syncCrosshair(chartView, time, price),
     onRangeChange: syncRanges,
     onTfChange: () => {
@@ -187,12 +186,18 @@ function syncRanges() {
   }
 }
 
-// 「带宽」只在有图打开 FlowWave带 时可调。判据用开关本身而不是画面上有没有带: 足迹图下带只是被临时藏起来,
-// 宽度选择仍然有效, 切回 K 线就用得上, 没必要在这里置灰。
-function refreshBandControl() {
-  $("band-k").disabled = !charts.some((c) => c.shown().band);
+// 测量工具(每张图左上角的尺子): Esc 取消所有图上的测量。合约选择器的搜索框自己处理 Esc(收起菜单, 已 preventDefault),
+// 那一下不算。
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !event.defaultPrevented) charts.forEach((c) => c.cancelMeasure());
+});
+
+// FlowWave带 的带宽 k 两张图共用: 哪张图的图例里点了「2σ」, 两张一起换。
+// 只重算带本身(中线、wt2 状态不变), 顶部读数里没有带, 不用刷新。
+function setBandK(k) {
+  settings.bandK = BAND.kOptions.includes(k) ? k : BAND.kDefault;   // 不按目录之外的倍数画带
+  charts.forEach((c) => c.rebuildBand());
 }
-refreshBandControl();
 
 // ---------- 工具栏 ----------
 
@@ -207,13 +212,6 @@ $("threshtype").addEventListener("change", (e) => { settings.threshtype = e.targ
 $("wt-signal").addEventListener("change", (e) => {
   settings.wtSignal = ["strong", "all", "none"].includes(e.target.value) ? e.target.value : "strong";
   charts.forEach((c) => c.renderWtMarks());
-});
-$("band-k").addEventListener("change", (e) => {
-  const value = parseFloat(e.target.value);
-  settings.bandK = BAND.kOptions.includes(value) ? value : BAND.kDefault;   // 非法值回落到默认, 不按垃圾值画带
-  e.target.value = String(settings.bandK);
-  charts.forEach((c) => c.rebuildBand());
-  activeChart.refreshLegend();
 });
 
 $("view").addEventListener("change", (e) => {
