@@ -247,7 +247,7 @@ $("ltf").addEventListener("change", (e) => {
 });
 
 // ---------- 合约选择器: 自研二级级联菜单 ----------
-// 组件在 contract-picker.js(一级品种 + 二级月份, 含搜索/键盘/悬停预取), 纯逻辑在 picker-core.js。
+// 组件在 contract-picker.js(分类页签 + 一级品种 + 二级月份, 含搜索/键盘/悬停预取), 纯逻辑在 picker-core.js。
 // 选择结果统一写回 URL 的 symbol 参数, 由页面重载完成切换与重连。
 
 function setPickerHint(text, detail) {
@@ -280,6 +280,7 @@ const picker = ContractPicker.create({
     trigger: $("picker-trigger"),
     popup: $("picker-popup"),
     search: $("picker-search"),
+    tabs: $("picker-tabs"),
     products: $("picker-products"),
     months: $("picker-months"),
   },

@@ -486,11 +486,12 @@ class CandleStore:
         if not final:
             done = done[done["hasBaseline"].astype(bool)]
         lines = []
+        pending = {}
         for row in done[self.COLUMNS].itertuples(index=False):
             key, values = int(row[0]), tuple(float(value) for value in row[1:])
-            if self._written.get(key) == values:
+            if pending.get(key, self._written.get(key)) == values:
                 continue
-            self._written[key] = values
+            pending[key] = values
             lines.append(",".join([str(key), *map(_cell, values)]) + "\n")
         if not lines:
             return
@@ -501,6 +502,8 @@ class CandleStore:
             payload = "\n" + payload
         with open(self.path, "a", encoding="utf-8", newline="") as handle:
             handle.write(payload)
+        # 包括文件关闭/缓冲刷新在内都成功后, 才能让后续调用跳过这些行。
+        self._written.update(pending)
         self._needs_header = self._needs_newline = False
         if len(self._written) > 3 * self.window:
             self._written = dict(sorted(self._written.items())[-2 * self.window:])
@@ -988,22 +991,23 @@ class CryptoManager:
         return instrument.label if instrument is not None else symbol
 
     def catalog_groups(self) -> list[dict]:
-        """合约选择器的加密分组: 每个交易所一组(按 24 小时成交额降序), 再加多所汇总。
+        """合约选择器的加密分组: 多所汇总在最前, 后面每个交易所一组(均按 24 小时成交额降序)。
 
+        汇总放前面: 各交易所的永续动辄几百个, 排在它们后面就得翻到底才找得到。
         行的字段与期货品种一致(见 catalog.build_products); openInterest 一栏放 24 小时成交额(USDT),
         crypto=true 告诉前端没有月份可取, 二级只有永续本身。
         """
         groups = []
+        if self.aggregates is not None:
+            group = self.aggregates.catalog_group(self)
+            if group["products"]:
+                groups.append(group)
         instruments = self.instrument_list()
         for venue in self.adapters:
             items = sorted((item for item in instruments if item.venue == venue), key=lambda item: -item.rank)
             if items:
                 groups.append({"exchangeId": venue, "exchangeName": f"{VENUE_NAMES[venue]}永续",
                                "products": [catalog_product(item) for item in items]})
-        if self.aggregates is not None:
-            group = self.aggregates.catalog_group(self)
-            if group["products"]:
-                groups.append(group)
         return groups
 
     def watch_rows(self, symbols) -> list[dict]:

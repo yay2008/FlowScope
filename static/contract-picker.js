@@ -1,8 +1,11 @@
 /* 自研合约二级级联菜单(不用原生 <select>)。
  *
  * 结构: 一级 = 品种(交易所吸顶分组, 按持仓量降序), 二级 = 该品种的月份(第一项恒为★主力)。
- * 交互: 悬停/点击品种即出月份; 点击月份即切换; 键盘 ↑↓ 移动、→/← 换列、Enter 确认、Esc 关闭;
- *       搜索框输入即过滤品种, 搜索时二级自动跟到第一个命中品种; 每行的 ☆ 直接加/移出自选。
+ *       一级上面是分类页签(期货 / 加密), 一次只列一个分类; 只有一个分类时不显示页签。
+ * 交互: 悬停/点击品种即出月份; 点击月份即切换; 键盘 ↑↓ 移动、→/← 换列、Tab/Shift+Tab 换分类、
+ *       Enter 确认、Esc 关闭; 打开菜单时停在当前合约所属的分类;
+ *       搜索框输入即过滤当前分类, 当前分类没命中而别的分类有时自动跳过去, 二级自动跟到第一个命中品种;
+ *       每行的 ☆ 直接加/移出自选。
  * 数据: 一级 GET /api/symbols(服务端缓存 5 分钟), 二级 GET /api/symbols?exchange=&product=
  *       (服务端缓存 1 分钟), 前端再加内存缓存 + localStorage, 悬停即预取, 菜单基本都是秒开。
  * 依赖: picker-core.js(纯逻辑) + data-sync.js(标签格式化), 由 index.html 在它之前加载。
@@ -30,8 +33,10 @@
     const el = options.root;
     const now = options.now || (() => Date.now());
 
-    let products = [];               // 展平后的一级列表
-    let filtered = [];               // 当前搜索命中
+    let products = [];               // 展平后的一级列表(全部分类)
+    let categories = [];             // 目录里有品种的分类 id, 按 core.CATEGORIES 的顺序
+    let category = "";               // 当前页签; 目录到之前为空串(= 不按分类过滤)
+    let filtered = [];               // 当前分类里的搜索命中
     let productIndex = 0;
     let level = "product";           // "product" | "month"
     let monthIndex = 0;
@@ -50,6 +55,7 @@
 
     const productKey = (product) => (product ? `${product.exchangeId}.${product.productId}` : "");
     const query = () => (el.search ? el.search.value || "" : "");
+    const visibleProducts = () => core.filterProducts(products, query(), category);
     const activeProduct = () => filtered[productIndex] || null;
     const clear = (node) => { node.textContent = ""; };   // 清空子节点
 
@@ -100,12 +106,16 @@
         monthState.set(keepKey, keepMonths);
       }
       products = core.flattenGroups((data && data.groups) || []);
+      categories = core.CATEGORIES.map((item) => item.id)
+        .filter((id) => products.some((product) => core.categoryOf(product) === id));
+      // 首次到达时按当前合约选页签; 当前页签在新目录里没了(加密源停了)也重新选
+      if (!categories.includes(category)) category = symbolCategory() || categories[0] || "";
       productIndex = 0;
       level = "product";
       monthIndex = 0;
       activeKey = "";
       if (keepKey) {
-        const index = core.filterProducts(products, query()).findIndex((item) => productKey(item) === keepKey);
+        const index = visibleProducts().findIndex((item) => productKey(item) === keepKey);
         if (index >= 0) {
           productIndex = index;
           level = keepLevel;
@@ -150,7 +160,7 @@
     // ---------- 过滤与渲染 ----------
 
     function applyFilter(reset) {
-      filtered = core.filterProducts(products, query());
+      filtered = visibleProducts();
       if (reset) {
         productIndex = 0;
         level = "product";
@@ -158,9 +168,75 @@
       }
       productIndex = Math.min(productIndex, Math.max(0, filtered.length - 1));
       followActive(true);
+      renderTabs();
       renderProducts();
       renderMonths();
       renderHighlight();
+    }
+
+    // ---------- 分类页签 ----------
+
+    // 当前合约属于哪个分类: 主连/永续按代码直接找, 具体月份按 交易所.品种 找; 找不到返回空串。
+    function symbolCategory() {
+      if (!symbol) return "";
+      const parts = flow.parseSymbolParts(symbol);
+      const product = products.find((item) => item.contSymbol === symbol
+        || (parts && item.exchangeId === parts.exchange && item.productId === parts.product));
+      return product ? core.categoryOf(product) : "";
+    }
+
+    function setCategory(id) {
+      if (!id || id === category || !categories.includes(id)) return;
+      category = id;
+      applyFilter(true);
+    }
+
+    function stepCategory(delta) {
+      const count = categories.length;
+      const index = categories.indexOf(category);
+      setCategory(categories[((index + delta) % count + count) % count]);
+    }
+
+    // 搜索时当前分类没命中、别的分类有: 直接跳过去(期货页输入 btc 就到加密页)。
+    // 只在输入时跳; 用户自己点到一个没命中的页签不跳回去, 清空搜索也不跳。
+    function followMatches() {
+      if (!query().trim()) return;
+      const counts = core.countByCategory(products, query());
+      if (counts[category]) return;
+      const next = categories.find((id) => counts[id]);
+      if (next) category = next;
+    }
+
+    function renderTabs() {
+      if (!el.tabs) return;
+      clear(el.tabs);
+      el.tabs.hidden = categories.length < 2;
+      if (el.tabs.hidden) return;
+      const searching = !!query().trim();
+      const counts = searching ? core.countByCategory(products, query()) : null;
+      for (const item of core.CATEGORIES) {
+        if (!categories.includes(item.id)) continue;
+        const active = item.id === category;
+        const tab = node("picker-tab" + (active ? " active" : ""), "tab");
+        tab.setAttribute("aria-selected", active ? "true" : "false");
+        const label = doc.createElement("span");
+        label.textContent = item.label;
+        tab.append(label);
+        if (counts) {
+          const count = doc.createElement("span");
+          count.className = "picker-tab-count";
+          count.textContent = String(counts[item.id] || 0);
+          tab.append(count);
+        }
+        // 按下不抢走搜索框的焦点, 切完分类还能接着用键盘
+        tab.addEventListener("mousedown", (event) => event.preventDefault());
+        tab.addEventListener("click", (event) => {
+          // 页签会随过滤重画, 点中的元素已经不在菜单里了; 不拦住的话"点外部收起"会把菜单关掉
+          event.stopPropagation();
+          setCategory(item.id);
+        });
+        el.tabs.append(tab);
+      }
     }
 
     // 二级始终跟着"当前高亮品种"; 换了品种就取(或预取)它的月份。
@@ -396,7 +472,11 @@
       el.popup.hidden = false;
       if (el.trigger) el.trigger.setAttribute("aria-expanded", "true");
       el.search.focus();
-      applyFilter(false);
+      // 每次打开都回到当前合约所属的分类(看 fu 打开是期货, 看 BTC 打开是加密)
+      const home = symbolCategory();
+      const moved = !!home && home !== category && categories.includes(home);
+      if (moved) category = home;
+      applyFilter(moved);
     }
 
     function close() {
@@ -432,10 +512,15 @@
     // ---------- 事件 ----------
 
     el.search.addEventListener("keydown", (event) => {
-      const result = core.reduceKey({ level, productIndex, monthIndex }, event.key,
+      const key = event.key === "Tab" && event.shiftKey ? "Shift+Tab" : event.key;
+      const result = core.reduceKey({ level, productIndex, monthIndex }, key,
                                     filtered, currentOptions());
-      // Tab 只是收起菜单, 不要拦住默认的焦点移动
-      if (result.action.type !== "none" && event.key !== "Tab") event.preventDefault();
+      // 只有一个分类(没有页签)时 Tab 照旧只收起菜单, 不拦住默认的焦点移动
+      if (result.action.type === "category" && categories.length < 2) {
+        close();
+        return;
+      }
+      if (result.action.type !== "none") event.preventDefault();
       level = result.state.level;
       productIndex = result.state.productIndex;
       monthIndex = result.state.monthIndex;
@@ -445,13 +530,18 @@
         renderHighlight();
       } else if (result.action.type === "pick") {
         pick(result.action.symbol);
+      } else if (result.action.type === "category") {
+        stepCategory(result.action.delta);
       } else if (result.action.type === "close") {
         close();
       } else {
         renderHighlight();
       }
     });
-    el.search.addEventListener("input", () => applyFilter(true));
+    el.search.addEventListener("input", () => {
+      followMatches();
+      applyFilter(true);
+    });
     if (el.trigger) el.trigger.addEventListener("click", () => (isOpen ? close() : open()));
     doc.addEventListener("click", (event) => {
       // 点到菜单和触发器之外就收起; 触发器自己的点击已经 toggle 过, 这里不再处理。
@@ -465,7 +555,8 @@
       isOpen: () => isOpen,
       // 给宿主页面与回归测试观察内部状态
       snapshot: () => ({ products: filtered, months: currentOptions(), level, productIndex,
-                         monthIndex, label: el.trigger ? el.trigger.textContent : "" }),
+                         monthIndex, category, categories: categories.slice(),
+                         label: el.trigger ? el.trigger.textContent : "" }),
     };
   }
 

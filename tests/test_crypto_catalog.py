@@ -37,7 +37,10 @@ class CatalogTests(unittest.TestCase):
             manager.instruments["BINANCE.ETHUSDT.P"] = replace(manager.instruments["BINANCE.ETHUSDT.P"], rank=9e9)
             manager.instruments[BTC] = replace(manager.instruments[BTC], rank=1e9)
             manager.instruments["BINANCE.SOLUSDT.P"] = make_instrument("SOLUSDT", "SOL", 0.01, 1.0, rank=5e9)
-        groups = {group["exchangeId"]: group for group in manager.catalog_groups()}
+        ordered = manager.catalog_groups()
+        # 汇总排最前: 交易所的永续有几百个, 排在后面得翻到底才找得到
+        self.assertEqual([group["exchangeId"] for group in ordered], ["AGG", "BINANCE", "OKX"])
+        groups = {group["exchangeId"]: group for group in ordered}
         self.assertEqual([item["contSymbol"] for item in groups["BINANCE"]["products"]],
                          ["BINANCE.ETHUSDT.P", "BINANCE.SOLUSDT.P", BTC])
         row = groups["BINANCE"]["products"][0]
@@ -104,7 +107,7 @@ class RouteTests(unittest.TestCase):
 
     def test_symbols_append_crypto_groups_and_skip_months_for_crypto(self):
         payload = asyncio.run(server.symbols())
-        self.assertEqual([group["exchangeId"] for group in payload["groups"]], ["SHFE", "BINANCE", "OKX", "AGG"])
+        self.assertEqual([group["exchangeId"] for group in payload["groups"]], ["SHFE", "AGG", "BINANCE", "OKX"])
         payload = asyncio.run(server.symbols(exchange="BINANCE", product="BTCUSDT"))
         self.assertEqual(self.catalog.calls[-1], (None, None))             # 加密品种不问 TqSdk 的月份
         self.assertEqual(payload["months"], [])

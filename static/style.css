@@ -83,6 +83,20 @@ body { display: flex; flex-direction: column; }
 .picker-search-bar { padding: 6px; border-bottom: 1px solid #2a2e39; }
 #toolbar #picker-search { width: 100%; box-sizing: border-box; padding: 4px 8px; }
 
+/* 分类页签(期货 / 加密): 当前页签金色下划线, 与高亮行的左边线同色; 搜索时带命中数 */
+.picker-tabs { display: flex; gap: 4px; padding: 0 6px; border-bottom: 1px solid #2a2e39; }
+.picker-tabs[hidden] { display: none; }
+.picker-tab {
+  padding: 5px 10px 4px;
+  color: #9598a1;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  user-select: none;
+}
+.picker-tab:hover { color: #d1d4dc; }
+.picker-tab.active { color: #fff; border-bottom-color: #f0b90d; }
+.picker-tab-count { margin-left: 5px; font-family: Consolas, monospace; font-size: 12px; color: #9598a1; }
+
 .picker-columns { display: flex; max-height: 340px; }
 .picker-col { overflow-y: auto; padding: 4px 0; }
 .picker-col:first-child { width: 56%; border-right: 1px solid #2a2e39; }

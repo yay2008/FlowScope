@@ -334,12 +334,12 @@ class PaperBook:
         else:
             price = self._check_limit_price(order["price"], quote)
             order["price"] = price
-            self._check_funds(quote["contract"], side, qty, price, quote, now)
             opposite = quote.get("ask") if side == "buy" else quote.get("bid")
             volume = quote.get("askVolume") if side == "buy" else quote.get("bidVolume")
             crosses = opposite is not None and (opposite <= price if side == "buy" else opposite >= price)
             # 够得着对手价就按对手价成交(可能比限价更好); 否则挂着等价格穿过限价。
             price = opposite if open_now and crosses and (volume or 0) >= qty else None
+            self._check_funds(quote["contract"], side, qty, order["price"] if price is None else price, quote, now)
         order["id"] = self._next_id("O")
         self.orders.append(order)
         if price is not None:
@@ -470,10 +470,11 @@ class PaperBook:
         if not opening:
             return
         others = [(key, pos) for key, pos in self.positions.items() if key != contract]
+        mark = quote.get("last") or price  # 与 _fill 之后的账户估值保持一致。
         equity = self.cash + realized - fee + sum(self._float_pnl(key, pos) for key, pos in others)
-        equity += (price - position["avgPrice"]) * position["qty"] * position["multiplier"]
+        equity += (mark - position["avgPrice"]) * position["qty"] * position["multiplier"]
         other_margin = sum(self._margin(key, pos) for key, pos in others)
-        need = abs(position["qty"]) * price * position["multiplier"] * MARGIN_RATE
+        need = abs(position["qty"]) * mark * position["multiplier"] * MARGIN_RATE
         if equity - other_margin < need:
             raise OrderError(f"资金不足: 需要保证金 {need:,.0f}, 可用 {equity - other_margin:,.0f}")
 

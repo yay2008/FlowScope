@@ -102,6 +102,55 @@ class BookTests(unittest.TestCase):
         self.assertEqual(book.positions[BTC.symbol], {"qty": -2.0, "avgPrice": 100.0})
         self.assertAlmostEqual(book.realized, -0.1)
 
+    def test_opening_funds_use_mark_price_for_both_sides(self):
+        for side in ("buy", "sell"):
+            with self.subTest(side=side):
+                book = CryptoBook({"initialCash": 10.16})
+                quote = make_quote(bids=((99., 10.),), asks=((101., 10.),), mark=100.)
+                with self.assertRaisesRegex(OrderError, "资金不足"):
+                    book.place(order(side, 1.), quote, NOW)
+                self.assertEqual(book.positions, {})
+                self.assertEqual(book.orders, [])
+
+    def test_marketable_limit_checks_actual_fill_instead_of_limit(self):
+        for side, limit in (("buy", 110.), ("sell", 90.)):
+            with self.subTest(side=side):
+                book = CryptoBook({"initialCash": 10.1})
+                quote = make_quote(bids=((100., 10.),), asks=((100., 10.),), mark=100.)
+                filled = book.place(order(side, 1., "limit", limit), quote, NOW)
+                self.assertEqual((filled["status"], filled["fillPrice"]), ("filled", 100.))
+                self.assertAlmostEqual(book.summary()["account"]["available"], .05)
+
+    def test_fill_valuation_uses_current_quote_and_last_price_fallback(self):
+        for mark in (100., None):
+            with self.subTest(mark=mark):
+                book = CryptoBook({"initialCash": 10.16})
+                book.marks[BTC.symbol] = 90.  # 当前报价已比上一次估值更新。
+                quote = make_quote(asks=((100., 10.),), mark=mark, last=100.)
+                book.place(order("buy", 1.), quote, NOW)
+                summary = book.summary()["account"]
+                self.assertEqual(summary["floatPnl"], 0.)
+                self.assertAlmostEqual(summary["available"], .11)
+
+    def test_resting_order_rechecks_funds_at_current_mark(self):
+        book = CryptoBook({"initialCash": 10.2})
+        resting = book.place(order("buy", 1., "limit", 100.), make_quote(), NOW)
+        self.assertEqual(resting["status"], "open")
+        through = make_quote(bids=((98., 10.),), asks=((99., 10.),), mark=99., last=99.)
+        self.assertTrue(book.match({BTC.symbol: through}, NOW + 1000))
+        self.assertEqual(resting["status"], "rejected")
+        self.assertEqual(book.positions, {})
+
+    def test_reduction_still_allowed_with_insufficient_initial_margin(self):
+        book = CryptoBook({"initialCash": 100.})
+        book.place(order("buy", 9.), make_quote(asks=((100., 10.),)), NOW)
+        quote = make_quote(bids=((90., 10.),), mark=90., last=90.)
+        book.settle({BTC.symbol: quote}, NOW + 1000)
+        self.assertLess(book.summary()["account"]["available"], 0.)
+        filled = book.place(order("sell", 1.), quote, NOW + 1001)
+        self.assertEqual(filled["status"], "filled")
+        self.assertEqual(book.positions[BTC.symbol]["qty"], 8.)
+
     def test_funding_settles_at_the_announced_time_with_the_rate_seen_before(self):
         book = CryptoBook()
         book.place(order("buy", 1.0), make_quote(), NOW)
@@ -112,6 +161,30 @@ class BookTests(unittest.TestCase):
         self.assertAlmostEqual(book.cash - cash, -1.0 * 100.0 * 0.0001)    # 多头在正费率时付费
         self.assertEqual(len(book.fundings), 1)
         self.assertFalse(book.settle({BTC.symbol: after}, NOW + 2000))      # 同一期不重复结算
+
+    def test_reopening_before_funding_charges_only_the_new_position(self):
+        book = CryptoBook()
+        quote = make_quote(rate=.001, next_time=NOW + 1000)
+        book.place(order("buy", 1.), quote, NOW)
+        book.settle({BTC.symbol: quote}, NOW)
+        book.flatten(BTC.symbol, quote, NOW + 500)
+        book.place(order("sell", 2.), quote, NOW + 750)
+        # 新仓建立后还没跑过循环, 到点仍应按新空仓数量收费/付费。
+        after = make_quote(rate=.002, next_time=NOW + 2000)
+        book.settle({BTC.symbol: after}, NOW + 1000)
+        self.assertEqual(len(book.fundings), 1)
+        self.assertEqual(book.fundings[0]["qty"], -2.)
+        self.assertAlmostEqual(book.funding, .2)
+
+    def test_flat_resting_order_does_not_accrue_funding_for_later_position(self):
+        book = CryptoBook()
+        quote = make_quote(rate=.001, next_time=NOW + 1000)
+        book.place(order("buy", 1., "limit", 90.), quote, NOW)
+        book.settle({BTC.symbol: quote}, NOW)
+        later = make_quote(rate=.002, next_time=NOW + 3000)
+        book.place(order("buy", 1.), later, NOW + 2000)
+        book.settle({BTC.symbol: later}, NOW + 2001)
+        self.assertEqual(book.fundings, [])
 
     def test_liquidation_when_equity_falls_below_maintenance(self):
         book = CryptoBook({"initialCash": 100.0})
@@ -185,6 +258,34 @@ class ServiceTests(unittest.TestCase):
         summary = self.service.reset(500)
         self.assertEqual(summary["account"]["equity"], 500.0)
         self.assertEqual(self.service.state(BTC.symbol)["leverage"], 5)       # 重置保留杠杆设置
+
+    def test_flat_at_funding_time_is_not_charged_after_reopening(self):
+        now = [NOW]
+        self.service._clock = lambda: now[0]
+        self.crypto.raw["mark"].update(fundingRate=.001, nextFundingTime=NOW + 1000)
+        self.service.place(order("buy", 1.))
+        self.service.on_cycle(self.crypto)
+        now[0] = NOW + 500
+        self.service.flatten(BTC.symbol)
+        now[0] = NOW + 1001
+        self.service.on_cycle(self.crypto)
+        self.assertEqual(self.service.state(BTC.symbol)["positions"], [])
+
+        now[0] = NOW + 2000
+        self.crypto.raw["mark"].update(fundingRate=.002, nextFundingTime=NOW + 3000)
+        self.service.place(order("buy", 2.))
+        self.service.on_cycle(self.crypto)
+        self.assertEqual(self.service.state(BTC.symbol)["fundings"], [])
+
+        now[0] = NOW + 3000
+        self.crypto.raw["mark"].update(fundingRate=.003, nextFundingTime=NOW + 4000)
+        self.service.on_cycle(self.crypto)
+        self.service.on_cycle(self.crypto)
+        state = self.service.state(BTC.symbol)
+        self.assertEqual(len(state["fundings"]), 1)
+        self.assertAlmostEqual(state["account"]["funding"], -.4)
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertAlmostEqual(json.load(handle)["funding"], -.4)
 
 
 class NoFutures:

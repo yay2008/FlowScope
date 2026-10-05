@@ -191,13 +191,13 @@ class CryptoBook:
             if price is None:
                 raise OrderError("五档盘口的量不够这笔市价单")
             self._check_notional(qty, price, quote)
-            self._check_funds(quote["contract"], side, qty, price, taker)
+            self._check_funds(quote["contract"], side, qty, price, taker, quote)
         else:
             limit = self._check_limit_price(order["price"], quote)
             order["price"] = limit
             self._check_notional(qty, limit, quote)
-            self._check_funds(quote["contract"], side, qty, limit, taker)
             price = sweep(book, qty, limit, side) if quote["open"] else None
+            self._check_funds(quote["contract"], side, qty, limit if price is None else price, taker, quote)
         order["id"] = self._next_id("O")
         self.orders.append(order)
         if price is not None:
@@ -234,7 +234,7 @@ class CryptoBook:
                 continue
             maker, _ = FEES.get(venue_of(order["contract"]), FEES["BINANCE"])
             try:
-                self._check_funds(order["contract"], order["side"], order["qty"], order["price"], maker)
+                self._check_funds(order["contract"], order["side"], order["qty"], order["price"], maker, quote)
             except OrderError as exc:
                 order.update(status="rejected", reason=str(exc), updatedAt=_stamp(now_ms))
             else:
@@ -262,14 +262,22 @@ class CryptoBook:
                                       "amount": round(amount, 6)})
                 self.fundings = self.fundings[-MAX_FUNDINGS:]
                 changed = True
-            upcoming = quote.get("nextFundingTime")
-            if upcoming and upcoming > now_ms:
-                self._funding_due[symbol] = upcoming
-                if quote.get("fundingRate") is not None:
-                    self._funding_rate[symbol] = quote["fundingRate"]
-            elif due is not None and now_ms >= due:
-                self._funding_due.pop(symbol, None)
+            self._schedule_funding(symbol, quote, now_ms)
         return self._liquidate(quotes, now_ms) or changed
+
+    def _schedule_funding(self, symbol: str, quote: dict, now_ms: int):
+        """只为现有持仓登记未来结算; 空仓和到期状态一并清理, 费率不跨期沿用。"""
+        due = self._funding_due.get(symbol)
+        upcoming = quote.get("nextFundingTime")
+        if symbol in self.positions and upcoming and upcoming > now_ms:
+            if upcoming != due:
+                self._funding_rate.pop(symbol, None)
+            self._funding_due[symbol] = upcoming
+            if quote.get("fundingRate") is not None:
+                self._funding_rate[symbol] = quote["fundingRate"]
+        elif symbol not in self.positions or (due is not None and now_ms >= due):
+            self._funding_due.pop(symbol, None)
+            self._funding_rate.pop(symbol, None)
 
     # ---------- 规则 ----------
 
@@ -327,6 +335,10 @@ class CryptoBook:
     def _mark_of(self, symbol: str, position: dict) -> float:
         return self.marks.get(symbol, position["avgPrice"])
 
+    def _quote_mark(self, symbol: str, quote: dict, fallback: float) -> float:
+        """资金校验和成交后估值使用同一价格: 当前标记价、最新价、缓存价、最后才是成交价。"""
+        return quote.get("markPrice") or quote.get("last") or self.marks.get(symbol, fallback)
+
     def _float_pnl(self, symbol: str, position: dict) -> float:
         return (self._mark_of(symbol, position) - position["avgPrice"]) * position["qty"]
 
@@ -337,31 +349,39 @@ class CryptoBook:
         equity = self.cash + sum(self._float_pnl(key, pos) for key, pos in self.positions.items())
         return equity - sum(self._margin(key, pos) for key, pos in self.positions.items())
 
-    def _check_funds(self, symbol: str, side: str, qty: float, price: float, fee_rate: float):
+    def _check_funds(self, symbol: str, side: str, qty: float, price: float, fee_rate: float, quote: dict):
         """开仓(含反手的开仓部分)要求成交后权益仍够付全部持仓的初始保证金; 只减仓不查。"""
         signed = qty if side == "buy" else -qty
         position, realized, fee, opening, _ = self._preview(symbol, signed, price, fee_rate)
         if not opening:
             return
         others = [(key, pos) for key, pos in self.positions.items() if key != symbol]
+        mark = self._quote_mark(symbol, quote, price)
         equity = self.cash + realized - fee + sum(self._float_pnl(key, pos) for key, pos in others)
-        equity += (price - position["avgPrice"]) * position["qty"]
+        equity += (mark - position["avgPrice"]) * position["qty"]
         need = sum(self._margin(key, pos) for key, pos in others)
-        need += abs(position["qty"]) * price / self.leverage_of(symbol)
+        need += abs(position["qty"]) * mark / self.leverage_of(symbol)
         if equity < need:
             raise OrderError(f"资金不足: 需要保证金 {need:,.2f} USDT, 权益 {equity:,.2f}")
 
     def _fill(self, order: dict, price: float, fee_rate: float, liquidity: str, quote: dict, now_ms: int):
+        symbol = order["contract"]
+        was_flat = symbol not in self.positions
         signed = order["qty"] if order["side"] == "buy" else -order["qty"]
-        position, realized, fee, opening, closing = self._preview(order["contract"], signed, price, fee_rate)
+        position, realized, fee, opening, closing = self._preview(symbol, signed, price, fee_rate)
         if position["qty"]:
-            self.positions[order["contract"]] = position
+            self.positions[symbol] = position
         else:
-            self.positions.pop(order["contract"], None)
+            self.positions.pop(symbol, None)
+        if was_flat or not position["qty"]:
+            # 新仓不能继承空仓前的结算; 从成交时的报价登记下一期, 不必等下一轮循环。
+            self._funding_due.pop(symbol, None)
+            self._funding_rate.pop(symbol, None)
+            self._schedule_funding(symbol, quote, now_ms)
         self.cash += realized - fee
         self.realized += realized
         self.fees_paid += fee
-        self.marks.setdefault(order["contract"], quote.get("markPrice") or price)
+        self.marks[order["contract"]] = self._quote_mark(order["contract"], quote, price)
         self.trades.append({"id": self._next_id("T"), "orderId": order["id"], "contract": order["contract"],
                             "side": order["side"], "qty": order["qty"], "price": price, "liquidity": liquidity,
                             "open": opening, "close": closing, "pnl": round(realized, 6),

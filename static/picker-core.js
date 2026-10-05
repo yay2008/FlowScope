@@ -1,4 +1,4 @@
-/* 合约选择器的纯逻辑: 展平目录、搜索过滤、月份选项、键盘状态机。
+/* 合约选择器的纯逻辑: 展平目录、分类、搜索过滤、月份选项、键盘状态机。
  *
  * 不碰 DOM, 浏览器与 Node 回归测试共用(与 data-sync.js 同样的写法)。
  * 展示用的文字标签在 data-sync.js 里(productLabel / monthLabel), 这里只出数据。
@@ -7,6 +7,17 @@
   "use strict";
 
   const NO_ACTION = Object.freeze({ type: "none" });
+
+  // 一级菜单顶上的分类页签, 按这个顺序排。品种行没有分类字段, 按 crypto 标记归类;
+  // 以后接入别的市场, 在这里加一项、在 categoryOf 里认出来即可。
+  const CATEGORIES = Object.freeze([
+    Object.freeze({ id: "futures", label: "期货" }),
+    Object.freeze({ id: "crypto", label: "加密" }),
+  ]);
+
+  function categoryOf(product) {
+    return product && product.crypto ? "crypto" : "futures";
+  }
 
   // 目录是 交易所 -> 品种 的两层结构; 选择器要按"一行一个品种"来导航和搜索, 所以先展平。
   function flattenGroups(groups) {
@@ -25,15 +36,29 @@
   }
 
   // 搜索口径: 中文名、品种代码、主连代码、主力合约代码、交易所代码。
-  function filterProducts(products, query) {
+  // 传了 category 只在该分类里找; 不传(或空串)就是全部分类。
+  function filterProducts(products, query, category) {
     const needle = normalize(query);
-    if (!needle) return (products || []).slice();
-    return (products || []).filter((product) =>
+    const pool = category ? (products || []).filter((product) => categoryOf(product) === category)
+      : (products || []);
+    if (!needle) return pool.slice();
+    return pool.filter((product) =>
       normalize(product.name).includes(needle) ||
       normalize(product.productId).includes(needle) ||
       normalize(product.contSymbol).includes(needle) ||
       normalize(product.mainSymbol).includes(needle) ||
       normalize(product.exchangeId).includes(needle));
+  }
+
+  // 每个分类的搜索命中数(页签上显示, 也用来判断要不要自动跳到有结果的分类)。
+  function countByCategory(products, query) {
+    const counts = {};
+    for (const category of CATEGORIES) counts[category.id] = 0;
+    for (const product of filterProducts(products, query)) {
+      const id = categoryOf(product);
+      counts[id] = (counts[id] || 0) + 1;
+    }
+    return counts;
   }
 
   // 二级菜单: 第一项恒为「主力」, 即使月份列表还没回来(或请求失败)也能选主力。
@@ -64,11 +89,13 @@
 
   /*
    * 键盘状态机: state = {level, productIndex, monthIndex}, 返回 {state, action}。
-   * action 只有四种, 由调用方落地:
+   * action 只有五种, 由调用方落地:
    *   {type:"none"}                 什么都不做
    *   {type:"prefetch", index}      一级停到了新品种, 去取它的月份
    *   {type:"pick", symbol}         选定一个合约(一级回车 = 该品种主力)
+   *   {type:"category", delta}      切到下一个(+1)/上一个(-1)分类页签
    *   {type:"close"}                关闭菜单
+   * Shift+Tab 由调用方按 "Shift+Tab" 传进来(key 本身只有 "Tab")。
    */
   function reduceKey(state, key, products, months) {
     const list = products || [];
@@ -114,15 +141,18 @@
         // 一级直接回车 = 该品种的主力(主连), 不用先进二级, 这是最常用的路径。
         return product ? { state, action: { type: "pick", symbol: product.contSymbol } } : same;
       }
-      case "Escape":
       case "Tab":
+      case "Shift+Tab":
+        return { state, action: { type: "category", delta: key === "Tab" ? 1 : -1 } };
+      case "Escape":
         return { state, action: { type: "close" } };
       default:
         return same;
     }
   }
 
-  const api = { flattenGroups, filterProducts, monthOptions, moveIndex, reduceKey };
+  const api = { CATEGORIES, categoryOf, flattenGroups, filterProducts, countByCategory, monthOptions,
+                moveIndex, reduceKey };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PickerCore = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

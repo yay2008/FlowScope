@@ -213,6 +213,27 @@ class CandleStoreTests(unittest.TestCase):
         self.assertEqual(list(reloaded.time), [display(0), display(10000)])
         self.assertEqual(reloaded.iloc[0].open, 90.0)              # 后写的行优先
 
+    def test_failed_write_retries_new_and_revised_candles(self):
+        bars = pd.DataFrame({"time": [10, 20], "open": [100., 101.], "high": [102., 103.],
+                             "low": [99., 100.], "close": [101., 102.], "volume": [2., 3.]})
+        store = CandleStore(self.path)
+        store.load()
+        with patch("builtins.open", side_effect=PermissionError("temporary file lock")):
+            with self.assertRaises(PermissionError):
+                store.save(bars.iloc[:1], final=True)
+        store.save(bars.iloc[:1], final=True)
+        bars.loc[0, "volume"] = 5.
+        with patch("builtins.open", side_effect=PermissionError("temporary file lock")):
+            with self.assertRaises(PermissionError):
+                store.save(bars, final=True)
+        store.save(bars, final=True)
+        pd.testing.assert_frame_equal(CandleStore(self.path).load(), bars)
+        count = len(self.rows())
+        store.save(bars, final=True)
+        self.assertEqual(len(self.rows()), count)
+        store.refresh()
+        pd.testing.assert_frame_equal(store.rows(0, 30), bars)
+
     def test_reload_takes_latest_rows_and_skips_bad_lines(self):
         with open(self.path, "w", encoding="utf-8") as handle:
             handle.write("time,open,high,low,close,volume\n10,1.0,1.0,1.0,1.0,1.0\n20,2.0,2.0,2.0,2.0,2.0\n"

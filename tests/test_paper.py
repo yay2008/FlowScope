@@ -213,6 +213,24 @@ class FeeTest(unittest.TestCase):
 
 
 class FundsTest(unittest.TestCase):
+    def test_opening_funds_include_spread_loss_at_last_price(self):
+        for side in ("buy", "sell"):
+            with self.subTest(side=side):
+                account = book(cash=4510., fees=FeeTable())
+                quote = snap(ask_price1=3002., bid_price1=2998., last_price=3000.)
+                with self.assertRaisesRegex(OrderError, "资金不足"):
+                    account.place(order(side, 1), quote, NOW)
+                self.assertEqual(account.positions, {})
+
+    def test_marketable_limit_funds_use_actual_fill_and_last_price(self):
+        for side, limit in (("buy", 3010.), ("sell", 2990.)):
+            with self.subTest(side=side):
+                account = book(cash=4505., fees=FeeTable())
+                quote = snap(ask_price1=3000., bid_price1=3000., last_price=3000.)
+                filled = account.place(order(side, 1, "limit", limit), quote, NOW)
+                self.assertEqual((filled["status"], filled["fillPrice"]), ("filled", 3000.))
+                self.assertEqual(account.summary()["account"]["available"], 5.)
+
     def test_open_needs_margin_but_closing_is_always_allowed(self):
         account = book(cash=10_000.0, fees=FeeTable())
         # 一手保证金 3000 x 10 x 15% = 4500; 两手可以, 三手不够

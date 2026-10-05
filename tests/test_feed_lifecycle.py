@@ -206,6 +206,32 @@ class FeedLifecycleTests(unittest.TestCase):
         self.assertFalse(apis[1].quote_calls)
         self.assertTrue(all(api.closed for api in apis))
 
+    def test_disconnect_with_cancelled_query_reconnects_and_fails_remaining_jobs(self):
+        feed = self.feed()
+        apis, futures = [], []
+
+        def disconnect(api):
+            cancelled = self.manager.submit_job(lambda api: None)
+            cancelled.cancel()  # HTTP 查询在队列中等到超时。
+            futures.extend([cancelled, self.manager.submit_job(lambda api: None)])
+            raise ConnectionError("connection lost after query timeout")
+
+        def verify(api):
+            self.assertTrue(futures[0].cancelled())
+            self.assertIsInstance(futures[1].exception(), RuntimeError)
+            self.assertIs(self.manager._subscribed[(feed.symbol, 30)], feed)
+            self.manager._stop.set()
+
+        def factory(**kwargs):
+            api = ScriptedApi(self.manager, self.clock, [verify] if apis else [disconnect])
+            apis.append(api)
+            return api
+
+        self.run_manager(factory)
+        self.assertEqual(len(apis), 2)
+        self.assertTrue(all(api.closed for api in apis))
+        self.assertTrue(self.manager.jobs.empty())
+
     def test_temporary_computation_error_retries_even_without_new_ticks(self):
         feed = self.feed()
         complete = feed.recompute.side_effect

@@ -1,9 +1,9 @@
 "use strict";
-/* picker-core 的纯逻辑回归: 展平、搜索、月份选项、键盘状态机。 */
+/* picker-core 的纯逻辑回归: 展平、分类、搜索、月份选项、键盘状态机。 */
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { flattenGroups, filterProducts, monthOptions, moveIndex, reduceKey } =
-  require("../static/picker-core.js");
+const { CATEGORIES, categoryOf, flattenGroups, filterProducts, countByCategory, monthOptions, moveIndex,
+        reduceKey } = require("../static/picker-core.js");
 
 const GROUPS = [
   { exchangeId: "SHFE", exchangeName: "上期所", products: [
@@ -37,6 +37,47 @@ test("搜索匹配中文名、品种代码、主连代码、主力合约与交�
   assert.deepEqual(filterProducts(PRODUCTS, "shfe").map((p) => p.productId), ["fu", "rb"]);
   assert.deepEqual(filterProducts(PRODUCTS, "  ").length, 3);   // 空搜索 = 全部
   assert.deepEqual(filterProducts(PRODUCTS, "不存在"), []);
+});
+
+// 期货 + 加密混排的目录(与 /api/symbols 一样: 期货分组在前, 加密分组带 crypto=true)
+const MIXED = flattenGroups([
+  ...GROUPS,
+  { exchangeId: "AGG", exchangeName: "多所汇总", products: [
+    { exchangeId: "AGG", productId: "BTC", name: "BTC", contSymbol: "AGG.BTC", mainSymbol: "",
+      crypto: true, openInterest: 9e9 },
+  ] },
+  { exchangeId: "BINANCE", exchangeName: "币安永续", products: [
+    { exchangeId: "BINANCE", productId: "BTCUSDT", name: "BTCUSDT", contSymbol: "BINANCE.BTCUSDT.P",
+      mainSymbol: "", crypto: true, openInterest: 8e9 },
+    { exchangeId: "BINANCE", productId: "FUNUSDT", name: "FUNUSDT", contSymbol: "BINANCE.FUNUSDT.P",
+      mainSymbol: "", crypto: true, openInterest: 1e6 },
+  ] },
+]);
+
+test("分类按 crypto 标记归类, 页签顺序是 期货 → 加密", () => {
+  assert.deepEqual(CATEGORIES.map((c) => c.id), ["futures", "crypto"]);
+  assert.deepEqual(CATEGORIES.map((c) => c.label), ["期货", "加密"]);
+  assert.equal(categoryOf(MIXED[0]), "futures");
+  assert.equal(categoryOf(MIXED[3]), "crypto");
+  assert.equal(categoryOf(null), "futures");
+});
+
+test("搜索可以限定在一个分类里, 不传分类就是全部", () => {
+  assert.deepEqual(filterProducts(MIXED, "", "futures").map((p) => p.productId), ["fu", "rb", "i"]);
+  assert.deepEqual(filterProducts(MIXED, "", "crypto").map((p) => p.productId), ["BTC", "BTCUSDT", "FUNUSDT"]);
+  // fu 在两个分类里都有命中: 燃油 与 FUNUSDT
+  assert.deepEqual(filterProducts(MIXED, "fu", "futures").map((p) => p.productId), ["fu"]);
+  assert.deepEqual(filterProducts(MIXED, "fu", "crypto").map((p) => p.productId), ["FUNUSDT"]);
+  assert.deepEqual(filterProducts(MIXED, "fu").map((p) => p.productId), ["fu", "FUNUSDT"]);
+  assert.deepEqual(filterProducts(MIXED, "fu", "").length, 2);
+});
+
+test("各分类命中数: 没有命中的分类也给 0", () => {
+  assert.deepEqual(countByCategory(MIXED, ""), { futures: 3, crypto: 3 });
+  assert.deepEqual(countByCategory(MIXED, "btc"), { futures: 0, crypto: 2 });
+  assert.deepEqual(countByCategory(MIXED, "螺纹"), { futures: 1, crypto: 0 });
+  assert.deepEqual(countByCategory(PRODUCTS, ""), { futures: 3, crypto: 0 });
+  assert.deepEqual(countByCategory(null, "x"), { futures: 0, crypto: 0 });
 });
 
 test("二级第一项恒为★主力, 即使月份列表为空或还没回来", () => {
@@ -90,17 +131,24 @@ test("回车在一级选主力、在二级选具体月份", () => {
   assert.deepEqual(empty.action, { type: "none" });
 });
 
-test("二级上下键移动月份, Esc/Tab 关闭菜单", () => {
+test("二级上下键移动月份, Esc 关闭菜单", () => {
   const state = { level: "month", productIndex: 0, monthIndex: 0 };
   const down = reduceKey(state, "ArrowDown", PRODUCTS, MONTHS);
   assert.equal(down.state.monthIndex, 1);
   assert.deepEqual(down.action, { type: "none" });   // 二级移动不需要重新取月份
   assert.equal(reduceKey(state, "ArrowDown", PRODUCTS, MONTHS).state.level, "month");
-  for (const key of ["Escape", "Tab"]) {
-    const result = reduceKey(state, key, PRODUCTS, MONTHS);
-    assert.deepEqual(result.action, { type: "close" });
-  }
+  assert.deepEqual(reduceKey(state, "Escape", PRODUCTS, MONTHS).action, { type: "close" });
   assert.deepEqual(reduceKey(state, "a", PRODUCTS, MONTHS).action, { type: "none" });
+});
+
+test("Tab / Shift+Tab 切换分类, 一级二级都一样, 光标由调用方重置", () => {
+  for (const level of ["product", "month"]) {
+    const state = { level, productIndex: 1, monthIndex: 1 };
+    const next = reduceKey(state, "Tab", PRODUCTS, MONTHS);
+    assert.deepEqual(next.action, { type: "category", delta: 1 });
+    assert.deepEqual(next.state, state);
+    assert.deepEqual(reduceKey(state, "Shift+Tab", PRODUCTS, MONTHS).action, { type: "category", delta: -1 });
+  }
 });
 
 test("二级 Home/End 按月份数跳到首尾, 不是按品种数", () => {

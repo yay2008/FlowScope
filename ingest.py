@@ -556,7 +556,10 @@ class FeedManager:
                 _, future = self.jobs.get_nowait()
             except queue.Empty:
                 return
-            future.set_exception(RuntimeError(message))
+            # 与 HTTP 超时取消原子地交接状态: 先检查 cancelled() 再 set_exception
+            # 仍有竞态; 取得执行权后取消便不会再成功。
+            if future.set_running_or_notify_cancel():
+                future.set_exception(RuntimeError(message))
 
     async def query(self, fn, timeout: float = JOB_TIMEOUT_SEC):
         """在采集线程执行一次 SDK 查询并等待结果(HTTP 处理器调用)。

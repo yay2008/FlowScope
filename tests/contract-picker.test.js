@@ -72,11 +72,12 @@ function makeRoot(doc) {
   const trigger = doc.createElement("button");
   const popup = doc.createElement("div");
   const search = doc.createElement("input");
+  const tabs = doc.createElement("div");
   const products = doc.createElement("div");
   const months = doc.createElement("div");
   wrapper.append(trigger, popup);
-  popup.append(search, products, months);
-  return { wrapper, trigger, popup, search, products, months };
+  popup.append(search, tabs, products, months);
+  return { wrapper, trigger, popup, search, tabs, products, months };
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -581,4 +582,229 @@ test("菜单里的 ☆ 与工具栏、自选面板共用同一份自选", async 
   picker.refreshFavorites();
   assert.equal(stars(el.products)[2].textContent, "★");   // 铁矿石那一行亮起来
   assert.equal(stars(el.products)[0].textContent, "☆");
+});
+
+// ---------- 分类页签(期货 / 加密) ----------
+
+// 与 /api/symbols 一样: 期货分组之后接加密分组(多所汇总在前), 加密行带 crypto=true
+const MIXED_CATALOG = {
+  ...CATALOG, groups: [
+    ...CATALOG.groups,
+    { exchangeId: "AGG", exchangeName: "多所汇总", products: [
+      { exchangeId: "AGG", productId: "BTC", name: "BTC", contSymbol: "AGG.BTC", mainSymbol: "",
+        crypto: true, openInterest: 9e9 },
+    ] },
+    { exchangeId: "BINANCE", exchangeName: "币安永续", products: [
+      { exchangeId: "BINANCE", productId: "BTCUSDT", name: "BTCUSDT", contSymbol: "BINANCE.BTCUSDT.P",
+        mainSymbol: "", crypto: true, openInterest: 8e9 },
+      { exchangeId: "BINANCE", productId: "FUNUSDT", name: "FUNUSDT", contSymbol: "BINANCE.FUNUSDT.P",
+        mainSymbol: "", crypto: true, openInterest: 1e6 },
+    ] },
+  ],
+};
+
+function mixedRoutes() {
+  const futures = defaultRoutes();
+  return (url) => (url === "/api/symbols" ? Promise.resolve(MIXED_CATALOG) : futures(url));
+}
+
+const tabTexts = (tabs) => tabs.children.map((tab) => tab.children.map((child) => child.textContent).join(" "));
+const activeTab = (tabs) => {
+  const tab = tabs.children.find((child) => child.className.includes("active"));
+  return tab ? tab.children[0].textContent : null;
+};
+const groupTitles = (column) => column.children.filter((child) => child.className === "picker-group")
+  .map((child) => child.textContent);
+const shownIds = (picker) => picker.snapshot().products.map((product) => product.productId);
+
+// 模拟浏览器里的一次点击: 元素自己的监听器先跑, 没被拦住才冒泡到 document
+function clickInPage(doc, element) {
+  let stopped = false;
+  element.dispatch("click", { target: element, stopPropagation() { stopped = true; } });
+  if (!stopped) doc.dispatch("click", { target: element });
+}
+
+function input(el, value) {
+  el.search.value = value;
+  el.search.dispatch("input");
+}
+
+test("目录只有期货时不显示页签, Tab 照旧收起菜单且不拦焦点", async () => {
+  const { el, picker } = setup();
+  picker.load();
+  await flush();
+  assert.equal(el.tabs.hidden, true);
+  assert.equal(el.tabs.children.length, 0);
+  picker.open();
+  let prevented = false;
+  el.search.dispatch("keydown", { key: "Tab", preventDefault() { prevented = true; } });
+  assert.equal(picker.isOpen(), false);
+  assert.equal(prevented, false);
+});
+
+test("期货 + 加密: 页签按 期货 → 加密 排, 一次只列当前分类", async () => {
+  const { el, picker } = setup({ fetchJson: mixedRoutes() });
+  picker.setSymbol("KQ.m@SHFE.fu");
+  picker.load();
+  await flush();
+  assert.equal(el.tabs.hidden, false);
+  assert.deepEqual(tabTexts(el.tabs), ["期货", "加密"]);       // 不搜索时不带数字
+  assert.equal(activeTab(el.tabs), "期货");
+  assert.deepEqual(shownIds(picker), ["fu", "rb", "i"]);
+  assert.deepEqual(groupTitles(el.products), ["上期所", "大商所"]);
+  assert.deepEqual(picker.snapshot().categories, ["futures", "crypto"]);
+});
+
+test("打开菜单时停在当前合约所属的分类", async () => {
+  const { el, picker, calls } = setup({ fetchJson: mixedRoutes() });
+  picker.setSymbol("BINANCE.BTCUSDT.P");
+  picker.load();
+  await flush();
+  assert.equal(picker.snapshot().category, "crypto");          // 首次到达就按当前合约选页签
+  assert.deepEqual(groupTitles(el.products), ["多所汇总", "币安永续"]);
+  assert.ok(!calls.some((url) => url.includes("exchange=AGG") || url.includes("exchange=BINANCE")));
+
+  picker.setSymbol("SHFE.fu2701");                             // 具体月份也能认出分类
+  picker.open();
+  assert.equal(picker.snapshot().category, "futures");
+  picker.close();
+  picker.setSymbol("AGG.BTC");
+  picker.open();
+  assert.equal(picker.snapshot().category, "crypto");
+  assert.equal(picker.snapshot().productIndex, 0);             // 换了分类, 光标回到第一行
+  assert.equal(activeTab(el.tabs), "加密");
+});
+
+test("当前合约不在目录里时打开菜单不换分类", async () => {
+  const { picker } = setup({ fetchJson: mixedRoutes() });
+  picker.setSymbol("KQ.m@SHFE.fu");
+  picker.load();
+  await flush();
+  picker.open();
+  picker.close();
+  picker.setSymbol("OKX.SOL-USDT-SWAP");                       // 合约列表里没有
+  picker.open();
+  assert.equal(picker.snapshot().category, "futures");
+});
+
+test("Tab / Shift+Tab 循环切换分类, 光标回到第一行、二级跟上", async () => {
+  const { el, picker, picked } = setup({ fetchJson: mixedRoutes() });
+  picker.setSymbol("KQ.m@SHFE.fu");
+  picker.load();
+  await flush();
+  picker.open();
+  el.search.dispatch("keydown", { key: "ArrowDown" });
+  el.search.dispatch("keydown", { key: "ArrowRight" });        // 停在螺纹的二级
+  let prevented = false;
+  el.search.dispatch("keydown", { key: "Tab", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);                               // 焦点留在搜索框
+  let state = picker.snapshot();
+  assert.equal(state.category, "crypto");
+  assert.equal(state.level, "product");
+  assert.equal(state.productIndex, 0);
+  assert.match(el.months.textContent, /永续 · BTC/);
+  el.search.dispatch("keydown", { key: "Tab" });               // 只有两个分类: 再按回到期货
+  assert.equal(picker.snapshot().category, "futures");
+  el.search.dispatch("keydown", { key: "Tab", shiftKey: true });
+  assert.equal(picker.snapshot().category, "crypto");
+  el.search.dispatch("keydown", { key: "Enter" });
+  assert.deepEqual(picked, ["AGG.BTC"]);
+});
+
+test("点页签切换分类: 不收起菜单、不抢搜索框焦点", async () => {
+  const { doc, el, picker } = setup({ fetchJson: mixedRoutes() });
+  picker.setSymbol("KQ.m@SHFE.fu");
+  picker.load();
+  await flush();
+  picker.open();
+  const cryptoTab = el.tabs.children[1];
+  let prevented = false;
+  cryptoTab.dispatch("mousedown", { preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  clickInPage(doc, cryptoTab);                                  // 点完页签就重画了, 它已不在菜单里
+  assert.equal(picker.isOpen(), true);
+  assert.equal(picker.snapshot().category, "crypto");
+  assert.equal(activeTab(el.tabs), "加密");
+  clickInPage(doc, el.tabs.children[1]);                        // 点当前页签: 什么都不变
+  assert.equal(picker.snapshot().category, "crypto");
+});
+
+test("搜索只在当前分类里找, 页签上显示各分类命中数", async () => {
+  const { el, picker } = setup({ fetchJson: mixedRoutes() });
+  picker.setSymbol("KQ.m@SHFE.fu");
+  picker.load();
+  await flush();
+  picker.open();
+  input(el, "fu");                                             // 燃油 与 FUNUSDT 都命中
+  assert.equal(picker.snapshot().category, "futures");          // 当前分类有命中就不跳
+  assert.deepEqual(shownIds(picker), ["fu"]);
+  assert.deepEqual(tabTexts(el.tabs), ["期货 1", "加密 1"]);
+  input(el, "");
+  assert.deepEqual(tabTexts(el.tabs), ["期货", "加密"]);
+});
+
+test("当前分类没命中而别的分类有: 自动跳过去; 清空搜索、手动点回都不再跳", async () => {
+  const { doc, el, picker, picked } = setup({ fetchJson: mixedRoutes() });
+  picker.setSymbol("KQ.m@SHFE.fu");
+  picker.load();
+  await flush();
+  picker.open();
+  input(el, "btc");
+  assert.equal(picker.snapshot().category, "crypto");
+  assert.deepEqual(shownIds(picker), ["BTC", "BTCUSDT"]);
+  assert.deepEqual(tabTexts(el.tabs), ["期货 0", "加密 2"]);
+  el.search.dispatch("keydown", { key: "Enter" });
+  assert.deepEqual(picked, ["AGG.BTC"]);
+
+  picker.open();                                               // 回车后菜单关了, 再打开(当前合约还是 fu)
+  clickInPage(doc, el.tabs.children[1]);
+  input(el, "");                                               // 清空搜索: 留在加密
+  assert.equal(picker.snapshot().category, "crypto");
+  input(el, "btc");
+  clickInPage(doc, el.tabs.children[0]);                        // 手动点到没命中的期货: 不弹回去
+  assert.equal(picker.snapshot().category, "futures");
+  assert.match(el.products.textContent, /没有匹配的品种/);
+  input(el, "zzz");                                            // 哪个分类都没命中: 不跳
+  assert.equal(picker.snapshot().category, "futures");
+});
+
+test("网络目录晚于缓存到达时, 加密页的分类和光标都保持", async () => {
+  const storage = makeStorage({ "flowscope.catalog.v1": JSON.stringify({ at: 1, groups: MIXED_CATALOG.groups }) });
+  let release;
+  const network = new Promise((resolve) => { release = resolve; });
+  const { el, picker, picked } = setup({
+    storage,
+    fetchJson: (url) => (url === "/api/symbols" ? network : mixedRoutes()(url)),
+  });
+  picker.setSymbol("AGG.BTC");
+  picker.load();
+  await flush();
+  picker.open();
+  el.search.dispatch("keydown", { key: "ArrowDown" });          // 币安 BTCUSDT
+  release(MIXED_CATALOG);
+  await flush();
+  const state = picker.snapshot();
+  assert.equal(state.category, "crypto");
+  assert.equal(state.products[state.productIndex].contSymbol, "BINANCE.BTCUSDT.P");
+  el.search.dispatch("keydown", { key: "Enter" });
+  assert.deepEqual(picked, ["BINANCE.BTCUSDT.P"]);
+});
+
+test("新目录里加密分组没了: 退回期货页并收起页签", async () => {
+  const storage = makeStorage({ "flowscope.catalog.v1": JSON.stringify({ at: 1, groups: MIXED_CATALOG.groups }) });
+  let release;
+  const network = new Promise((resolve) => { release = resolve; });
+  const { el, picker } = setup({
+    storage,
+    fetchJson: (url) => (url === "/api/symbols" ? network : defaultRoutes()(url)),
+  });
+  picker.setSymbol("AGG.BTC");
+  picker.load();
+  await flush();
+  assert.equal(picker.snapshot().category, "crypto");
+  release(CATALOG);                                            // 加密源停了, 只剩期货
+  await flush();
+  assert.equal(picker.snapshot().category, "futures");
+  assert.deepEqual(shownIds(picker), ["fu", "rb", "i"]);
+  assert.equal(el.tabs.hidden, true);
 });

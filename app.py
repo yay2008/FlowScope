@@ -166,7 +166,7 @@ async def symbols(exchange: str | None = None, product: str | None = None, refre
     - 带 exchange + product: 额外返回该品种未下市月份合约(持仓量降序, 标出主力)。
     - 查询在采集线程里发给 TqSdk 合约服务并缓存; 行情源不可用时回退到内置常用品种表
       (`source="fallback"`), 月份列表为空, 页面仍能选到常用主力。
-    - 期货分组之后接加密分组(各交易所永续 + 多所汇总, 按 24 小时成交额降序, 见
+    - 期货分组之后接加密分组(多所汇总 + 各交易所永续, 按 24 小时成交额降序, 见
       CryptoManager.catalog_groups); 加密品种没有月份, 二级只有永续本身, 不去问 TqSdk。
     """
     crypto_product = bool(exchange) and exchange.strip().upper() in crypto_feed.VENUE_NAMES

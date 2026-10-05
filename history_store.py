@@ -562,30 +562,32 @@ class HistoryStore:
         done = bars if final else bars.iloc[:-1]
         estimated = (done.coverage.eq(SOURCE_PARTIAL)
                      & (done.get("hasBaseline", False) | ~done.time.isin(self.estimates)))
-        earliest = None
         for mask, values, quality in [(done.coverage.eq(SOURCE_COMPLETE), self.values,
                                        SOURCE_COMPLETE),
                                       (estimated, self.estimates, SOURCE_PARTIAL)]:
             lines = []
+            pending_values, pending_extra = {}, {}
             for row in done[mask].itertuples(index=False):
                 timestamp = int(row.time)
                 buy, sell = _norm(row.buy), _norm(row.sell)
                 if buy is None or sell is None:
                     continue
-                stored = self.extra.get(timestamp, {})
+                stored = pending_extra.get(timestamp, self.extra.get(timestamp, {}))
                 extras = {c: _norm(getattr(row, c, np.nan)) for c in EXTRA_COLUMNS}
                 # 对照列也要参与比较, 否则 buy/sell 不变而 unknown 变化时不会落盘;
                 # 比较用 _norm 归一, 保证空值不会让同一行被反复追加。
-                if values.get(timestamp) != (buy, sell) or any(stored.get(c) != extras[c]
-                                                               for c in EXTRA_COLUMNS):
+                if pending_values.get(timestamp, values.get(timestamp)) != (buy, sell) or any(
+                        stored.get(c) != extras[c] for c in EXTRA_COLUMNS):
                     lines.append(_row_line(timestamp, buy, sell, extras, quality))
-                    values[timestamp] = (buy, sell)
-                    self.extra[timestamp] = dict(extras)
-                    earliest = timestamp if earliest is None else min(earliest, timestamp)
+                    pending_values[timestamp] = (buy, sell)
+                    pending_extra[timestamp] = extras
             self._append(lines)
-        if earliest is not None:
-            self._dirty = True
-            self.changes.mark(earliest)
+            # 落盘成功才提交去重缓存; 后一批失败也不能漏掉前一批的索引/版本更新。
+            if pending_values:
+                values.update(pending_values)
+                self.extra.update(pending_extra)
+                self._dirty = True
+                self.changes.mark(min(pending_values))
 
     @property
     def revision(self):

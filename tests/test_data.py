@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -224,6 +225,59 @@ class DataTests(unittest.TestCase):
             self.assertEqual(restarted.values, store.values)
             self.assertEqual(restarted.merge(build_bars(klines(), ticks())).coverage.tolist(),
                              ["partial", "complete", "complete"])
+
+    def test_failed_append_can_retry_the_same_rows(self):
+        for coverage in ("complete", "partial"):
+            with self.subTest(coverage=coverage), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "v3.csv"
+                store = HistoryStore(path)
+                bars = pd.DataFrame([{"time": 1000, "buy": 10., "sell": 4., "delta": 6.,
+                                      "unknown": 1., "buyLegacy": 8., "sellLegacy": 6.,
+                                      "coverage": coverage, "hasBaseline": True}])
+                revision = store.revision
+                with patch.object(store, "_append", side_effect=OSError("temporary write failure")):
+                    with self.assertRaises(OSError):
+                        store.save_completed(bars, final=True)
+                self.assertEqual(store.revision, revision)
+                self.assertEqual(store.extra, {})
+                self.assertEqual(store.values, {})
+                self.assertEqual(store.estimates, {})
+                store.save_completed(bars, final=True)
+                self.assertEqual(store.display_between(0, 2000)[0].tolist(), [1000])
+                restored = HistoryStore(path)
+                self.assertEqual(restored.values, store.values)
+                self.assertEqual(restored.estimates, store.estimates)
+                self.assertEqual(restored.extra, store.extra)
+                self.assertEqual(restored.with_cvd(bars).cvd.tolist(), [6.])
+                size = path.stat().st_size
+                store.save_completed(bars, final=True)
+                self.assertEqual(path.stat().st_size, size)
+
+    def test_failed_second_append_keeps_successful_batch_indexed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "v3.csv"
+            store = HistoryStore(path)
+            bars = pd.DataFrame({"time": [1000, 1030], "buy": [10., 6.], "sell": [4., 2.],
+                                 "delta": [6., 4.], "unknown": [0., 0.],
+                                 "buyLegacy": [10., 6.], "sellLegacy": [4., 2.],
+                                 "coverage": ["complete", "partial"], "hasBaseline": [True, True]})
+            append = store._append
+
+            def fail_partial(lines):
+                if any("partial" in line for line in lines):
+                    raise OSError("partial batch failed")
+                append(lines)
+
+            revision = store.revision
+            with patch.object(store, "_append", side_effect=fail_partial):
+                with self.assertRaises(OSError):
+                    store.save_completed(bars, final=True)
+            self.assertGreater(store.revision, revision)
+            self.assertEqual(store.with_cvd(bars).cvdOpen.tolist(), [0., 6.])
+            self.assertEqual(store.estimates, {})
+            store.save_completed(bars, final=True)
+            self.assertEqual(pd.read_csv(path).time.tolist(), [1000, 1030])
+            self.assertEqual(HistoryStore(path).with_cvd(bars).cvd.tolist(), [6., 10.])
 
     def test_legacy_v3_file_without_source_column_reads_as_complete(self):
         """既有文件没有 source 列时按 complete 读; 表头在加载时被补齐到当前格式。"""
