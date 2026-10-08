@@ -26,56 +26,29 @@
       <div id="picker-foot" class="picker-foot">↑↓ 移动 · →/← 换列 · Tab 换分类 · Enter 确认 · Esc 关闭 · 双击品种=主力 · ☆ 加自选</div>
     </div>
   </div>
-  <span id="symbol-name" spellcheck="false">加载中…</span>
   <label>视图
     <select id="view">
       <option value="candle" selected>K线</option>
       <option value="footprint">足迹图</option>
     </select>
   </label>
-  <label>WT信号
-    <select id="wt-signal" title="主图 WaveTrend 的交叉箭头: 振荡线穿越信号线(振荡值的 4 根均线; 两条线图上都不画)的那一根, 金叉打在 K 线下方(绿)、死叉打在上方(红)。强信号(原版默认): 只标超卖区(振荡值低于 -56.5)的金叉与超买区(高于 56.5)的死叉; 全部信号: 另外标 0 轴下方金叉/上方死叉(中号)与顺势交叉(小号); 无信号: 不标箭头。WaveTrend 本身的显示/隐藏在主图左上角的眼睛按钮。">
-      <option value="strong" selected>强信号</option>
-      <option value="all">全部信号</option>
-      <option value="none">无信号</option>
+  <!-- 模式/阈值在每张图 FlowMeter 窗格的左上角(chart-view.js 建), 只影响那个窗格 -->
+  <label>买卖口径
+    <select id="cvd-source" title="决定成交量怎么分成主动买和主动卖，影响 CVD、Delta 和买卖量。TqSdk tick：按快照盘口估算方向；TV K线：按小周期 K 线涨跌归类成交量，后面的秒数是拆分用的小周期，当前周期用不了的置灰。两者行情均来自 TqSdk。">
+      <option value="tick" selected>TqSdk tick</option>
+      <option value="kline-1">TV K线 1s</option>
+      <option value="kline-5">TV K线 5s</option>
+      <option value="kline-10">TV K线 10s</option>
+      <option value="kline-15">TV K线 15s</option>
+      <option value="kline-30">TV K线 30s（粗略）</option>
     </select>
   </label>
-  <label>模式
-    <select id="mode">
-      <option value="rvol">Relative Volume</option>
-      <option value="crvol">CRVOL</option>
-      <option value="volume">Volume</option>
-      <option value="bsv">Buy/Sell Volume</option>
-      <option value="delta">Volume Delta</option>
-      <option value="cvd" selected>CVD</option>
-    </select>
-  </label>
-  <label>阈值
-    <select id="threshtype">
-      <option value="RELATIVE">RELATIVE</option>
-      <option value="SMA">SMA</option>
-      <option value="Z-SCORE" selected>Z-SCORE</option>
-    </select>
-  </label>
-  <label>CVD口径
-    <select id="cvd-source" title="TV K线口径按小周期K线涨跌归类成交量；TqSdk tick口径按快照盘口估算方向。两者行情均来自TqSdk，也影响Delta和买卖量。">
-      <option value="tick" selected>TqSdk tick口径</option>
-      <option value="kline">TV K线口径</option>
-    </select>
-  </label>
-  <label>拆分粒度
-    <select id="ltf" disabled title="仅TV K线口径使用；tick口径不使用小周期。">
-      <option value="1">1s</option>
-      <option value="5">5s</option>
-      <option value="10" selected>10s</option>
-      <option value="15">15s</option>
-      <option value="30">30s(粗略)</option>
-    </select>
-  </label>
+  <span class="ai-group">
+    <button id="ai-run" type="button" title="把图表截图连同这段行情的数值交给 DeepSeek 分析，结果显示在图表上方的浮层里，并存到 data/analysis/。默认只发鼠标所在的那张图。">AI 分析</button>
+    <label title="勾上后两张图一起发给 AI（大周期在前：先定方向再找位置）；两张图周期相同时只发鼠标所在的那张"><input id="ai-both" type="checkbox">双图</label>
+  </span>
+  <!-- 状态点: 两张图的连接状态 + 合约目录/自选的提示, 细节在悬停提示里(app.js 的 showStatus) -->
   <span id="status" class="off">连接中…</span>
-  <span id="picker-hint" title=""></span>
-  <span id="coverage" title="完整表示快照区间量与K线成交量核对一致。CVD累计可用的快照估算和历史回填量；缺失留空，部分覆盖和旧历史仍保留标记。">覆盖:待加载</span>
-  <span id="legend"></span>
 </div>
 <div id="workspace">
   <aside id="watchlist">
@@ -87,7 +60,28 @@
     <ul id="watch-items"></ul>
   </aside>
   <!-- 10s、30s 两张图由 chart-view.js 在这里创建, 左右并排 -->
-  <div id="chart"></div>
+  <div id="chart">
+    <!-- AI 看图分析的浮层(ai-panel.js): 盖在图表上, 标题栏拖动、右下角拉大小 -->
+    <div id="ai-panel" class="ai-panel" hidden>
+      <div id="ai-head" class="ai-head">
+        <span id="ai-title" class="ai-title">AI 分析</span>
+        <span id="ai-status" class="ai-status"></span>
+        <button id="ai-stop" type="button" title="停止这次分析；已经输出的部分照样存盘" hidden>停止</button>
+        <button id="ai-again" type="button" title="按当前画面重新截图分析" hidden>重新分析</button>
+        <button id="ai-close" type="button" class="ai-close" title="关闭（进行中的分析会停止）">×</button>
+      </div>
+      <div id="ai-body" class="ai-body">
+        <div id="ai-shots" class="ai-shots"></div>
+        <details id="ai-thinking" class="ai-thinking" hidden>
+          <summary id="ai-thinking-summary">思考过程</summary>
+          <div id="ai-thinking-text" class="ai-thinking-text"></div>
+        </details>
+        <div id="ai-text" class="ai-text"></div>
+        <div id="ai-error" class="ai-error"></div>
+      </div>
+      <div id="ai-foot" class="ai-foot"></div>
+    </div>
+  </div>
   <aside id="trade">
     <div id="trade-head">
       <button id="trade-toggle" title="折叠/展开模拟交易面板">›</button>
@@ -136,6 +130,7 @@
 <script src="picker-core.js"></script>
 <script src="contract-picker.js"></script>
 <script src="paper-panel.js"></script>
+<script src="ai-panel.js"></script>
 <script src="chart-view.js"></script>
 <script src="app.js"></script>
 </body>

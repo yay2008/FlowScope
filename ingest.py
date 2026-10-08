@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import math
 import os
 import queue
 import re
@@ -375,8 +376,18 @@ class Feed:
             broadcast(message)
 
     def cfg(self) -> dict:
-        """快照里下发前端的配置; 币安合约在此基础上补价格/成交量的显示位数。"""
-        return period_cfg(self.tf)
+        """快照里下发前端的配置: 周期参数 + 合约价格的显示位数(加密合约另按自己的步长覆盖)。
+
+        报价还没到时(price_tick 还是 NaN) price_decs 是默认的 0, 不可信: 这时不下发 priceDigits,
+        前端按「位数未知」处理, 不拿 0 位去取整(国债期货 107.85 会被取成 108)。
+        """
+        cfg = period_cfg(self.tf)
+        tick = getattr(self.quote, "price_tick", None)
+        decs = getattr(self.quote, "price_decs", None)
+        if (isinstance(tick, (int, float)) and math.isfinite(tick) and tick > 0
+                and isinstance(decs, (int, float)) and decs >= 0):
+            cfg["priceDigits"] = int(decs)
+        return cfg
 
     def _publish(self, ltf, bars, previous, revision):
         """合并历史、落盘、算 CVD, 返回 (该粒度的快照, 有变化时的增量消息或 None)。"""

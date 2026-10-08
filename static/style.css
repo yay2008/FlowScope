@@ -32,34 +32,35 @@ body { display: flex; flex-direction: column; }
   padding: 3px 6px;
 }
 
-/* 只读展示位: 外观接近其它控件但不暗示可点, 当前合约代码放 title */
-#toolbar #symbol-name {
-  background: #131722;
-  color: #d1d4dc;
-  border: 1px solid #2a2e39;
-  border-radius: 4px;
-  padding: 3px 8px;
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-#picker-hint { color: #9598a1; }
-
 /* ---------- 合约选择器(自研二级级联菜单) ---------- */
 .picker { position: relative; flex-shrink: 0; }
 
+/* 按钮上就是当前合约的中文名(原始代码在悬停提示里), 右边的 ▾ 表示可以展开 */
 .picker-trigger {
+  position: relative;
   min-width: 158px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   text-align: left;
   background: #131722;
   color: #d1d4dc;
   border: 1px solid #2a2e39;
   border-radius: 4px;
-  padding: 3px 8px;
+  padding: 3px 22px 3px 8px;
   font: inherit;
+  font-weight: 600;
   cursor: pointer;
+}
+.picker-trigger::after {
+  content: "▾";
+  position: absolute;
+  right: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #9598a1;
+  font-weight: normal;
 }
 .picker-trigger:hover { border-color: #3a4152; }
 .picker-trigger[aria-expanded="true"] { border-color: #2962ff; color: #fff; }
@@ -131,7 +132,7 @@ body { display: flex; flex-direction: column; }
 .picker-empty { color: #9598a1; font-size: 12px; padding: 6px 10px; }
 .picker-foot { color: #9598a1; font-size: 12px; padding: 5px 8px; border-top: 1px solid #2a2e39; }
 
-#toolbar button {
+#ai-run {
   background: #2962ff;
   color: #fff;
   border: none;
@@ -142,15 +143,34 @@ body { display: flex; flex-direction: column; }
 
 /* 收藏入口只在合约选择器每行的 ☆ 上, 工具栏不再有收藏按钮 */
 
+/* 状态点: 靠右, 圆点颜色看整体, 文字太长时截断(全文在悬停提示里) */
+#status {
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #9598a1;
+  cursor: default;
+}
+#status::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  vertical-align: 1px;
+  background: #66bb6a;
+}
+#status.warn::before { background: #f0b90d; }
 #status.off { color: #f7525f; }
-#status.on  { color: #66bb6a; }
+#status.off::before { background: #f7525f; }
 
-#legend { color: #9598a1; margin-left: auto; font-family: Consolas, monospace; flex: 1 1 220px; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-#toolbar select:disabled { opacity: 0.45; }
-#toolbar > label, #toolbar > button, .logo, #status, #coverage { flex-shrink: 0; }
-#coverage { color: #9598a1; }
+#toolbar option:disabled { color: #5a6072; }
+#toolbar > label, .ai-group, .logo { flex-shrink: 0; }
+.ai-group { display: inline-flex; align-items: center; gap: 8px; }
 
-/* 指标窗格左上角名称标签 */
+/* 指标窗格左上角名称标签(FlowWave 副图; FlowMeter 用下面的 .pane-head) */
 .pane-label {
   position: absolute;
   top: 4px;
@@ -191,24 +211,66 @@ body { display: flex; flex-direction: column; }
   gap: 3px;
   pointer-events: none;
 }
-.tf-select {
+.tf-select, .pane-select {
   padding: 0 4px;
   border: 1px solid #2a2e39;
   border-radius: 3px;
   background: rgba(30, 34, 45, 0.85);
-  color: #f0b90d;
+  color: #d1d4dc;
   font-size: 12px;
-  font-weight: 600;
   line-height: 18px;
   cursor: pointer;
   pointer-events: auto;
 }
-.tf-select option { background: #1e222d; color: #d1d4dc; }
+.tf-select { color: #f0b90d; font-weight: 600; }
+.tf-select option, .pane-select option { background: #1e222d; color: #d1d4dc; }
+.chart-corner { max-width: calc(100% - 100px); }   /* 不压到右边的价格轴 */
 .chart-corner-row {
   display: flex;
   align-items: center;
   gap: 4px;
+  max-width: 100%;
 }
+.chart-corner-row .readout { flex: 1 1 0; margin-left: 4px; }
+
+/* FlowMeter 窗格左上角: 窗格名 + 模式/阈值下拉框 + 读数; 放不下时读数整段换到下一行。
+   容器不挡十字光标, 只有下拉框接收鼠标 */
+.pane-head {
+  position: absolute;
+  top: 3px;
+  left: 8px;
+  z-index: 10;
+  max-width: calc(100% - 100px);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  font-size: 12px;
+  pointer-events: none;
+}
+.pane-head[hidden] { display: none; }
+.pane-name { font-weight: 600; color: #9598a1; }
+.pane-head .readout { flex: 1 1 auto; }
+
+/* 读数: 名称暗色 + 数值, 数字等宽不跳; 放不下时按项换行。浅色描边让它压在 K 线上也看得清 */
+.readout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 9px;
+  min-width: 0;
+  font-size: 12px;
+  color: #d1d4dc;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-shadow: 0 0 3px #131722, 0 0 3px #131722;
+}
+.readout:empty { display: none; }
+.readout .rk { color: #787b86; margin-right: 3px; }
+/* 涨跌按国内习惯红涨绿跌; 覆盖不完整时标黄 */
+.readout .up { color: #f23645; }
+.readout .down { color: #00e676; }
+.readout .warn { color: #f0b90d; }
 /* 测量按钮: 正在量(等点起点 / 拉区间)时高亮 */
 .measure-btn {
   display: inline-flex;
@@ -464,3 +526,76 @@ button.ml-params:disabled, .ml-toggle:disabled { cursor: default; }
 /* 盈亏与多空: 红盈绿亏, 红多绿空 */
 #trade .up { color: #f23645; }
 #trade .down { color: #00e676; }
+
+/* ---------- AI 看图分析: 工具栏按钮 + 图表区上方的浮层(标题栏拖动, 右下角拉大小) ---------- */
+#ai-run:disabled { opacity: 0.6; cursor: default; }
+#toolbar label:has(#ai-both) { display: inline-flex; align-items: center; gap: 3px; color: #9598a1; cursor: pointer; }
+#toolbar #ai-both { margin: 0; padding: 0; }
+
+.ai-panel {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 40;   /* 盖过图表左上角的周期框与图例(20) */
+  display: flex;
+  flex-direction: column;
+  width: 460px;
+  min-width: 300px;
+  min-height: 160px;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 16px);
+  overflow: hidden;
+  resize: both;
+  background: rgba(30, 34, 45, 0.97);
+  border: 1px solid #363c4e;
+  border-radius: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+.ai-panel[hidden] { display: none; }
+.ai-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px 5px 12px;
+  border-bottom: 1px solid #2a2e39;
+  cursor: move;
+  user-select: none;
+  touch-action: none;
+}
+.ai-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.ai-status { flex-shrink: 0; color: #9598a1; font-size: 12px; white-space: nowrap; }
+.ai-head button {
+  flex-shrink: 0;
+  background: #363c4e;
+  color: #d1d4dc;
+  border: none;
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.ai-head button:hover { background: #434a60; }
+.ai-head .ai-close { background: transparent; color: #9598a1; font-size: 16px; line-height: 1; padding: 2px 6px; }
+.ai-head .ai-close:hover { color: #d1d4dc; background: #2a2e39; }
+.ai-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 8px 12px 10px; }
+.ai-shots { display: flex; flex-wrap: wrap; gap: 6px; }
+.ai-shots img { height: 64px; border: 1px solid #2a2e39; border-radius: 3px; cursor: zoom-in; }
+.ai-shots img.zoom { height: auto; width: 100%; cursor: zoom-out; }
+.ai-shots:not(:empty) { margin-bottom: 8px; }
+.ai-thinking { margin-bottom: 8px; }
+.ai-thinking summary { color: #9598a1; font-size: 12px; cursor: pointer; }
+.ai-thinking-text {
+  max-height: 200px;
+  overflow: auto;
+  margin-top: 4px;
+  padding-left: 8px;
+  border-left: 2px solid #2a2e39;
+  color: #787b86;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ai-text { line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+.ai-error { margin-top: 6px; color: #f7525f; white-space: pre-wrap; }
+.ai-error:empty { display: none; }
+.ai-foot { padding: 5px 12px; border-top: 1px solid #2a2e39; color: #787b86; font-size: 12px; overflow-wrap: anywhere; }
+.ai-foot:empty { display: none; }

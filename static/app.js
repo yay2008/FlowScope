@@ -1,7 +1,8 @@
 /* FlowScope 前端: 页面级逻辑
  * 工具栏、合约选择器、自选面板、模拟交易面板在这里; 图表本身(K线/指标/足迹图与数据推送)是 chart-view.js 里
  * 可实例化的组件, 每张图一个主周期, 左上角的下拉框切换。页面放两张图左右并排(默认 10s、30s):
- * 工具栏状态 settings 两张图共用, 十字光标与可视时间范围联动, 主图指标的显示开关每张图各管各的。
+ * 共用状态 settings(工具栏的视图/买卖口径, FlowMeter 窗格的模式/阈值)两张图共用, 十字光标与可视时间范围联动,
+ * 主图指标的显示开关和读数每张图各管各的。
  */
 "use strict";
 
@@ -9,32 +10,34 @@ const $ = (id) => document.getElementById(id);
 // 指标常量来自 indicators.js
 const { BAND } = FlowIndicators;
 
-// 工具栏状态: 所有图按引用共用, 只在这里改, 改完调各图对应的刷新入口。
-// 下拉框的默认值必须与 index.html 里对应 <select> 的 selected 选项一致。
+// 共用状态: 所有图按引用共用, 只在这里改, 改完调各图对应的刷新入口。
+// 工具栏下拉框的默认值必须与 index.html 里对应 <select> 的 selected 选项一致;
+// 模式/阈值的下拉框由各图按这里的值建。
 const settings = {
   mode: "cvd",
   threshtype: "Z-SCORE",
-  cvdSource: "tick",
-  klineLtf: 10,        // 切回 K线口径时保留上次选择，默认同 Pine 的 10S。
+  cvdSource: "tick",   // tick 口径 / kline = TV K线口径(按 klineLtf 秒的小周期拆分), 工具栏「买卖口径」一个下拉框选
+  klineLtf: 10,        // 默认同 Pine 的 10S
   view: "candle",      // 主图视图: candle=K线, footprint=足迹图
   bandK: BAND.kDefault,   // 叠加带的带宽倍数 k(回归残差标准差的倍数), 不在工具栏: 点主图图例里的「2σ」切换
-  wtSignal: "strong",  // 主图 WaveTrend 的交叉箭头: strong=只标强交叉(原版默认) / all=全部 / none=不标
 };
 let symbol = new URLSearchParams(location.search).get("symbol") || "KQ.m@SHFE.fu";
 // 自选代码(服务端顺序即面板顺序)。常量必须早于合约选择器: picker.load() 会同步渲染
 // 月份行并回调 isFavorite 画 ☆, 声明放后面会踩 let 的暂时性死区。
 let favorites = [];
 
-// 顶栏的合约名是只读展示: 切换合约只走合约选择器, 展示名由 /api/symbol 解析
-// (主连会解析成当前标的月份合约的中文名), 在页面末尾统一发起。
-$("symbol-name").title = symbol;
+// 合约名显示在合约选择器的按钮上: 展示名由 /api/symbol 解析(主连会解析成当前标的月份合约的中文名),
+// 在页面末尾统一发起; 拿到之前按钮先按目录显示。原始代码放在按钮的悬停提示最前面。
+let symbolLabel = "";
+$("picker-trigger").title = `${symbol}\n${$("picker-trigger").title}`;
 
 // 加密合约(币安/OKX/多所汇总)的 tick 口径是交易所逐笔成交自带的主动方向, 不是 TqSdk 快照估算, 下拉框照实写。
 const CRYPTO_SYMBOL = /^(BINANCE|OKX|AGG)\./;
 if (CRYPTO_SYMBOL.test(symbol)) {
   const tickOption = $("cvd-source").querySelector('option[value="tick"]');
-  if (tickOption) tickOption.textContent = "交易所逐笔主动方向";
-  $("cvd-source").title = "交易所逐笔主动方向：成交自带的主动买卖方，不用估算；TV K线口径：按小周期K线涨跌归类成交量。也影响Delta和买卖量。";
+  if (tickOption) tickOption.textContent = "交易所逐笔";
+  $("cvd-source").title = "决定成交量怎么分成主动买和主动卖，影响 CVD、Delta 和买卖量。交易所逐笔：成交自带的主动买卖方，不用估算；" +
+    "TV K线：按小周期 K 线涨跌归类成交量，后面的秒数是拆分用的小周期，当前周期用不了的置灰。";
 }
 
 // ---------- 图表 ----------
@@ -62,16 +65,16 @@ function saveChartTfs() {
 
 const chartTfs = loadChartTfs();
 
-// 各图主图指标的显示开关记在 localStorage, 按左右图各记一份 [{ema, band, wt, bandMid}, {...}]: 切合约是整页重载,
+// 各图主图指标的显示开关记在 localStorage, 按左右图各记一份 [{ema, band, bandMid}, {...}]: 切合约是整页重载,
 // 不记的话每切一次都被打回默认(bandMid 是 FlowWave带 的中线, 后来才加, 旧值里没有就按默认不画)。
 // 开关跟着图走, 不跟周期走(两张图可以选同一个周期, 切周期也不换开关)。
 // 旧版按周期记 flowscope.mainShown = {"10": {...}, "30": {...}}(更早只记一份 {ema, band, wt}),
-// 新键还没有时按旧值初始化; 读不到(隐私模式、旧值不合法)就用默认值。
+// 新键还没有时按旧值初始化; 读不到(隐私模式、旧值不合法)就用默认值。旧值里 WaveTrend 的 wt 已经没用, 读的时候忽略。
 const CHART_SHOWN_KEY = "flowscope.chartShown";
 const MAIN_SHOWN_KEY = "flowscope.mainShown";
 
 function loadShown(index, tf) {
-  const shown = { ema: true, band: false, wt: true, bandMid: false };
+  const shown = { ema: true, band: false, bandMid: false };
   try {
     const perChart = JSON.parse(localStorage.getItem(CHART_SHOWN_KEY) || "null");
     let mine = Array.isArray(perChart) ? perChart[index] : null;
@@ -92,10 +95,11 @@ function saveShown() {
   } catch (error) { /* 记不住不影响使用 */ }
 }
 
-// 鼠标所在(最近进入)的那张图: 顶栏读数显示它, 十字光标与缩放/拖动以它为准同步另一张。默认右边那张。
+// 鼠标所在(最近进入)的那张图: 十字光标与缩放/拖动以它为准同步另一张, AI 分析默认发它。默认右边那张。
 // 只由鼠标进入图表区域来切换, 十字光标事件不算(见 syncCrosshair)。
 let activeChart = null;
 const chartStatus = new Map();   // 第几张图 -> {ok, text}
+const notices = new Map();       // 提示来源("catalog" 合约目录 / "favorite" 自选) -> {text, detail, level}, 见 showStatus
 
 function makeChart(tf, index) {
   const chartView = ChartView.create({
@@ -105,7 +109,7 @@ function makeChart(tf, index) {
     settings,
     shown: loadShown(index, tf),
     onStatus: (ok, text) => setChartStatus(index, ok, text),
-    onLegend: (text, coverage) => showLegend(chartView, text, coverage),
+    onSuiteSetting: setSuiteSetting,
     onConfig: refreshLtfOptions,
     onShownChange: saveShown,
     onBandK: setBandK,
@@ -115,8 +119,7 @@ function makeChart(tf, index) {
       chartTfs[index] = chartView.tf;
       saveChartTfs();
       refreshLtfOptions();
-      showChartStatus();
-      if (chartView === activeChart) chartView.refreshLegend();
+      showStatus();
     },
   });
   chartView.el.addEventListener("pointerenter", () => activate(chartView));
@@ -127,32 +130,37 @@ const charts = chartTfs.map(makeChart);
 activeChart = charts[charts.length - 1];
 
 function activate(chartView) {
-  if (chartView === activeChart) return;
   activeChart = chartView;
-  chartView.refreshLegend();
 }
 
-// 顶栏连接状态: 两张图都连上才显示「已连接」, 否则列出没连上的(带周期前缀)
+// ---------- 顶栏状态点 ----------
+// 两张图的连接状态和合约目录/自选的提示合成一个: 圆点绿 = 都正常, 黄 = 能用但有提示(如离线目录),
+// 红 = 有图没连上或出错了。文字只写最要紧的: 没连上的图(带周期前缀) > 出错的提示 > 「已连接」,
+// 细节(每张图的状态、提示原文)都在悬停提示里。
 function setChartStatus(index, ok, text) {
   chartStatus.set(index, { ok, text });
-  showChartStatus();
+  showStatus();
 }
 
-function showChartStatus() {
+// 各来源的提示各记各的, 互不覆盖。level: "info" 只把圆点变黄, "error" 文字也换成提示; text 为空即清除
+function setNotice(source, text, detail, level) {
+  notices.set(source, { text: text || "", detail: detail || "", level: text ? level || "info" : "" });
+  showStatus();
+}
+
+function showStatus() {
+  const line = (index) => `${ChartView.tfLabel(chartTfs[index])}: ${chartStatus.get(index)?.text ?? "连接中…"}`;
   const pending = chartTfs.map((tf, index) => index).filter((index) => !chartStatus.get(index)?.ok);
+  const shown = [...notices.values()];
+  const error = shown.find((item) => item.level === "error");
   const el = $("status");
-  el.className = pending.length ? "off" : "on";
-  el.textContent = pending.length
-    ? pending.map((index) => `${ChartView.tfLabel(chartTfs[index])}: ${chartStatus.get(index)?.text ?? "连接中…"}`)
-      .join("  ")
-    : "已连接";
-}
-
-// 顶栏读数只显示鼠标所在那张图(带周期前缀), 另一张的读数直接忽略
-function showLegend(chartView, text, coverage) {
-  if (chartView !== activeChart) return;
-  $("legend").textContent = `${ChartView.tfLabel(chartView.tf)} · ${text}`;
-  $("coverage").textContent = coverage;
+  el.className = pending.length || error ? "off" : shown.some((item) => item.level) ? "warn" : "on";
+  el.textContent = pending.length ? pending.map(line).join("  ") : error ? error.text : "已连接";
+  const details = chartTfs.map((tf, index) => line(index));
+  for (const item of shown) {
+    if (item.text || item.detail) details.push([item.text, item.detail].filter(Boolean).join("："));
+  }
+  el.title = details.join("\n");
 }
 
 // 十字光标联动: 鼠标所在那张图的光标一动, 另一张就把光标摆到同一时刻(落到它自己周期的那根 bar 上),
@@ -199,76 +207,65 @@ function setBandK(k) {
   charts.forEach((c) => c.rebuildBand());
 }
 
-// ---------- 工具栏 ----------
+// ---------- 模式/阈值(各图 FlowMeter 窗格左上角, 两张图共用) ----------
 
-// 模式/阈值只影响 Volume Suite 和图例读数
-function renderSuites() {
-  charts.forEach((c) => c.renderSuite());
-  activeChart.refreshLegend();
+// 只影响 FlowMeter 窗格和读数; 哪张图上选的都一样, 各图的下拉框在 renderSuite 里跟着改
+function setSuiteSetting(key, value) {
+  settings[key] = value;
+  charts.forEach((c) => {
+    c.renderSuite();
+    c.refreshReadout();
+  });
 }
-$("mode").addEventListener("change", (e) => { settings.mode = e.target.value; renderSuites(); });
-$("threshtype").addEventListener("change", (e) => { settings.threshtype = e.target.value; renderSuites(); });
 
-$("wt-signal").addEventListener("change", (e) => {
-  settings.wtSignal = ["strong", "all", "none"].includes(e.target.value) ? e.target.value : "strong";
-  charts.forEach((c) => c.renderWtMarks());
-});
+// ---------- 工具栏 ----------
 
 $("view").addEventListener("change", (e) => {
   settings.view = e.target.value;
   charts.forEach((c) => c.setView());
 });
 
-// ---------- CVD 口径与拆分粒度 ----------
+// ---------- 买卖口径(CVD 口径与拆分粒度合在一个下拉框) ----------
+// 选项值 "tick" = tick 口径, "kline-N" = TV K线口径、按 N 秒的小周期拆分; 写进 settings 时仍分成 cvdSource 与 klineLtf。
 // 拆分粒度随主周期收敛: 必须整除主周期且不比它粗(15/30 在 10s 下不合法)。工具栏上的选择所有图共用,
 // 每张图请求时各自把用不了的选择回落到本周期下最粗的合法粒度(chart-view.js 的 currentLtf),
 // 所以这里只禁用哪张图都用不了的选项。
+const splitLtf = (value) => (String(value).startsWith("kline-") ? Number(String(value).slice(6)) : null);
+
 function refreshLtfOptions() {
   const usable = new Set(charts.flatMap((c) => c.ltfOptions()));
-  for (const option of $("ltf").options) {
-    option.disabled = !usable.has(Number(option.value));
+  for (const option of $("cvd-source").options) {
+    const ltf = splitLtf(option.value);
+    option.disabled = ltf != null && !usable.has(ltf);
   }
 }
 
-function updateSplitSelection() {
-  $("ltf").disabled = settings.cvdSource === "tick";
-  $("ltf").value = String(settings.klineLtf);
-  charts.forEach((c) => c.load());
-}
 $("cvd-source").addEventListener("change", (e) => {
-  settings.cvdSource = e.target.value;
-  updateSplitSelection();
-});
-$("ltf").addEventListener("change", (e) => {
-  settings.klineLtf = parseInt(e.target.value, 10);
-  updateSplitSelection();
+  const ltf = splitLtf(e.target.value);
+  settings.cvdSource = ltf == null ? "tick" : "kline";
+  if (ltf != null) settings.klineLtf = ltf;
+  charts.forEach((c) => c.load());
 });
 
 // ---------- 合约选择器: 自研二级级联菜单 ----------
 // 组件在 contract-picker.js(分类页签 + 一级品种 + 二级月份, 含搜索/键盘/悬停预取), 纯逻辑在 picker-core.js。
 // 选择结果统一写回 URL 的 symbol 参数, 由页面重载完成切换与重连。
 
-function setPickerHint(text, detail) {
-  const hint = $("picker-hint");
-  hint.textContent = text || "";
-  hint.title = detail || "";
-}
-
-// 合约展示名: 只读, 取不到就回退成合约代码, 不阻塞图表加载。
+// 合约展示名: 写到选择器按钮上, 取不到就留着按钮按目录显示的名字, 不阻塞图表加载。
 async function labelOf(target) {
   try {
     const data = await fetchJson(`/api/symbol?symbol=${encodeURIComponent(target)}`);
-    if (symbol === target && data && data.label) $("symbol-name").textContent = data.label;
-  } catch (error) {
-    $("symbol-name").textContent = target;
-  }
+    if (symbol === target && data && data.label) {
+      symbolLabel = data.label;
+      picker.setLabel(data.label);
+    }
+  } catch (error) { /* 按钮上已经有目录给的名字或原始代码 */ }
 }
 
 function switchSymbol(target) {
   if (!target || target === symbol) return;
-  // 重载前先给出反馈: 新页面的展示位会自己再解析一次。
-  $("symbol-name").textContent = "加载中…";
-  $("symbol-name").title = target;
+  // 重载前先给出反馈: 新页面的按钮会自己再解析一次。
+  picker.setLabel("切换中…");
   location.search = "?symbol=" + encodeURIComponent(target);
 }
 
@@ -285,7 +282,7 @@ const picker = ContractPicker.create({
   fetchJson,                       // 与自选面板共用同一个把 4xx 详情带出来的取数函数
   storage: window.localStorage,
   onPick: switchSymbol,
-  onStatus: setPickerHint,
+  onStatus: (text, detail, level) => setNotice("catalog", text, detail, level),
   // 行内 ☆: 菜单里直接加/移出自选, 状态由这里持有的 favorites 决定
   isFavorite: (target) => favorites.includes(target),
   onToggleFavorite: (target) => changeFavorite(target, !favorites.includes(target)),
@@ -448,13 +445,13 @@ async function changeFavorite(code, wanted) {
     favorites = data.symbols || [];
     if (!wanted) watchRows.delete(code);
     setWatchHint("");
-    setPickerHint("");                 // 上一次"自选已满"之类的提示到这里就该消失
+    setNotice("favorite", "");         // 上一次"自选已满"之类的提示到这里就该消失
     renderWatch();
     picker.refreshFavorites();         // 菜单里的 ☆ 跟着变
     scheduleWatch(0);
   } catch (error) {
     setWatchHint((wanted ? "收藏失败：" : "移出失败：") + error.message);
-    setPickerHint((wanted ? "收藏失败：" : "移出失败：") + error.message);
+    setNotice("favorite", (wanted ? "收藏失败：" : "移出失败：") + error.message, "", "error");
   } finally {
     favoritesInFlight -= 1;
     if (favoritesInFlight === 0 && favoritesStale) {
@@ -500,6 +497,26 @@ const paperPanel = PaperPanel.create({
 });
 paperPanel.start();
 
+// ---------- AI 看图分析(图表区上方的浮层; 调 DeepSeek 与存盘在服务端 analysis.py) ----------
+// 默认只发鼠标所在的那张图; 工具栏勾上「双图」两张一起发, 大周期在前。两张图周期相同时只发鼠标所在那张。
+
+const aiPanel = AiPanel.create({
+  byId: $,
+  collect(both) {
+    const picked = both && new Set(charts.map((c) => c.tf)).size > 1
+      ? [...charts].sort((a, b) => b.tf - a.tf) : [activeChart];
+    return {
+      symbol,
+      label: symbolLabel || symbol,
+      // 买卖量口径不放这里: 各图实际的拆分粒度可能不同, 由每张图的 analysisInput() 带上
+      settings: { mode: settings.mode, threshtype: settings.threshtype, bandK: settings.bandK },
+      // 图上的持仓均价线、挂单线是什么, 文字里也说一声
+      paper: PaperPanel.priceLines(paperPanel.state()).map(({ title, price }) => ({ title, price })),
+      sources: picked.map((c) => ({ tf: c.tf, input: c.analysisInput(), screenshot: () => c.screenshot() })),
+    };
+  },
+});
+
 charts.forEach((c) => c.load());
 loadFavorites();  // 自选独立: 面板先列出代码, 报价随轮询补齐(合约目录在 picker.load() 里自己拉)
-labelOf(symbol);  // 顶栏合约名: 与图表加载并行, 拿不到就显示代码
+labelOf(symbol);  // 合约名: 与图表加载并行, 拿不到就留着按钮按目录显示的名字

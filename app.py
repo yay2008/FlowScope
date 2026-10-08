@@ -12,10 +12,12 @@ import os
 import time
 
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import crypto_feed
 import ingest
+from analysis import AnalysisService, Busy, NotConfigured
 from backup import BackupScheduler
 from binance_feed import BinanceAdapter
 from catalog import CatalogService
@@ -54,6 +56,8 @@ paper = PaperService(lambda: manager,
 # 加密永续另一个账户(USDT、小数数量、杠杆、资金费), 报价来自加密行情的推送缓存。
 crypto_paper = CryptoPaperService(lambda: crypto,
                                   PaperStore(lambda: os.path.join(ingest.DATA_DIR, "paper", "crypto.json")))
+# AI 看图分析(DeepSeek): 每次分析的结论与截图存在数据目录里, 随定期快照一起备份。
+analysis = AnalysisService(lambda: os.path.join(ingest.DATA_DIR, "analysis"))
 
 
 def manager_for(symbol: str):
@@ -375,6 +379,27 @@ def paper_leverage(symbol: str, leverage: int):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/analyze")
+async def analyze(body: dict = Body(...)):
+    """AI 看图分析: ``{symbol, label, settings, paper, charts: [{tf, image, columns, rows, meta}]}``。
+
+    image 是页面截图的 data URL, rows 是同一段 bar 的数值表(列见 analysis.COLUMN_NOTES)。
+    返回 SSE 流: ``meta`` → ``reasoning`` / ``delta`` …… → ``done`` 或 ``error``(见 analysis.py)。
+    请求不合法 400, 没配 DEEPSEEK_API_KEY 503, 上一次分析还没结束 429; 开始推流之后的失败走 ``error`` 事件。
+    """
+    try:
+        body = {**body, "symbol": validate_symbol(str(body.get("symbol") or ""))}
+        job = analysis.start(body, asyncio.get_running_loop())
+    except NotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Busy as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return StreamingResponse(analysis.events(job), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
+
+
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, footprint: bool = False,
              tf: int = DEFAULT_TF_SEC):
@@ -438,6 +463,19 @@ async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, f
         source.remove_client(q)
 
 
+class RevalidatedStaticFiles(StaticFiles):
+    """前端文件每次都向服务端确认一下(没改过回 304, 本机上几乎不花时间)。
+
+    不带 Cache-Control 时浏览器按 Last-Modified 启发式缓存: 很久没改的脚本一缓存就是几天,
+    更新之后会出现新 app.js 配旧 contract-picker.js 这种新旧混用, 页面调到旧脚本里没有的函数。
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 # Windows 注册表可能把 SVG 识别为 image/svg，浏览器需要标准 MIME 类型。
 mimetypes.add_type("image/svg+xml", ".svg")
-app.mount("/", StaticFiles(directory=os.path.join(BASE_DIR, "static"), html=True))
+app.mount("/", RevalidatedStaticFiles(directory=os.path.join(BASE_DIR, "static"), html=True))

@@ -43,6 +43,7 @@
     let activeKey = "";              // 二级正在展示的品种键 "SHFE.fu"
     let monthState = new Map();      // key -> {status, months, error}
     let symbol = "";                 // 当前合约(URL 里那个)
+    let label = "";                  // 页面给的展示名(服务端解析的合约中文名), 有就优先显示在触发器上
     let generation = 0;              // 请求代际: 丢弃过期响应
     let hoverTimer = null;
     let isOpen = false;
@@ -66,8 +67,9 @@
       return item;
     }
 
-    function setStatus(text, detail) {
-      onStatus(text || "", detail || "");
+    // level: "info" = 能用但要留意(离线目录), "error" = 出错了
+    function setStatus(text, detail, level) {
+      onStatus(text || "", detail || "", text ? level || "info" : "");
     }
 
     // ---------- 目录 ----------
@@ -83,7 +85,7 @@
         .catch((error) => {
           if (cached) return;                      // 有缓存先用着, 后台下次打开再刷新
           setStatus(`合约目录加载失败（${attempt + 1}/${CATALOG_RETRY_MAX}），可直接手填合约`,
-                    error.message);
+                    error.message, "error");
           // 连接刚断时目录会失败, 稍后自动重试; 不重试的话这一页就只能手填合约了。
           if (attempt + 1 < CATALOG_RETRY_MAX) {
             setTimeout(() => load(attempt + 1), CATALOG_RETRY_MS);
@@ -132,7 +134,7 @@
         }
       }
       if (data && data.source === "fallback") {
-        setStatus("目录: 离线常用品种", data.error || "");
+        setStatus("目录: 离线常用品种", data.error || "", "info");
       } else if (data && data.error) {
         setStatus("", data.error);
       } else {
@@ -496,8 +498,15 @@
       if (el.trigger) el.trigger.textContent = triggerLabel();
     }
 
-    // 触发器显示「品种 · 主力月份」; 具体月份显示其中文名; 目录还没到时先显示原始代码。
+    function setLabel(value) {
+      label = value || "";
+      if (el.trigger) el.trigger.textContent = triggerLabel();
+    }
+
+    // 触发器优先显示页面给的展示名; 没有时显示「品种 · 主力月份」, 具体月份显示其中文名,
+    // 目录还没到时先显示原始代码。
     function triggerLabel() {
+      if (label) return label;
       const parts = flow.parseSymbolParts(symbol);
       if (!parts) return symbol || "选择合约";
       const product = products.find((item) => item.exchangeId === parts.exchange
@@ -551,7 +560,7 @@
     });
 
     return {
-      load, setSymbol, open, close, refreshFavorites,
+      load, setSymbol, setLabel, open, close, refreshFavorites,
       isOpen: () => isOpen,
       // 给宿主页面与回归测试观察内部状态
       snapshot: () => ({ products: filtered, months: currentOptions(), level, productIndex,

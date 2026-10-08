@@ -151,6 +151,17 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(self.feed.snapshots[10]["bars"][0]["delta"], 20)
         self.assertEqual(self.feed.snapshots[0]["bars"][0]["delta"], 10)
 
+    def test_snapshot_cfg_carries_contract_price_digits_once_quote_is_ready(self):
+        # 国债期货步长 0.005: 位数要下发, 否则前端按 0 位取整, 107.85 变成 108
+        self.feed.quote = SimpleNamespace(price_tick=0.005, price_decs=3)
+        self.feed.recompute(lambda _: None)
+        self.assertEqual(self.feed.snapshots[0]["cfg"]["priceDigits"], 3)
+        # 报价还没到: price_tick 是 NaN, price_decs 是默认的 0, 不能当真
+        self.feed.quote = SimpleNamespace(price_tick=float("nan"), price_decs=0)
+        self.assertNotIn("priceDigits", self.feed.cfg())
+        self.feed.quote = None
+        self.assertNotIn("priceDigits", self.feed.cfg())
+
     def test_lower_candles_subscribe_on_demand_and_reuse_main_period(self):
         from unittest.mock import Mock
         api = Mock()
@@ -248,6 +259,20 @@ class FeedTests(unittest.TestCase):
         with patch.object(server, "manager", manager):
             asyncio.run(exercise())
 
+
+
+class StaticFilesTests(unittest.TestCase):
+    def test_frontend_files_revalidate_every_load(self):
+        # 不带 Cache-Control 时浏览器按 Last-Modified 启发式缓存, 更新后新旧脚本混用
+        files = server.app.routes[-1].app
+        plain = {"type": "http", "method": "GET", "path": "/app.js", "headers": []}
+        first = asyncio.run(files.get_response("app.js", plain))
+        self.assertEqual((first.status_code, first.headers["cache-control"]), (200, "no-cache"))
+        again = dict(plain, headers=[(b"if-none-match", first.headers["etag"].encode())])
+        second = asyncio.run(files.get_response("app.js", again))
+        self.assertEqual((second.status_code, second.headers["cache-control"]), (304, "no-cache"))
+        index = asyncio.run(files.get_response(".", dict(plain, path="/")))
+        self.assertEqual(index.headers["cache-control"], "no-cache")
 
 
 if __name__ == "__main__":

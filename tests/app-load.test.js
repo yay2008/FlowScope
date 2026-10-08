@@ -18,7 +18,7 @@ const vm = require("node:vm");
 const ROOT = path.join(__dirname, "..");
 const STATIC = path.join(ROOT, "static");
 const SCRIPTS = ["data-sync.js", "indicators.js", "picker-core.js", "contract-picker.js", "paper-panel.js",
-                 "chart-view.js", "app.js"];
+                 "ai-panel.js", "chart-view.js", "app.js"];
 
 // ---------- 最小 DOM ----------
 
@@ -51,6 +51,7 @@ class StubElement {
   }
   append(...nodes) { this.children.push(...nodes); }
   appendChild(node) { this.children.push(node); return node; }
+  replaceChildren(...nodes) { this.children = nodes; }
   insertBefore(node) { this.children.push(node); return node; }
   remove() {}
   setAttribute(key, value) { this.attributes[key] = value; }
@@ -99,26 +100,36 @@ function createDocument() {
 
 // 每张图一份记录, 按创建顺序(与页面的 charts 一致: 10s、30s), 每次 runBrowser() 清空:
 //   applied            每次 series.applyOptions: 可见性开关是"状态变量 → series"的唯一通路, 只能从这里观察
-//   markers            K 线 markers 插件每次 setMarkers 的内容
+//   series             每条 series 一项 {type, options, pane, data, applied, scale}: 建它时的参数、最近一次 setData、
+//                      它自己的 applyOptions 记录、它所在价格轴的 applyOptions 记录
+//   markers           K 线 markers 插件每次 setMarkers 的内容
 //   timeScale          可视逻辑范围有状态, set 时同步通知订阅者; sets 记 set 的次数
 //   crosshairHandlers  十字光标订阅, 测试直接调它模拟用户移动光标
-//   primitives         挂在 series 上的图元(背离连线、测量工具)
+//   primitives         挂在 series 上的图元(测量工具)
+//   stretch            窗格的高度比例 [窗格下标, 比例], 按设置先后
 //   crosshair          程序设置的十字光标 {price, time}, 清掉记 null
 let stubCharts = [];
 // 模拟交易叠加画到图上的价格线(两张图合在一起)
 let createdPriceLines = [];
 
 function createChartStub() {
-  const record = { applied: [], markers: [], crosshair: [], crosshairHandlers: [], primitives: [] };
+  const record = { applied: [], series: [], markers: [], crosshair: [], crosshairHandlers: [], primitives: [],
+                   stretch: [] };
   stubCharts.push(record);
-  const series = () => ({
-    _record: record,
-    setData() {}, update() {}, applyOptions(options) { record.applied.push(options); }, setMarkers() {},
-    createPriceLine(options) { createdPriceLines.push(options); return { applyOptions() {} }; }, removePriceLine() {},
-    priceScale() { return { applyOptions() {} }; },
-    setVisibleRange() {}, coordinateToPrice(y) { return 4000 + y; }, priceToCoordinate() { return 0; },
-    attachPrimitive(primitive) { record.primitives.push(primitive); }, detachPrimitive() {},
-  });
+  // addSeries(类型, 选项, 窗格) / addCustomSeries(自定义视图, 选项, 窗格)
+  const series = (type, seriesOptions = {}, pane = 0) => {
+    const entry = { type, options: seriesOptions, pane, data: null, applied: [], scale: [] };
+    record.series.push(entry);
+    return {
+      _record: record,
+      setData(data) { entry.data = data; }, update() {}, setMarkers() {},
+      applyOptions(options) { record.applied.push(options); entry.applied.push(options); },
+      createPriceLine(options) { createdPriceLines.push(options); return { applyOptions() {} }; }, removePriceLine() {},
+      priceScale() { return { applyOptions(options) { entry.scale.push(options); } }; },
+      setVisibleRange() {}, coordinateToPrice(y) { return 4000 + y; }, priceToCoordinate() { return 0; },
+      attachPrimitive(primitive) { record.primitives.push(primitive); }, detachPrimitive() {},
+    };
+  };
   let range = null;
   const rangeHandlers = [];
   record.timeScale = {
@@ -138,8 +149,8 @@ function createChartStub() {
     addSeries: series, addCustomSeries: series, removeSeries() {},
     applyOptions() {}, resize() {}, timeScale: () => record.timeScale,
     priceScale: () => ({ applyOptions() {} }),
-    panes: () => Array.from({ length: 4 }, () => ({
-      setHeight() {}, setStretchFactor() {}, paneIndex: () => 0,
+    panes: () => Array.from({ length: 4 }, (_, index) => ({
+      setHeight() {}, setStretchFactor(factor) { record.stretch.push([index, factor]); }, paneIndex: () => index,
     })),
     subscribeClick() {}, unsubscribeClick() {},
     subscribeCrosshairMove(fn) { record.crosshairHandlers.push(fn); },
@@ -218,7 +229,7 @@ function runBrowser(options = {}) {
   const context = {
     document,
     localStorage: options.localStorage || createLocalStorage(),
-    location: { search: "", host: "127.0.0.1:8000", protocol: "http:", href: "http://127.0.0.1:8000/" },
+    location: { search: options.search || "", host: "127.0.0.1:8000", protocol: "http:", href: "http://127.0.0.1:8000/" },
     navigator: { userAgent: "node" },
     console,
     // vm 上下文是干净的内建环境: 浏览器里天然存在的构造器要显式注入。
@@ -293,17 +304,18 @@ test("favorites 在顶层声明完毕后才可能为真值", () => {
   assert.ok(firstUse > declaration, "favorites 的声明必须早于第一次使用");
 });
 
-test("顶栏合约名由 /api/symbol 解析后写入展示位", async () => {
+test("合约名由 /api/symbol 解析后显示在合约选择器的按钮上, 原始代码在悬停提示里", async () => {
   const context = runBrowser();
   await new Promise((resolve) => setImmediate(resolve));
-  const name = context.document.getElementById("symbol-name");
-  assert.equal(name.textContent, "燃油2611");
-  assert.equal(name.title, "KQ.m@SHFE.fu", "悬停应能看到原始合约代码");
+  const trigger = context.document.getElementById("picker-trigger");
+  assert.equal(trigger.textContent, "燃油2611");
+  assert.match(trigger.title, /^KQ\.m@SHFE\.fu\n/, "悬停应能看到原始合约代码");
+  assert.equal(vm.runInContext("symbolLabel", context), "燃油2611", "AI 分析的标题用同一个名字");
 });
 
-test("顶栏只保留只读展示 : 手填输入框、切换按钮、收藏按钮都已移除", () => {
+test("顶栏只保留合约选择器: 只读展示位、手填输入框、切换按钮、收藏按钮都已移除", () => {
   const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
-  assert.match(html, /<span id="symbol-name"/, "顶栏应保留合约名展示位");
+  assert.ok(!html.includes('id="symbol-name"'), "合约名并进选择器按钮, 不再单独展示一遍");
   assert.ok(!html.includes('id="symbol"'), "手填输入框应已移除");
   assert.ok(!html.includes('id="apply"'), "切换按钮应已移除");
   assert.ok(!html.includes('id="star"'), "工具栏收藏按钮应已移除");
@@ -333,11 +345,7 @@ test("工具栏默认值与 app.js 初始状态一致", () => {
   // 只改一处就会出现"页面显示 A、实际按 B 渲染", 这里把两处钉在一起。
   const table = [
     ["view", /\bview: "([^"]+)"/],
-    ["mode", /\bmode: "([^"]+)"/],
-    ["threshtype", /\bthreshtype: "([^"]+)"/],
     ["cvd-source", /\bcvdSource: "([^"]+)"/],
-    ["ltf", /\bklineLtf: (\d+)/],
-    ["wt-signal", /\bwtSignal: "([^"]+)"/],
   ];
   for (const [id, pattern] of table) {
     const htmlDefault = html.match(
@@ -365,6 +373,22 @@ function findAll(node, predicate, out = []) {
   return out;
 }
 
+// 节点连同子孙的文字, 子节点之间空一格(StubElement 不会自己拼子节点的 textContent)
+function textOf(node) {
+  return [node.textContent, ...(node.children || []).map(textOf)].filter(Boolean).join(" ");
+}
+
+// 第 index 张图的读数: which = "price" 主图左上角的 OHLC, "meter" FlowMeter 窗格的量能读数
+function readoutOf(context, index, which) {
+  const all = findAll(vm.runInContext(`charts[${index}].el`, context), (node) => node.className === "readout");
+  return all[which === "price" ? 0 : 1];
+}
+
+// 第 index 张图 FlowMeter 窗格左上角的 [模式, 阈值] 下拉框
+function paneSelectsOf(context, index) {
+  return findAll(vm.runInContext(`charts[${index}].el`, context), (node) => node.className === "pane-select");
+}
+
 test("工具栏的周期下拉框已移除: 默认 10s、30s 两张图左右并排, 各自左上角有周期下拉框, 下面是本图的主图指标图例", () => {
   const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
   assert.ok(!html.includes('id="tf"'), "工具栏的周期下拉框应已移除");
@@ -382,18 +406,35 @@ test("工具栏的周期下拉框已移除: 默认 10s、30s 两张图左右并�
   for (const corner of corners) {
     assert.equal(corner.children[0].className, "chart-corner-row");
     assert.deepEqual(corner.children[0].children.map((node) => node.className),
-                     ["tf-select", "measure-btn", "measure-hint"], "周期下拉框右边是测量按钮");
+                     ["tf-select", "measure-btn", "measure-hint", "readout"], "周期下拉框右边是测量按钮, 再往右是价格读数");
     assert.equal(corner.children[1].className, "main-legend", "主图图例应挂在周期标签下面");
   }
 });
 
-test("阈值默认是 Z-SCORE", () => {
+test("模式/阈值在每张图的 FlowMeter 窗格左上角, 默认 CVD、Z-SCORE; 哪张图上选都是两张一起换", () => {
   const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
-  assert.match(html,
-    /id="threshtype"[\s\S]*?<option value="Z-SCORE"[^>]*\bselected\b/,
-    "阈值下拉框默认应选中 Z-SCORE");
+  assert.ok(!html.includes('id="mode"') && !html.includes('id="threshtype"'), "模式/阈值已从工具栏移走");
   const app = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
   assert.match(app, /\bthreshtype: "Z-SCORE"/, "app.js 的阈值初始状态应为 Z-SCORE");
+  assert.match(app, /\bmode: "cvd"/, "app.js 的模式初始状态应为 CVD");
+
+  const context = runBrowser();
+  feedBothCharts(context);
+  const values = () => [0, 1].map((index) => paneSelectsOf(context, index).map((select) => select.value));
+  assert.deepEqual(values(), [["cvd", "Z-SCORE"], ["cvd", "Z-SCORE"]], "两张图的下拉框都按初始状态选好");
+  assert.deepEqual(paneSelectsOf(context, 0)[0].children.map((option) => option.value),
+                   ["rvol", "crvol", "volume", "bsv", "delta", "cvd"]);
+
+  paneSelectsOf(context, 0)[0].handlers.change[0]({ target: { value: "delta" } });
+  paneSelectsOf(context, 1)[1].handlers.change[0]({ target: { value: "SMA" } });
+  assert.deepEqual(values(), [["delta", "SMA"], ["delta", "SMA"]], "另一张图的下拉框跟着换");
+  assert.equal(vm.runInContext("settings.mode + ' ' + settings.threshtype", context), "delta SMA");
+  for (const index of [0, 1]) {
+    const meter = textOf(readoutOf(context, index, "meter"));
+    assert.match(meter, /^Δ /, "读数以模式主值打头");
+    assert.equal(meter.match(/Δ/g).length, 1, "Delta 模式下 Δ 不重复列");
+    assert.match(meter, / CVD /, "CVD 不是主值时照样列");
+  }
 });
 
 // ---------- FlowWave 主图叠加带 ----------
@@ -601,11 +642,14 @@ test("两张图的眼睛按钮各管各的: 点 10s 图的 FlowWave带 不动 30
   assert.equal(legendRow(context, 1, "band").classList.contains("off"), true, "30s 图的图例行保持关闭");
 });
 
-test("WaveTrend 眼睛按钮: 参考线、交叉箭头与背离连线默认显示, 点一下清空, 足迹图下强制清空且图例收起", () => {
+test("WaveTrend 已删除: 图例只有 EMA 与 FlowWave带, 工具栏没有 WT信号, K 线上没有交叉箭头和背离连线", () => {
+  const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
+  assert.ok(!html.includes('id="wt-signal"'), "工具栏不该再有 WT信号");
   const context = runBrowser();
   const setView = viewSetter(context);
-  const legend = legendOf(context, 1);
-  // 一段过了 73 根冷启动的振荡行情; 箭头档位放到「全部」, 保证有箭头可数
+  const keys = (index) => findAll(chartEl(context, index), (node) => node.className === "ml-item")
+    .map((node) => node.getAttribute("data-key"));
+  assert.deepEqual([keys(0), keys(1)], [["ema", "band"], ["ema", "band"]]);
   vm.runInContext(`(() => {
     const c = charts[1];
     c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
@@ -618,37 +662,44 @@ test("WaveTrend 眼睛按钮: 参考线、交叉箭头与背离连线默认显�
     }
     c.renderAll();
   })()`, context);
-  context.document.getElementById("wt-signal").handlers.change[0]({ target: { value: "all" } });
-  // K 线上只有一个 markers 插件, 成交标记带「买/卖」文字, 交叉箭头不带
-  const arrows = () => stubCharts[1].markers[stubCharts[1].markers.length - 1].filter((m) => !m.text).length;
-  // 五条参考线: 点眼睛时 applyWtVisibility 最后对它们 applyOptions
-  const applied = stubCharts[1].applied;
-  const levelsVisible = () => applied.slice(-5).map((o) => o.visible);
-  const segments = () => vm.runInContext("charts[1].wtDivergence._segs.length", context);
-
-  assert.ok(arrows() > 0, "默认显示: K 线上应有交叉箭头(否则这个用例是空跑)");
-  assert.ok(segments() > 0, "默认显示: 应有背离连线(否则这个用例是空跑)");
-
-  clickEye(context, 1, "wt");
-  assert.deepEqual(levelsVisible(), [false, false, false, false, false], "点一下: 五条参考线隐藏");
-  assert.equal(arrows(), 0, "点一下: 箭头清空");
-  assert.equal(segments(), 0, "点一下: 背离连线清空");
-  assert.equal(legendRow(context, 1, "wt").classList.contains("off"), true, "图例这一行应变暗");
-  clickEye(context, 1, "wt");
-  assert.deepEqual(levelsVisible(), [true, true, true, true, true], "再点一下: 参考线恢复");
-  assert.ok(arrows() > 0 && segments() > 0, "再点一下恢复");
+  assert.equal(vm.runInContext("'wt' in charts[1].derived", context), false, "不再计算 WaveTrend");
+  assert.ok(stubCharts[1].markers.every((list) => list.length === 0), "没有成交时 K 线上一个标记都没有");
+  assert.deepEqual(stubCharts[1].primitives.map((p) => p.constructor.name), ["MeasurePrimitive"], "K 线上只挂测量工具");
 
   setView("footprint");
-  assert.equal(legend.hidden, true, "足迹图下主图指标全部隐藏, 图例收起");
+  assert.equal(legendOf(context, 1).hidden, true, "足迹图下主图指标全部隐藏, 图例收起");
   assert.equal(legendOf(context, 0).hidden, true, "两张图的图例都收起");
-  assert.equal(arrows(), 0, "足迹图下即使开着也不画");
-  assert.equal(segments(), 0);
   setView("candle");
-  assert.equal(legend.hidden, false);
-  assert.ok(arrows() > 0 && segments() > 0, "切回 K 线按开关恢复");
+  assert.equal(legendOf(context, 1).hidden, false);
 });
 
-const offFlags = (ctx, index) => ["ema", "band", "wt"].map((key) => legendRow(ctx, index, key).classList.contains("off"));
+test("FlowWave 副图隐藏: 不建第三个窗格, 顶部读数不列 LSMA; FlowWave 照常计算, 主图 FlowWave带 照常按 wt2 染色", () => {
+  const context = runBrowser();
+  const rec = stubCharts[1];
+  assert.deepEqual(rec.series.filter((s) => s.pane > 1), [], "第三个窗格上不能有 series(有就会建出窗格)");
+  assert.deepEqual([...new Set(rec.stretch.map(([index]) => index))], [0, 1], "只给主图和 FlowMeter 分高度");
+  vm.runInContext(`(() => {
+    const c = charts[1];
+    c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+              colors: { up: "#0f0", down: "#f00", upLevels: ["#0f1", "#0f2", "#0f3"], downLevels: ["#f01", "#f02", "#f03"] } };
+    c.bars = [];
+    let price = 4000;
+    for (let i = 0; i < 200; i++) {
+      price += Math.sin(i / 5) * 8;
+      c.bars.push({ time: 1700000000 + i * 30, open: price - 1, high: price + 2, low: price - 2,
+                    close: price, volume: 100 + (i % 9) * 40, buy: 60, sell: 40, delta: 20 });
+    }
+    c.renderAll();
+    c.refreshReadout();
+  })()`, context);
+  const legend = textOf(readoutOf(context, 1, "meter"));
+  assert.match(legend, /RVOL \S+ 斜率 /, "读数应已刷新(否则下一条断言是空跑)");
+  assert.doesNotMatch(legend, /LSMA/, "副图隐藏后不列它的主线");
+  const states = JSON.parse(vm.runInContext("JSON.stringify(charts[1].derived.band.state)", context));
+  assert.ok(states.some((v) => v !== 0), "wt2 照常计算, 带上有超买超卖段(否则这个用例是空跑)");
+});
+
+const offFlags = (ctx, index) => ["ema", "band"].map((key) => legendRow(ctx, index, key).classList.contains("off"));
 
 test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各记进 localStorage, 重载后各自按记下的状态初始化", () => {
   const storage = createLocalStorage();
@@ -660,14 +711,15 @@ test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各
   assert.deepEqual(applied.slice(-4).map((o) => o.visible), [false, false, false, false]);
   assert.equal(eyeOf(context, 1, "ema").title, "显示");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")),
-                   [{ ema: true, band: false, wt: true, bandMid: false }, { ema: false, band: false, wt: true, bandMid: false }]);
+                   [{ ema: true, band: false, bandMid: false }, { ema: false, band: false, bandMid: false }]);
 
-  // 切合约是整页重载: 新页面的两张图各按记下的状态画
+  // 切合约是整页重载: 新页面的两张图各按记下的状态画(删掉 WaveTrend 之前记的 wt 忽略掉)
   storage.setItem("flowscope.chartShown", JSON.stringify([
     { ema: true, band: false, wt: true }, { ema: false, band: true, wt: false }]));
   const again = runBrowser({ localStorage: storage });
-  assert.deepEqual(offFlags(again, 0), [false, true, false]);
-  assert.deepEqual(offFlags(again, 1), [true, false, true]);
+  assert.deepEqual(offFlags(again, 0), [false, true]);
+  assert.deepEqual(offFlags(again, 1), [true, false]);
+  assert.equal(vm.runInContext("'wt' in charts[0].shown()", again), false, "旧值里的 wt 不带进开关");
   assert.equal(bandKOf(again, 1).disabled, false, "右图的带记成打开, 它图例里的带宽应可点");
 
   // 旧版按周期记 {"10": {...}, "30": {...}}: 新键还没有时各图按自己的周期初始化
@@ -675,19 +727,19 @@ test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各
   storage.setItem("flowscope.mainShown", JSON.stringify({
     10: { ema: true, band: true, wt: true }, 30: { ema: false, band: false, wt: false } }));
   const perPeriod = runBrowser({ localStorage: storage });
-  assert.deepEqual(offFlags(perPeriod, 0), [false, false, false]);
-  assert.deepEqual(offFlags(perPeriod, 1), [true, true, true]);
+  assert.deepEqual(offFlags(perPeriod, 0), [false, false]);
+  assert.deepEqual(offFlags(perPeriod, 1), [true, true]);
 
   // 更早只记一份 {ema, band, wt}: 两张图都按它初始化
   storage.setItem("flowscope.mainShown", JSON.stringify({ ema: false, band: true, wt: true }));
   const legacy = runBrowser({ localStorage: storage });
-  assert.deepEqual(offFlags(legacy, 0), [true, false, false]);
-  assert.deepEqual(offFlags(legacy, 1), [true, false, false]);
+  assert.deepEqual(offFlags(legacy, 0), [true, false]);
+  assert.deepEqual(offFlags(legacy, 1), [true, false]);
 
   // 坏值不能把页面弄挂, 回落到默认
   storage.setItem("flowscope.chartShown", "not json");
   const third = runBrowser({ localStorage: storage });
-  assert.deepEqual(offFlags(third, 1), [false, true, false]);
+  assert.deepEqual(offFlags(third, 1), [false, true]);
   assert.equal(bandKOf(third, 1).disabled, true);
 });
 
@@ -695,16 +747,16 @@ test("两张图选同一个周期时开关各管各的, 重载后不串; 切周�
   const storage = createLocalStorage();
   storage.setItem("flowscope.chartTfs", "[30,30]");
   const context = runBrowser({ localStorage: storage, fetch: historyRecorder([]) });
-  clickEye(context, 0, "wt");
+  clickEye(context, 0, "ema");
   const again = runBrowser({ localStorage: storage, fetch: historyRecorder([]) });
-  assert.deepEqual(offFlags(again, 0), [false, true, true], "左图关掉的 WaveTrend 重载后还是关的");
-  assert.deepEqual(offFlags(again, 1), [false, true, false], "右图不受左图影响");
+  assert.deepEqual(offFlags(again, 0), [true, true], "左图关掉的 EMA 重载后还是关的");
+  assert.deepEqual(offFlags(again, 1), [false, true], "右图不受左图影响");
 
   const select = tfSelectOf(again, 0);
   select.value = "300";
   select.handlers.change[0]();
-  assert.deepEqual(offFlags(again, 0), [false, true, true], "切周期后本图开关不变");
-  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0], { ema: true, band: false, wt: false, bandMid: false });
+  assert.deepEqual(offFlags(again, 0), [true, true], "切周期后本图开关不变");
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0], { ema: false, band: false, bandMid: false });
 });
 
 test("图例里的带宽只在本图打开 FlowWave带 时能点", () => {
@@ -791,10 +843,59 @@ test("点图例里的带宽按 1.5σ → 2σ → 2.5σ 循环, 两张图共用, 
   assert.ok(Math.abs(halfWidth() - base) < 1e-9, "回到 2σ");
   assert.deepEqual(labels(), ["2σ", "2σ"]);
 
-  vm.runInContext("charts[1].refreshLegend()", context);
-  const legend = context.document.getElementById("legend").textContent;
-  assert.match(legend, /LSMA:/, "顶部读数应已刷新(否则下一条断言是空跑)");
-  assert.doesNotMatch(legend, /带:/, "带开着也不往顶部读数里塞轨道值");
+  vm.runInContext("charts[1].refreshReadout()", context);
+  const legend = `${textOf(readoutOf(context, 1, "price"))} ${textOf(readoutOf(context, 1, "meter"))}`;
+  assert.match(legend, /RVOL /, "读数应已刷新(否则下一条断言是空跑)");
+  assert.doesNotMatch(legend, /带/, "带开着也不往读数里塞轨道值");
+});
+
+test("RVOL 脉冲画在 FlowMeter 窗格底部的单独价格轴上, FlowWave 副图里不再有; RVOL / Volume 模式下不画", () => {
+  const context = runBrowser();
+  const rec = stubCharts[1];
+  vm.runInContext(`(() => {
+    const c = charts[1];
+    c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+              colors: { up: "#0f0", down: "#f00", upLevels: ["#0f1", "#0f2", "#0f3"], downLevels: ["#f01", "#f02", "#f03"] } };
+    c.bars = [];
+    let price = 4000;
+    for (let i = 0; i < 120; i++) {
+      price += Math.sin(i / 3) * 4;
+      c.bars.push({ time: 1700000000 + i * 30, open: price - 1, high: price + 2, low: price - 2,
+                    close: price, volume: 100 + (i % 9) * 40, buy: 60, sell: 40, delta: 20 });
+    }
+    c.renderAll();
+  })()`, context);
+  const setMode = (value) => paneSelectsOf(context, 1)[0].handlers.change[0]({ target: { value } });
+
+  const plain = (v) => JSON.parse(JSON.stringify(v));   // vm 里建的对象原型不同, 转成本 realm 的再比
+  const pulse = rec.series.find((s) => s.options.priceScaleId === "pulse");
+  assert.ok(pulse, "脉冲应走自己的价格轴");
+  assert.deepEqual([pulse.type, pulse.pane], ["HistogramSeries", 1], "脉冲柱在 FlowMeter 窗格");
+  assert.deepEqual(plain(pulse.scale.at(-1).scaleMargins), { top: 0.78, bottom: 0 }, "只占窗格底部一条");
+  assert.ok(!rec.series.some((s) => s.pane === 2 && s.type === "HistogramSeries"), "FlowWave 副图里不再有柱子");
+
+  const rvol = JSON.parse(vm.runInContext("JSON.stringify(charts[1].derived.rvol)", context));
+  const expected = rvol.map((v, i) => (v == null ? null : [1700000000 + i * 30, v])).filter(Boolean);
+  const drawn = () => plain(pulse.data).map((p) => [p.time, p.value]);
+  assert.ok(expected.length > 0, "样本里应有 RVOL(否则这个用例是空跑)");
+  assert.deepEqual(drawn(), expected, "画的是 RVOL 本身(有自己的轴, 不再乘 5)");
+
+  // 主值(histA, 第一条不带 priceScaleId 的 FlowMeter 柱)给脉冲让出底边
+  const mainMargins = () => plain(rec.series.find((s) => s.pane === 1 && !s.options.priceScaleId).scale.at(-1).scaleMargins);
+  assert.equal(pulse.applied.at(-1).visible, true, "默认 CVD 模式画脉冲");
+  assert.deepEqual(mainMargins(), { top: 0.1, bottom: 0.28 }, "主值的价格轴留出底部给脉冲, 两者不重叠");
+
+  for (const mode of ["rvol", "volume"]) {
+    setMode(mode);
+    assert.equal(pulse.applied.at(-1).visible, false, `${mode} 模式主值就是成交量, 脉冲不画`);
+    assert.deepEqual(plain(pulse.data), [], `${mode} 模式不必算脉冲`);
+    assert.deepEqual(mainMargins(), { top: 0.2, bottom: 0.1 }, `${mode} 模式主值恢复默认留白`);
+  }
+
+  setMode("delta");
+  assert.equal(pulse.applied.at(-1).visible, true, "切回其他模式重新画");
+  assert.deepEqual(drawn(), expected);
+  assert.deepEqual(mainMargins(), { top: 0.1, bottom: 0.28 });
 });
 
 test("自定义 series 只画 visibleRange 内的 bar: 区间外的旧坐标不能画成残影", () => {
@@ -920,20 +1021,68 @@ function historyRecorder(calls) {
   };
 }
 
-test("K 线口径 15s: 10s 图请求时收敛成 10s 的合法值, 30s 图照用 15s, 工具栏上的选择不变", async () => {
+test("买卖口径一个下拉框: 选 TV K线 15s 时 10s 图收敛成 10s 的合法值, 30s 图照用 15s; 切回 tick 两张都按 tick", async () => {
   const calls = [];
   const context = runBrowser({ fetch: historyRecorder(calls) });
-  const ltfSelect = context.document.getElementById("ltf");
-  ltfSelect.options = [1, 5, 10, 15, 30].map((value) => ({ value: String(value), disabled: false }));
+  const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
+  assert.ok(!html.includes('id="ltf"'), "拆分粒度已并进买卖口径的下拉框");
+  const source = context.document.getElementById("cvd-source");
+  source.options = ["tick", "kline-1", "kline-5", "kline-10", "kline-15", "kline-30"]
+    .map((value) => ({ value, disabled: false }));
   // 30s 图上一次加载时服务端下发的 cfg 带着 30s 的合法粒度(含 15)
   vm.runInContext(`charts[1].cfg = { tf: 30, ltfOptions: [0, 1, 5, 10, 15, 30] };`, context);
-  context.document.getElementById("cvd-source").handlers.change[0]({ target: { value: "kline" } });
-  ltfSelect.handlers.change[0]({ target: { value: "15" } });
-  const byTf = Object.fromEntries(calls.slice(-2).map((params) => [params.get("tf"), params.get("ltf")]));
-  assert.deepEqual(byTf, { 30: "15", 10: "10" }, "15 不能整除 10, 10s 图应回落到本周期下最粗的合法粒度");
-  assert.equal(ltfSelect.value, "15", "工具栏上的选择不能被 10s 图改掉");
+  const byTf = () => Object.fromEntries(calls.slice(-2).map((params) => [params.get("tf"), params.get("ltf")]));
+
+  source.handlers.change[0]({ target: { value: "kline-15" } });
+  assert.deepEqual(byTf(), { 30: "15", 10: "10" }, "15 不能整除 10, 10s 图应回落到本周期下最粗的合法粒度");
+  assert.equal(vm.runInContext("settings.cvdSource + ' ' + settings.klineLtf", context), "kline 15");
   vm.runInContext("refreshLtfOptions()", context);
-  assert.equal(ltfSelect.options.find((o) => o.value === "15").disabled, false, "30s 图还用得上 15s, 不能禁用");
+  assert.equal(source.options.find((o) => o.value === "kline-15").disabled, false, "30s 图还用得上 15s, 不能禁用");
+  assert.equal(source.options.find((o) => o.value === "tick").disabled, false, "tick 口径哪个周期都能用");
+
+  source.handlers.change[0]({ target: { value: "tick" } });
+  assert.deepEqual(byTf(), { 30: "0", 10: "0" }, "tick 口径的协议值是 0");
+  assert.equal(vm.runInContext("settings.cvdSource", context), "tick");
+});
+
+test("AI 分析的买卖量口径按各图已加载的数据报: 选 15s 时 10s 图报 10s; 新口径历史没到之前不让发", async () => {
+  const pending = [];
+  const context = runBrowser({ fetch: (url) => {
+    const text = String(url);
+    if (!text.startsWith("/api/history")) return stubFetch(url);
+    const params = new URLSearchParams(text.slice(text.indexOf("?") + 1));
+    return new Promise((resolve) => pending.push({ tf: Number(params.get("tf")), ltf: Number(params.get("ltf")), resolve }));
+  } });
+  const ltfOptions = { 10: [0, 1, 5, 10], 30: [0, 1, 5, 10, 15, 30] };
+  // 按请求里的 tf/ltf 回一份历史(服务端快照里带着实际的 ltf)
+  const answer = async () => {
+    for (const { tf, ltf, resolve } of pending.splice(0)) {
+      const bars = [];
+      for (let t = 1699999980; t < 1699999980 + 3600; t += tf) {
+        bars.push({ time: t, open: 3999, high: 4002, low: 3998, close: 4000 + (t % 7), volume: 100, buy: 60, sell: 40 });
+      }
+      resolve(jsonResponse({ symbol: "KQ.m@SHFE.fu", tf, ltf, bars,
+                             cfg: { tf, ltfOptions: ltfOptions[tf], mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 } }));
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  const inputs = () => JSON.parse(vm.runInContext(`JSON.stringify(charts.map((c) => {
+    const input = c.analysisInput();
+    const data = AiPanel.buildChartData(input);
+    return { tf: c.tf, ltf: input.ltf, stale: input.stale, sent: data && data.meta.ltf };
+  }))`, context));
+
+  await answer();
+  assert.deepEqual(inputs(), [{ tf: 10, ltf: 0, stale: false, sent: 0 }, { tf: 30, ltf: 0, stale: false, sent: 0 }]);
+
+  context.document.getElementById("cvd-source").handlers.change[0]({ target: { value: "kline-15" } });
+  // 新口径的历史还在路上: 图上还是 tick 口径的数据, 不能配着 K 线口径的说明发出去
+  assert.deepEqual(inputs(), [{ tf: 10, ltf: 0, stale: true, sent: null }, { tf: 30, ltf: 0, stale: true, sent: null }]);
+
+  await answer();
+  assert.deepEqual(inputs(), [{ tf: 10, ltf: 10, stale: false, sent: 10 }, { tf: 30, ltf: 15, stale: false, sent: 15 }]);
+  const app = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
+  assert.ok(!/cvdSource: settings\.cvdSource|ltf: settings\.klineLtf/.test(app), "工具栏的口径不能当作各图的口径发出去");
 });
 
 // ---------- 两张图联动、顶栏状态与读数 ----------
@@ -1028,23 +1177,57 @@ test("十字光标联动: 另一张图的光标落到同一时刻所在的那根
   assert.equal(chart10.crosshair.at(-1), null);
 });
 
-test("顶栏读数只显示鼠标所在那张图, 带周期前缀; 鼠标换到另一张图时立刻切过去", () => {
+test("读数每张图各显示各的: 主图左上角是 OHLC 与涨跌, FlowMeter 窗格是量能读数; 另一张跟着联动的光标走", () => {
   const context = runBrowser();
   feedBothCharts(context);
-  const legend = context.document.getElementById("legend");
-  assert.match(legend.textContent, /^30s · /, "默认显示 30s 图");
-  vm.runInContext("charts[0].refreshLegend()", context);
-  assert.match(legend.textContent, /^30s · /, "10s 图不是鼠标所在那张, 它的读数不该写到顶栏");
+  const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
+  assert.ok(!html.includes('id="legend"') && !html.includes('id="coverage"'), "顶栏不再有读数和覆盖标记");
+  const price = (index) => textOf(readoutOf(context, index, "price"));
+  const meter = (index) => textOf(readoutOf(context, index, "meter"));
+  const bar = (index, t) => JSON.parse(vm.runInContext(
+    `JSON.stringify(charts[${index}].bars.find((b) => b.time === ${t}))`, context));
+  const lastTime = (index) => vm.runInContext(`charts[${index}].bars.at(-1).time`, context);
+  const ohlc = (b) => `O ${b.open} H ${b.high} L ${b.low} C ${b.close}`;
+  const signedText = (v, digits) => {
+    const text = v.toFixed(digits);
+    return Number(text) > 0 ? `+${text}` : Number(text) < 0 ? text : text.replace("-", "");
+  };
+
+  // 光标不在图上: 各显示自己最新一根
+  assert.ok(price(0).startsWith(ohlc(bar(0, lastTime(0)))), price(0));
+  assert.ok(price(1).startsWith(ohlc(bar(1, lastTime(1)))), price(1));
+  assert.match(meter(1), /^CVD \S+ Δ \S+ 买\/卖 \S+ 未知 \S+ 旧买\/卖 \S+ RVOL \S+ 斜率 \S+ 覆盖 缺失$/,
+               "CVD 模式下 CVD 只列一次; 期货列出判向对照");
+
+  // 鼠标在 10s 图 T0+50: 10s 图显示那根, 涨跌对上一根收盘; 30s 图显示包含它的 T0+30 那根
   chartEl(context, 0).handlers.pointerenter[0]();
-  assert.match(legend.textContent, /^10s · /);
-  // 30s 图上摆好的光标在它数据更新时库会再报一次: 不算鼠标换了图
-  stubCharts[1].crosshairHandlers[0]({ time: T0 + 60, point: { x: 100, y: 100 }, paneIndex: 0 });
-  assert.match(legend.textContent, /^10s · /);
-  chartEl(context, 1).handlers.pointerenter[0]();
-  assert.match(legend.textContent, /^30s · /);
+  stubCharts[0].crosshairHandlers[0]({ time: T0 + 50, point: { x: 100, y: 200 }, paneIndex: 0 });
+  const prev = bar(0, T0 + 40), cur = bar(0, T0 + 50);
+  const change = cur.close - prev.close;
+  assert.equal(price(0), `${ohlc(cur)} ${signedText(change, 0)} (${signedText(change / prev.close * 100, 2)}%)`);
+  assert.equal(readoutOf(context, 0, "price").children[4].className, change > 0 ? "up" : change < 0 ? "down" : "");
+  assert.ok(price(1).startsWith(ohlc(bar(1, T0 + 30))), "联动的光标摆到哪根, 读数就是哪根");
+
+  // 移出图表: 两张都回到最新一根
+  stubCharts[0].crosshairHandlers[0]({ time: undefined, point: undefined });
+  assert.ok(price(0).startsWith(ohlc(bar(0, lastTime(0)))));
+  assert.ok(price(1).startsWith(ohlc(bar(1, lastTime(1)))));
+
+  // 换周期: 新周期的数据到之前读数清空, 不留旧周期的数
+  vm.runInContext("charts[1].setTf(300)", context);
+  assert.equal(price(1), "");
+  assert.equal(meter(1), "");
 });
 
-test("顶栏连接状态: 两张图都连上才显示「已连接」, 否则带周期前缀列出没连上的", () => {
+test("加密合约的读数不列判向对照(旧买/卖照抄新算法, 未知恒为 0)", () => {
+  const context = runBrowser({ search: "?symbol=OKX.BTC-USDT-SWAP" });
+  feedBothCharts(context);
+  const meter = textOf(readoutOf(context, 1, "meter"));
+  assert.match(meter, /买\/卖 /);
+  assert.doesNotMatch(meter, /未知|旧买/);
+});
+
+test("顶栏状态点: 两张图都连上才显示「已连接」, 否则带周期前缀列出没连上的; 目录/自选提示只在出错时上文字", () => {
   const context = runBrowser();
   const status = context.document.getElementById("status");
   vm.runInContext(`setChartStatus(0, true, "已连接"); setChartStatus(1, false, "同步中…");`, context);
@@ -1055,6 +1238,18 @@ test("顶栏连接状态: 两张图都连上才显示「已连接」, 否则带�
   assert.equal(status.className, "on");
   vm.runInContext(`setChartStatus(0, false, "已断开, 重连补齐中…"); setChartStatus(1, false, "加载中…");`, context);
   assert.equal(status.textContent, "10s: 已断开, 重连补齐中…  30s: 加载中…");
+  assert.equal(status.title, "10s: 已断开, 重连补齐中…\n30s: 加载中…");
+
+  vm.runInContext(`setChartStatus(0, true, "已连接"); setChartStatus(1, true, "已连接");`, context);
+  vm.runInContext(`setNotice("catalog", "目录: 离线常用品种", "no tqsdk", "info");`, context);
+  assert.deepEqual([status.className, status.textContent], ["warn", "已连接"], "离线目录只把圆点变黄");
+  assert.equal(status.title, "10s: 已连接\n30s: 已连接\n目录: 离线常用品种：no tqsdk");
+  vm.runInContext(`setNotice("favorite", "收藏失败：自选已满", "", "error");`, context);
+  assert.deepEqual([status.className, status.textContent], ["off", "收藏失败：自选已满"], "出错的提示要上文字");
+  vm.runInContext(`setNotice("favorite", "");`, context);
+  assert.deepEqual([status.className, status.textContent], ["warn", "已连接"], "清掉自选的提示不动目录的提示");
+  vm.runInContext(`setNotice("catalog", "");`, context);
+  assert.equal(status.className, "on");
 });
 
 // ---------- 测量工具 ----------
