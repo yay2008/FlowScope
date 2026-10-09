@@ -17,6 +17,8 @@
   服务没开着的时候错过的结算不补。
 - 强平: 权益低于全部持仓的维持保证金(名义金额 x MAINTENANCE_RATE)时, 按标记价格平掉全部持仓。
 - 估值(浮动盈亏、保证金、强平)按标记价格, 没有标记价格时用最新价。
+- 止盈止损同期货账户(规则见 paper.py): 按**最新价**触发, 触发后按五档盘口市价平掉全部持仓, 吃不够就每轮重试;
+  下单时也能带, 成交后挂到持仓上。
 """
 from __future__ import annotations
 
@@ -26,7 +28,8 @@ from datetime import datetime, timedelta, timezone
 
 from crypto_feed import is_crypto, venue_of
 from ingest import validate_symbol
-from paper import MAX_FINISHED_ORDERS, MAX_TRADES, OrderError, PaperStore, _num
+from paper import (MAX_FINISHED_ORDERS, MAX_TRADES, STOP_LABELS, OrderError, PaperStore, _num, attach_stops,
+                   check_stops, keep_stops, normalize_stop, order_stops, snap_to_tick, stop_hit)
 
 DEFAULT_CASH = 10_000.0           # USDT
 MIN_CASH, MAX_CASH = 10.0, 1e9
@@ -115,6 +118,7 @@ def normalize_request(raw) -> dict:
         if price is None or price <= 0:
             raise OrderError("限价单要填价格")
     return {"symbol": symbol, "side": side, "type": kind, "qty": qty, "price": price,
+            "tp": normalize_stop(raw.get("tp"), "tp"), "sl": normalize_stop(raw.get("sl"), "sl"),
             "clientId": str(raw.get("clientId") or "")[:64]}
 
 
@@ -122,6 +126,7 @@ class CryptoBook:
     """加密模拟账户的全部状态与规则(纯逻辑: 不加锁、不读写文件、不碰行情连接)。
 
     ``cash`` 是静态权益 = 初始资金 + 平仓盈亏 - 手续费 + 资金费收支; 动态权益再加浮动盈亏。
+    持仓的 ``tp``/``sl`` 是止盈/止损价(没设就没有这个键)。
     """
 
     def __init__(self, state: dict | None = None):
@@ -141,6 +146,7 @@ class CryptoBook:
         self.marks: dict[str, float] = {}          # 合约 -> 估值价(标记价格优先), 只在内存里
         self._funding_due: dict[str, int] = {}     # 合约 -> 下一次资金费结算时刻(毫秒)
         self._funding_rate: dict[str, float] = {}  # 合约 -> 结算前最后看到的资金费率
+        self.stop_errors: dict[str, str] = {}      # 合约 -> 止盈止损触发了却平不掉的原因
 
     def to_dict(self) -> dict:
         return {"version": STORE_VERSION, "initialCash": self.initial_cash, "cash": self.cash,
@@ -198,6 +204,8 @@ class CryptoBook:
             self._check_notional(qty, limit, quote)
             price = sweep(book, qty, limit, side) if quote["open"] else None
             self._check_funds(quote["contract"], side, qty, limit if price is None else price, taker, quote)
+        held = (self.positions.get(quote["contract"]) or {}).get("qty", 0.0)
+        order.update(order_stops({**request, "qty": qty}, held, quote, order["price"], price is not None))
         order["id"] = self._next_id("O")
         self.orders.append(order)
         if price is not None:
@@ -222,6 +230,41 @@ class CryptoBook:
                 self._trim()
                 return order
         raise OrderError("找不到这笔委托")
+
+    def set_stops(self, symbol: str, tp: float | None, sl: float | None, quote: dict) -> dict:
+        """设置持仓的止盈/止损价, None 表示不设; 两个都是 None 就是取消。返回持仓。"""
+        position = self.positions.get(symbol)
+        if not position:
+            raise OrderError("这个合约没有持仓")
+        if tp is not None or sl is not None:
+            tp, sl = (None if value is None else snap_to_tick(value, quote["priceTick"]) for value in (tp, sl))
+            check_stops(position["qty"], tp, sl, quote.get("last"))
+        for key, value in (("tp", tp), ("sl", sl)):
+            if value is None:
+                position.pop(key, None)
+            else:
+                position[key] = value
+        self.stop_errors.pop(symbol, None)
+        return position
+
+    def trigger_stops(self, quotes: dict, now_ms: int) -> list[dict]:
+        """最新价碰到止盈/止损价的持仓按市价全部平掉; 平不掉(盘口断了、五档不够)下一轮再试。返回平仓委托。"""
+        placed = []
+        for symbol, position in list(self.positions.items()):
+            quote = quotes.get(symbol)
+            kind = stop_hit(position, quote and quote.get("last"))
+            if kind is None:
+                self.stop_errors.pop(symbol, None)
+                continue
+            try:
+                order = self.flatten(symbol, quote, now_ms)
+            except OrderError as exc:
+                self.stop_errors[symbol] = f"{STOP_LABELS[kind]}已触发, 平仓未成交: {exc}"
+                continue
+            order["reason"] = STOP_LABELS[kind]
+            self.stop_errors.pop(symbol, None)
+            placed.append(order)
+        return placed
 
     def match(self, quotes: dict, now_ms: int) -> bool:
         """用最新报价检查挂单(按挂单费率成交); 返回有没有状态变化。"""
@@ -302,11 +345,7 @@ class CryptoBook:
 
     @staticmethod
     def _check_limit_price(price: float, quote: dict) -> float:
-        tick = quote["priceTick"]
-        steps = price / tick
-        if abs(steps - round(steps)) > 1e-6:
-            raise OrderError(f"价格要是最小变动价位 {tick:g} 的整数倍")
-        return round(round(steps) * tick, 10)
+        return snap_to_tick(price, quote["priceTick"])
 
     @staticmethod
     def _trades_through(order: dict, quote: dict) -> bool:
@@ -330,7 +369,9 @@ class CryptoBook:
         else:
             new_avg = avg if new_qty else 0.0
         fee = abs(signed) * price * fee_rate
-        return {"qty": new_qty, "avgPrice": new_avg}, realized, fee, opening, closing
+        position = {"qty": new_qty, "avgPrice": new_avg}
+        keep_stops(old, position)
+        return position, realized, fee, opening, closing
 
     def _mark_of(self, symbol: str, position: dict) -> float:
         return self.marks.get(symbol, position["avgPrice"])
@@ -369,6 +410,7 @@ class CryptoBook:
         was_flat = symbol not in self.positions
         signed = order["qty"] if order["side"] == "buy" else -order["qty"]
         position, realized, fee, opening, closing = self._preview(symbol, signed, price, fee_rate)
+        attach_stops(order, position)
         if position["qty"]:
             self.positions[symbol] = position
         else:
@@ -446,7 +488,9 @@ class CryptoBook:
             positions.append({"contract": symbol, "qty": position["qty"], "avgPrice": position["avgPrice"],
                               "last": self.marks.get(symbol), "floatPnl": round(float_pnl, 4),
                               "margin": round(margin, 4), "leverage": self.leverage_of(symbol),
-                              "liqPrice": self._liquidation_price(symbol, position)})
+                              "liqPrice": self._liquidation_price(symbol, position),
+                              "tp": position.get("tp"), "sl": position.get("sl"),
+                              "stopError": self.stop_errors.get(symbol)})
         equity = self.cash + float_total
         return {"account": {"initialCash": self.initial_cash, "cash": round(self.cash, 4),
                             "equity": round(equity, 4), "floatPnl": round(float_total, 4),
@@ -554,6 +598,16 @@ class CryptoPaperService:
             self._save(book)
             return order
 
+    def set_stops(self, symbol: str, tp, sl) -> dict:
+        tp, sl = normalize_stop(tp, "tp"), normalize_stop(sl, "sl")
+        symbol, instrument = self._tradable(symbol)
+        quote = self._quote(symbol, instrument)
+        with self._lock:
+            book = self._book_now()
+            position = book.set_stops(symbol, tp, sl, quote)
+            self._save(book)
+            return {"contract": symbol, "qty": position["qty"], "tp": position.get("tp"), "sl": position.get("sl")}
+
     def set_leverage(self, symbol: str, leverage) -> dict:
         symbol, instrument = self._tradable(symbol)
         with self._lock:
@@ -574,7 +628,7 @@ class CryptoPaperService:
             return self._book.summary()
 
     def on_cycle(self, manager):
-        """加密行情管理线程每轮调用: 续订持仓/挂单合约的盘口与标记价格, 撮合挂单, 结算资金费, 检查强平。"""
+        """加密行情管理线程每轮调用: 续订持仓/挂单合约的盘口与标记价格, 撮合挂单, 结算资金费, 检查强平与止盈止损。"""
         with self._lock:
             book = self._book_now()
             symbols = set(book.positions) | {order["contract"] for order in book.orders if order["status"] == "open"}
@@ -592,5 +646,6 @@ class CryptoPaperService:
             now = self._clock()
             changed = book.settle(quotes, now)
             changed = book.match(quotes, now) or changed
+            changed = bool(book.trigger_stops(quotes, now)) or changed
             if changed:
                 self._save(book)

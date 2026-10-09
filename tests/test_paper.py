@@ -327,12 +327,139 @@ class LimitOrderTest(unittest.TestCase):
         self.assertEqual(len(account.trades), 4)
 
 
+class StopTest(unittest.TestCase):
+    def test_set_validates_side_tick_and_position(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 2), snap(), NOW)                       # 多 2 @3000, 最新价 3000
+        account.set_stops(CONTRACT, 3050.0, 2950.0, snap())
+        self.assertEqual((account.positions[CONTRACT]["tp"], account.positions[CONTRACT]["sl"]), (3050.0, 2950.0))
+        self.assertEqual(account.summary()["positions"][0]["tp"], 3050.0)
+        self.assertEqual(account.summary()["positions"][0]["multiplier"], 10)   # 图上划线算预估盈亏用
+        with self.assertRaisesRegex(OrderError, "多单止盈价要高于最新价 3000"):
+            account.set_stops(CONTRACT, 2990.0, None, snap())
+        with self.assertRaisesRegex(OrderError, "多单止损价要低于最新价 3000"):
+            account.set_stops(CONTRACT, None, 3000.0, snap())
+        with self.assertRaisesRegex(OrderError, "整数倍"):
+            account.set_stops(CONTRACT, 3050.5, None, snap())
+        with self.assertRaisesRegex(OrderError, "没有最新价"):
+            account.set_stops(CONTRACT, 3050.0, None, snap(last_price=float("nan")))
+        with self.assertRaisesRegex(OrderError, "没有持仓"):
+            account.set_stops("SHFE.fu2609", 3050.0, None, snap())
+        self.assertEqual(account.positions[CONTRACT]["sl"], 2950.0)      # 被拒的设置不改原来的
+        account.set_stops(CONTRACT, None, 2960.0, snap())                 # 只设止损: 止盈取消
+        self.assertNotIn("tp", account.positions[CONTRACT])
+        account.set_stops(CONTRACT, None, None, None)                     # 取消不用报价
+        self.assertEqual({"tp", "sl"} & set(account.positions[CONTRACT]), set())
+
+    def test_stop_loss_touch_closes_at_market(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 2), snap(), NOW)
+        account.set_stops(CONTRACT, 3100.0, 2950.0, snap())
+        self.assertEqual(account.trigger_stops({CONTRACT: snap(last_price=2951.0, bid_price1=2950.0)}, NOW), [])
+        placed = account.trigger_stops({CONTRACT: snap(last_price=2950.0, bid_price1=2949.0)}, NOW)
+        self.assertEqual([(item["side"], item["qty"], item["reason"]) for item in placed], [("sell", 2, "止损")])
+        self.assertEqual(placed[0]["fillPrice"], 2949.0)                  # 碰到就触发, 按对手价成交
+        self.assertEqual(account.positions, {})
+        self.assertEqual(account.trades[-1]["pnl"], (2949.0 - 3000.0) * 10 * 2)
+
+    def test_short_take_profit_and_stops_follow_the_position(self):
+        account = book(fees=FeeTable())
+        account.place(order("sell", 2), snap(), NOW)                      # 空 2 @2999
+        with self.assertRaisesRegex(OrderError, "空单止盈价要低于最新价"):
+            account.set_stops(CONTRACT, 3010.0, None, snap())
+        account.set_stops(CONTRACT, 2900.0, 3050.0, snap())
+        account.place(order("sell", 1), snap(), NOW)                      # 加仓、减仓都保留
+        account.place(order("buy", 2), snap(), NOW)
+        self.assertEqual((account.positions[CONTRACT]["qty"], account.positions[CONTRACT]["tp"]), (-1, 2900.0))
+        placed = account.trigger_stops({CONTRACT: snap(last_price=2900.0, ask_price1=2901.0)}, NOW)
+        self.assertEqual([(item["side"], item["qty"], item["reason"]) for item in placed], [("buy", 1, "止盈")])
+        # 反手: 新方向的持仓不带旧的止盈止损
+        account.place(order("buy", 1), snap(), NOW)
+        account.set_stops(CONTRACT, 3100.0, 2900.0, snap())
+        account.place(order("sell", 3), snap(), NOW)
+        self.assertEqual(account.positions[CONTRACT]["qty"], -2)
+        self.assertEqual({"tp", "sl"} & set(account.positions[CONTRACT]), set())
+
+    def test_failed_close_retries_and_waits_for_the_session(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 1), snap(), NOW)
+        account.set_stops(CONTRACT, None, 2950.0, snap())
+        lunch = datetime(2026, 9, 30, 12, 0, 0)
+        self.assertEqual(account.trigger_stops({CONTRACT: snap(last_price=2940.0)}, lunch), [])   # 午休不触发
+        self.assertEqual(account.stop_errors, {})
+        limit_down = snap(last_price=2700.0, bid_price1=float("nan"), lower_limit=2700.0)
+        self.assertEqual(account.trigger_stops({CONTRACT: limit_down}, NOW), [])
+        self.assertIn("止损已触发", account.summary()["positions"][0]["stopError"])
+        self.assertEqual(account.positions[CONTRACT]["sl"], 2950.0)       # 留着, 下一轮再试
+        placed = account.trigger_stops({CONTRACT: snap(last_price=2710.0, bid_price1=2709.0)}, NOW)
+        self.assertEqual(placed[0]["fillPrice"], 2709.0)
+        self.assertEqual(account.stop_errors, {})
+
+    def test_market_order_carries_stops_onto_the_position(self):
+        account = book(fees=FeeTable())
+        with self.assertRaisesRegex(OrderError, "多单止盈价要高于最新价 3000"):
+            account.place(order("buy", 2) | {"tp": 2990.0}, snap(), NOW)
+        with self.assertRaisesRegex(OrderError, "整数倍"):
+            account.place(order("buy", 2) | {"sl": 2950.5}, snap(), NOW)
+        self.assertEqual((account.orders, account.positions), ([], {}))  # 被拒的不下单
+        placed = account.place(order("buy", 2) | {"tp": 3100.0, "sl": 2950.0}, snap(), NOW)
+        self.assertEqual((placed["tp"], placed["sl"]), (3100.0, 2950.0))
+        self.assertEqual((account.positions[CONTRACT]["tp"], account.positions[CONTRACT]["sl"]), (3100.0, 2950.0))
+        # 只减仓或平仓的委托不能带; 反手的可以, 按新方向校验
+        with self.assertRaisesRegex(OrderError, "只减仓或平仓"):
+            account.place(order("sell", 2) | {"sl": 3050.0}, snap(), NOW)
+        account.place(order("sell", 3) | {"tp": 2900.0, "sl": 3050.0}, snap(), NOW)
+        self.assertEqual(account.positions[CONTRACT]["qty"], -1)
+        self.assertEqual((account.positions[CONTRACT]["tp"], account.positions[CONTRACT]["sl"]), (2900.0, 3050.0))
+        # 加仓只覆盖填了的那一项
+        account.place(order("sell", 1) | {"tp": 2950.0}, snap(), NOW)
+        self.assertEqual((account.positions[CONTRACT]["tp"], account.positions[CONTRACT]["sl"]), (2950.0, 3050.0))
+        # 不带的委托(含平仓)不碰持仓的止盈止损
+        account.place(order("buy", 1), snap(), NOW)
+        self.assertEqual((account.positions[CONTRACT]["qty"], account.positions[CONTRACT]["tp"]), (-1, 2950.0))
+
+    def test_limit_order_stops_attach_when_it_fills(self):
+        account = book(fees=FeeTable())
+        with self.assertRaisesRegex(OrderError, "多单止损价要低于委托价 2990"):
+            account.place(order("buy", 1, "limit", 2990.0) | {"sl": 2995.0}, snap(), NOW)
+        # 当场成交的限价单还要对最新价校验: 止损 3002 低于限价 3005, 但高于最新价 3000
+        with self.assertRaisesRegex(OrderError, "多单止损价要低于最新价 3000"):
+            account.place(order("buy", 1, "limit", 3005.0) | {"sl": 3002.0}, snap(ask_price1=3001.0), NOW)
+        resting = account.place(order("buy", 1, "limit", 2990.0) | {"tp": 3050.0, "sl": 2980.0}, snap(), NOW)
+        self.assertEqual((resting["status"], account.positions), ("open", {}))
+        account.match({CONTRACT: snap(ask_price1=2991.0, last_price=2989.0)}, NOW)
+        self.assertEqual(resting["status"], "filled")
+        self.assertEqual((account.positions[CONTRACT]["tp"], account.positions[CONTRACT]["sl"]), (3050.0, 2980.0))
+        # 成交时价格已经越过止损: 挂上之后紧接着触发
+        account.flatten(CONTRACT, snap(), NOW)
+        account.place(order("buy", 1, "limit", 2990.0) | {"sl": 2985.0}, snap(), NOW)
+        gap = {CONTRACT: snap(ask_price1=2981.0, bid_price1=2980.0, last_price=2980.0)}
+        account.match(gap, NOW)
+        placed = account.trigger_stops(gap, NOW)
+        self.assertEqual([(item["side"], item["reason"], item["fillPrice"]) for item in placed],
+                         [("sell", "止损", 2980.0)])
+
+    def test_resting_stops_skip_a_fill_that_only_reduces(self):
+        account = book(fees=FeeTable())
+        resting = account.place(order("sell", 1, "limit", 3010.0) | {"tp": 2950.0, "sl": 3060.0}, snap(), NOW)
+        account.place(order("buy", 2), snap(), NOW)                       # 挂单期间开了多 2
+        account.match({CONTRACT: snap(bid_price1=3011.0, last_price=3010.0)}, NOW)
+        self.assertEqual(resting["status"], "filled")
+        self.assertEqual(account.positions[CONTRACT]["qty"], 1)
+        self.assertEqual({"tp", "sl"} & set(account.positions[CONTRACT]), set())   # 空单的止盈止损不挂到多单上
+
+
 class RequestTest(unittest.TestCase):
     def test_normalize_request(self):
         good = paper.normalize_request({"symbol": " KQ.m@SHFE.fu ", "side": "buy", "qty": 2.0})
         self.assertEqual((good["symbol"], good["type"], good["qty"], good["price"]),
                          ("KQ.m@SHFE.fu", "market", 2, None))
+        self.assertEqual((good["tp"], good["sl"]), (None, None))
+        stops = paper.normalize_request({"symbol": CONTRACT, "side": "buy", "qty": 1, "tp": "3100", "sl": ""})
+        self.assertEqual((stops["tp"], stops["sl"]), (3100.0, None))
         bad = [{"symbol": "x/../y", "side": "buy", "qty": 1},
+               {"symbol": CONTRACT, "side": "buy", "qty": 1, "tp": "abc"},
+               {"symbol": CONTRACT, "side": "buy", "qty": 1, "sl": -5},
                {"symbol": CONTRACT, "side": "long", "qty": 1},
                {"symbol": CONTRACT, "side": "buy", "qty": 1.5},
                {"symbol": CONTRACT, "side": "buy", "qty": True},
@@ -493,6 +620,31 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual((saved["initialCash"], saved["positions"], saved["orders"]), (300_000, {}, []))
         self.assertEqual(saved["seq"], 1)             # 接着旧编号: 下一笔是 O2, 不会再出一个 O1
 
+    def test_stops_persist_and_trigger_on_the_loop(self):
+        self.run_async(self.service.place({"symbol": "KQ.m@SHFE.fu", "side": "buy", "qty": 1}))
+        result = self.service.set_stops("KQ.m@SHFE.fu", None, 2990)     # 主连按标的月份合约的持仓
+        self.assertEqual((result["contract"], result["tp"], result["sl"]), (CONTRACT, None, 2990.0))
+        with self.assertRaisesRegex(OrderError, "止损价要是正数"):
+            self.service.set_stops(CONTRACT, None, "abc")
+        state = self.run_async(self.make_service().state("KQ.m@SHFE.fu"))
+        self.assertEqual(state["positions"][0]["sl"], 2990.0)
+        self.quotes[CONTRACT].last_price = 2990.0
+        self.quotes[CONTRACT].bid_price1 = 2989.0
+        self.service.on_loop(self.api)
+        with open(self.path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["positions"], {})
+        self.assertEqual((saved["orders"][-1]["reason"], saved["orders"][-1]["fillPrice"]), ("止损", 2989.0))
+
+    def test_order_stops_go_through_the_service(self):
+        placed = self.run_async(self.service.place(
+            {"symbol": "KQ.m@SHFE.fu", "side": "buy", "qty": 1, "tp": 3100, "sl": "2950"}))
+        self.assertEqual((placed["contract"], placed["tp"], placed["sl"]), (CONTRACT, 3100.0, 2950.0))
+        state = self.run_async(self.make_service().state("KQ.m@SHFE.fu"))
+        self.assertEqual((state["positions"][0]["tp"], state["positions"][0]["sl"]), (3100.0, 2950.0))
+        with self.assertRaisesRegex(OrderError, "止盈价要是正数"):
+            self.run_async(self.service.place({"symbol": CONTRACT, "side": "buy", "qty": 1, "tp": 0}))
+
     def test_watch_expires(self):
         self.run_async(self.service.state(CONTRACT))
         self.api.gets.clear()
@@ -548,10 +700,17 @@ class EndpointTest(unittest.TestCase):
             asyncio.run(server.paper_flatten(CONTRACT))
         with self.assertRaises(HTTPException):
             server.paper_reset(-5)
+        with self.assertRaises(HTTPException) as caught:
+            server.paper_stops({"symbol": CONTRACT, "tp": 3100, "sl": None})
+        self.assertEqual(caught.exception.detail, "这个合约没有持仓")
 
     def test_order_round_trip(self):
         filled = asyncio.run(server.paper_order({"symbol": CONTRACT, "side": "buy", "qty": 1}))
         self.assertEqual(filled["status"], "filled")
+        with self.assertRaises(HTTPException) as caught:
+            server.paper_stops({"symbol": CONTRACT, "tp": 2990, "sl": None})
+        self.assertIn("止盈价要高于最新价", caught.exception.detail)
+        self.assertEqual(server.paper_stops({"symbol": CONTRACT, "tp": 3100, "sl": ""})["tp"], 3100.0)
         flat = asyncio.run(server.paper_flatten(CONTRACT))
         self.assertEqual((flat["side"], flat["status"]), ("sell", "filled"))
 

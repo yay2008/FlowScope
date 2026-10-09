@@ -1,4 +1,4 @@
-"""加密永续模拟交易: 五档撮合、数量规则、限价穿价、杠杆与保证金、反手、资金费、强平, 以及 app 分流。"""
+"""加密永续模拟交易: 五档撮合、数量规则、限价穿价、杠杆与保证金、反手、资金费、强平、止盈止损, 以及 app 分流。"""
 import asyncio
 import json
 import os
@@ -198,6 +198,39 @@ class BookTests(unittest.TestCase):
         self.assertEqual(book.trades[-1]["liquidity"], "liquidation")
         self.assertEqual({item["status"] for item in book.orders}, {"filled", "cancelled"})
 
+    def test_stops_trigger_on_last_price_and_sweep_the_book(self):
+        book = CryptoBook()
+        book.place(order("buy", 2.0), make_quote(), NOW)                  # 多 2 @100.15, 最新价 100
+        with self.assertRaisesRegex(OrderError, "多单止盈价要高于最新价 100"):
+            book.set_stops(BTC.symbol, 99.5, None, make_quote())
+        book.set_stops(BTC.symbol, 101.0, 99.0, make_quote())
+        self.assertEqual(book.summary()["positions"][0]["sl"], 99.0)
+        thin = make_quote(last=99.0, bids=((98.9, 0.5),))
+        self.assertEqual(book.trigger_stops({BTC.symbol: thin}, NOW), [])
+        self.assertIn("五档", book.stop_errors[BTC.symbol])                # 吃不够, 下一轮再试
+        placed = book.trigger_stops({BTC.symbol: make_quote(last=99.0, bids=((98.9, 1.0), (98.8, 2.0)))}, NOW)
+        self.assertEqual([(item["side"], item["qty"], item["reason"]) for item in placed], [("sell", 2.0, "止损")])
+        self.assertAlmostEqual(placed[0]["fillPrice"], 98.85)
+        self.assertEqual((book.positions, book.stop_errors), ({}, {}))
+
+    def test_orders_carry_stops_onto_the_position(self):
+        book = CryptoBook()
+        with self.assertRaisesRegex(OrderError, "空单止损价要高于最新价 100"):
+            book.place(order("sell", 1.0) | {"sl": 99.0}, make_quote(), NOW)
+        placed = book.place(order("sell", 1.0) | {"tp": 95.0, "sl": 103.0}, make_quote(), NOW)
+        self.assertEqual((placed["tp"], placed["sl"]), (95.0, 103.0))
+        self.assertEqual(book.summary()["positions"][0]["tp"], 95.0)
+        with self.assertRaisesRegex(OrderError, "只减仓或平仓"):
+            book.place(order("buy", 1.0) | {"tp": 105.0}, make_quote(), NOW)
+        # 限价单按委托价校验, 成交时(挂单费率)挂上
+        with self.assertRaisesRegex(OrderError, "多单止盈价要高于委托价 99"):
+            book.place(order("buy", 3.0, "limit", 99.0) | {"tp": 98.0}, make_quote(), NOW)
+        resting = book.place(order("buy", 3.0, "limit", 99.0) | {"tp": 104.0, "sl": 97.0}, make_quote(), NOW)
+        self.assertTrue(book.match({BTC.symbol: make_quote(last=98.9)}, NOW))
+        self.assertEqual(resting["status"], "filled")
+        position = book.positions[BTC.symbol]
+        self.assertEqual((position["qty"], position["tp"], position["sl"]), (2.0, 104.0, 97.0))   # 反手成多 2
+
     def test_client_id_places_once(self):
         book = CryptoBook()
         first = book.place(order("buy", 1.0, client_id="x"), make_quote(), NOW)
@@ -258,6 +291,18 @@ class ServiceTests(unittest.TestCase):
         summary = self.service.reset(500)
         self.assertEqual(summary["account"]["equity"], 500.0)
         self.assertEqual(self.service.state(BTC.symbol)["leverage"], 5)       # 重置保留杠杆设置
+
+    def test_stops_set_through_the_service_fire_on_the_cycle(self):
+        self.service.place(order("sell", 1.0))                            # 空 1 @100
+        result = self.service.set_stops(BTC.symbol, 95.0, None)
+        self.assertEqual((result["tp"], result["sl"]), (95.0, None))
+        self.crypto.raw["ticker"] = {"last": 95.0}
+        self.crypto.raw["book"] = {"bids": [[95.0, 5.0]], "asks": [[95.1, 5.0]], "received": time.time()}
+        self.service.on_cycle(self.crypto)
+        with open(self.path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["positions"], {})
+        self.assertEqual((saved["orders"][-1]["reason"], saved["orders"][-1]["fillPrice"]), ("止盈", 95.1))
 
     def test_flat_at_funding_time_is_not_charged_after_reopening(self):
         now = [NOW]
@@ -323,6 +368,8 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 400)
         with self.assertRaises(HTTPException):
             asyncio.run(server.paper_flatten(BTC.symbol))                        # 没有持仓
+        asyncio.run(server.paper_order(order("buy", 1.0)))
+        self.assertEqual(server.paper_stops({"symbol": BTC.symbol, "tp": None, "sl": 90})["sl"], 90.0)
 
 
 if __name__ == "__main__":

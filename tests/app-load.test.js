@@ -113,8 +113,9 @@ let stubCharts = [];
 let createdPriceLines = [];
 
 function createChartStub() {
+  // paneElement: 主图窗格的 DOM, 默认没有(和库画出第一帧之前一样); 划线测试自己摆一个
   const record = { applied: [], series: [], markers: [], crosshair: [], crosshairHandlers: [], primitives: [],
-                   stretch: [] };
+                   stretch: [], paneElement: null };
   stubCharts.push(record);
   // addSeries(类型, 选项, 窗格) / addCustomSeries(自定义视图, 选项, 窗格)
   const series = (type, seriesOptions = {}, pane = 0) => {
@@ -148,9 +149,10 @@ function createChartStub() {
   return {
     addSeries: series, addCustomSeries: series, removeSeries() {},
     applyOptions() {}, resize() {}, timeScale: () => record.timeScale,
-    priceScale: () => ({ applyOptions() {} }),
+    priceScale: () => ({ applyOptions() {}, width: () => 60 }),
     panes: () => Array.from({ length: 4 }, (_, index) => ({
       setHeight() {}, setStretchFactor(factor) { record.stretch.push([index, factor]); }, paneIndex: () => index,
+      getHTMLElement: () => (index === 0 ? record.paneElement : null),
     })),
     subscribeClick() {}, unsubscribeClick() {},
     subscribeCrosshairMove(fn) { record.crosshairHandlers.push(fn); },
@@ -208,7 +210,8 @@ function paperResponse() {
              last: 3000, priceTick: 1, priceDecs: 0, open: true, reason: "", datetime: "2026-09-30 10:00:00" },
     account: { initialCash: 1000000, cash: 1000000, equity: 1000100, floatPnl: 100, margin: 4500,
                available: 995600, realizedPnl: 0, fees: 0, marginRate: 0.15 },
-    positions: [{ contract: "SHFE.fu2611", qty: 1, avgPrice: 2990, last: 3000, floatPnl: 100, margin: 4500 }],
+    positions: [{ contract: "SHFE.fu2611", qty: 1, avgPrice: 2990, last: 3000, floatPnl: 100, margin: 4500,
+                  tp: 3100, sl: null, stopError: null }],
     orders: [{ id: "O2", contract: "SHFE.fu2611", side: "sell", qty: 1, type: "limit", price: 3050,
                status: "open", createdAt: "2026-09-30 10:00:01" }],
     trades: [{ id: "T1", contract: "SHFE.fu2611", side: "buy", qty: 1, price: 2990, open: 1, close: 0,
@@ -281,19 +284,115 @@ test("合约选择器加载完成后自选状态可用(isFavorite 不踩暂时�
   assert.doesNotThrow(() => context.document.getElementById("picker-months"));
 });
 
-test("模拟交易面板加载后在 K 线上画出持仓均价与挂单价格线", async () => {
+test("模拟交易面板加载后在 K 线上画出持仓均价、止盈与挂单价格线", async () => {
   const context = runBrowser();
   // vm 里的 setTimeout 是空操作, 面板的定时轮询不会自己跑: 直接调一次它的刷新入口
   await vm.runInContext("paperPanel.refresh()", context);
   const titles = createdPriceLines.map((line) => line.title).filter(Boolean);
   assert.ok(titles.includes("多1 均价"), `应画出持仓均价线, 实际 ${JSON.stringify(titles)}`);
   assert.ok(titles.includes("卖1 挂单"), `应画出挂单价格线, 实际 ${JSON.stringify(titles)}`);
+  assert.ok(titles.includes("止盈") && !titles.includes("止损"), `只画设了的止盈线, 实际 ${JSON.stringify(titles)}`);
   assert.ok(stubCharts.length === 2 && stubCharts.every((chart) => chart.markers.length > 0),
             "两张图都应把成交标记交给图表(即使这次为空)");
   const byId = (id) => context.document.getElementById(id);
   assert.equal(byId("trade-buy").textContent, "买入 3001");
   assert.equal(byId("trade-flatten").textContent, "平仓 多1");
   assert.equal(byId("trade-buy").disabled, false);
+  // 有持仓才显示止盈止损编辑, 输入框按服务端的值回填
+  assert.equal(byId("trade-stops").hidden, false);
+  assert.equal(byId("trade-tp").value, "3100");
+  assert.equal(byId("trade-sl").value, "");
+  assert.equal(byId("trade-stops-set").textContent, "设置止盈止损");
+});
+
+test("下单时填的止盈止损随委托提交, 成功后清空; 挂单带的止盈止损列在委托下面", async () => {
+  const posts = [];
+  const fetch = (url, init) => {
+    const route = String(url).split("?")[0];
+    if (route === "/api/paper/orders" && init && init.method === "POST") {
+      const body = JSON.parse(init.body);
+      posts.push(body);
+      return Promise.resolve(jsonResponse({ id: "O3", contract: "SHFE.fu2611", side: body.side, qty: body.qty,
+                                            type: body.type, price: null, status: "filled", fillPrice: 3001,
+                                            tp: body.tp, sl: body.sl }));
+    }
+    if (route === "/api/paper") {
+      const state = paperResponse();
+      state.orders.push({ id: "O4", contract: "SHFE.fu2611", side: "buy", qty: 1, type: "limit", price: 2980,
+                          status: "open", tp: 3100, sl: 2950, createdAt: "2026-09-30 10:00:02" });
+      return Promise.resolve(jsonResponse(state));
+    }
+    return stubFetch(url);
+  };
+  const context = runBrowser({ fetch });
+  await vm.runInContext("paperPanel.refresh()", context);
+  const byId = (id) => context.document.getElementById(id);
+  const lines = byId("trade-orders").children.flatMap((item) => item.children || [])
+    .filter((child) => child.className === "trade-order-stops-line");
+  assert.deepEqual(lines.map((line) => line.textContent), ["止盈 3100 · 止损 2950"], "只有带了止盈止损的挂单多一行");
+
+  byId("trade-order-tp").value = "3100";
+  byId("trade-order-sl").value = "2950";
+  byId("trade-buy").handlers.click[0]();
+  for (let i = 0; i < 3; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts.length, 1);
+  assert.deepEqual([posts[0].side, posts[0].type, posts[0].tp, posts[0].sl], ["buy", "market", 3100, 2950]);
+  assert.equal(byId("trade-order-tp").value, "", "下单成功后清空, 不带到下一笔");
+  assert.equal(byId("trade-order-sl").value, "");
+  assert.equal(byId("trade-msg").textContent, "已成交: 买 1 @3001，止盈 3100 · 止损 2950 已挂到持仓");
+
+  // 不填就不发这两个字段; 填了非正数在页面上就拦下
+  byId("trade-sell").handlers.click[0]();
+  for (let i = 0; i < 3; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts.length, 2);
+  assert.ok(!("tp" in posts[1]) && !("sl" in posts[1]));
+  byId("trade-order-sl").value = "-1";
+  byId("trade-buy").handlers.click[0]();
+  assert.equal(posts.length, 2);
+  assert.equal(byId("trade-msg").textContent, "止盈止损价要是正数");
+});
+
+test("图上划线: 拖止盈线松手才提交(另一项沿用), 成功后按新价位重画; 双击取消", async () => {
+  const posts = [];
+  const fetch = (url, init) => {
+    if (String(url).split("?")[0] === "/api/paper/stops") {
+      const body = JSON.parse(init.body);
+      posts.push(body);
+      return Promise.resolve(jsonResponse({ contract: body.symbol, qty: 1, tp: body.tp, sl: body.sl }));
+    }
+    return stubFetch(url);
+  };
+  const context = runBrowser({ fetch });
+  await vm.runInContext("paperPanel.refresh()", context);
+  // 主图窗格 800x400(右边 60 是价格轴); 桩的 priceToCoordinate 一律给 0, coordinateToPrice(y) = 4000 + y
+  const pane = new StubElement("tr");
+  pane.getBoundingClientRect = () => ({ top: 0, left: 0, right: 800, bottom: 400, width: 800, height: 400 });
+  stubCharts[0].paneElement = pane;
+  const el = vm.runInContext("charts[0].el", context);
+  const fire = (type, extra) => {
+    const event = { button: 0, pointerId: 1, clientX: 300, target: { closest: () => null },
+                    preventDefault() { this.prevented = true; }, stopPropagation() {}, ...extra };
+    for (const handler of el.handlers[type] || []) handler(event);
+    return event;
+  };
+  const settle = async () => { for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+
+  fire("pointermove", { clientY: 2 });
+  assert.equal(el.title, "拖动修改止盈 · 双击取消", "止盈线和均价线叠在一起时先拖止盈");
+  assert.equal(fire("pointerdown", { clientY: 2, clientX: 780 }).prevented, undefined, "价格轴上不算");
+  assert.equal(fire("pointerdown", { clientY: 2 }).prevented, true, "按在线上: 不让库拿去平移");
+  fire("pointermove", { clientY: 50 });
+  assert.deepEqual(posts, [], "拖的过程中不提交");
+  fire("pointerup", { clientY: 50 });
+  await settle();
+  assert.deepEqual(posts, [{ symbol: "SHFE.fu2611", tp: 4050, sl: null }]);
+  const position = vm.runInContext("paperPanel.state().positions[0]", context);
+  assert.equal(position.tp, 4050, "成功后面板数据先改好, 不等下一次轮询");
+  assert.ok(createdPriceLines.some((line) => line.title === "止盈" && line.price === 4050), "按新价位重画止盈线");
+
+  fire("dblclick", { clientY: 0 });
+  await settle();
+  assert.deepEqual(posts[1], { symbol: "SHFE.fu2611", tp: null, sl: null });
 });
 
 test("favorites 在顶层声明完毕后才可能为真值", () => {

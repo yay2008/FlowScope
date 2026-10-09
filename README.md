@@ -109,6 +109,7 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（两张图左右并
 - **杠杆**每个合约一个（默认 10 倍，面板上选），全仓；初始保证金 = 名义金额 / 杠杆。开仓（含反手的开仓部分）要求成交后权益够付全部持仓的初始保证金，只减仓不查；降杠杆后保证金不够会被拒。
 - **手续费**按交易所最低一档：挂单 0.02%、吃单 0.05%。**资金费**到交易所公布的结算时刻，按结算前最后看到的资金费率与标记价格结算（费率为正时多头付费）；服务没开着时错过的结算不补。
 - **强平**：权益低于全部持仓的维持保证金（名义金额 × 0.5%）时，按标记价格平掉全部持仓、撤掉挂单。面板上的「强平价(估)」只按当前合约估算。浮动盈亏、保证金都按标记价格算。
+- **止盈止损**与期货账户相同（见下一节），按**最新价**触发（不是标记价格），触发后按五档盘口市价平掉全部持仓，五档吃不够就每轮重试。
 - 多所汇总不能下单（面板提示切到单个交易所的合约）。委托编号以 `C` 开头，撤单据此分到加密账户；「重置账户」带上当前合约代码，重置的是当前合约所属的那个账户。
 
 ## 模拟交易
@@ -122,7 +123,10 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（两张图左右并
 - **只在交易时段撮合**：按合约的交易时段（含跨零点的夜盘、周末休市）判断，并要求报价时间落在本时段之内（含开盘前集合竞价）—— 节假日时钟落在时段里、盘口却是上一个交易日的旧值，不能拿来成交。休市时市价单直接拒绝，限价单可以挂。
 - **资金**：开仓（含反手的开仓部分）要求成交后权益仍够付全部保证金，减仓不查。保证金按最新价 × 乘数 × **15%**（`paper.MARGIN_RATE`）估算，不分品种。手续费取 `docs/手续费最低品种排名_*.csv` 里最新的一份（由 `docs/fee_rate_ranking.py` 生成），区分开仓、平昨、平今，查不到的品种按 0 计，面板底部会注明。
 - **同一 clientId 只下一次**：页面每次点击生成一个订单号，双击或超时重发不会重复成交；下单请求超时时，结果以委托与成交记录为准。
-- **图表**：当前合约的成交以箭头标在对应 K 线上（买红、卖绿），持仓均价画实线、挂单价画虚线。
+- **止盈止损**：挂在持仓上，每个合约一对价格，在面板「持仓」下方填写后点「设置止盈止损」（留空表示不设，两个都清空再点就是取消）。最新价**碰到**就触发（多单涨到止盈价或跌到止损价，空单反之），按市价平掉全部持仓 —— 它只是触发条件，成交价是当时的对手价，跳空时会比设定价差。设置时要求止盈止损价在最新价两侧（否则一设就触发）、是最小变动价位的整数倍。只在交易时段内触发；平不掉（涨跌停没有对手盘、一档量不够）就留着、每轮重试，原因显示在持仓下方。同向加仓、减仓保留，反手或平完仓随持仓清掉。触发出来的平仓单在委托列表里写「止盈」/「止损」。由采集循环每轮检查，服务没开着的时候不会触发。
+  - **图上划线**：K 线视图里，鼠标移到止盈/止损线上变成上下箭头，按住拖到新价位松手就改好；从持仓均价线拖出来是新设一条 —— 落在最新价盈利一侧（多单在上、空单在下）的是止盈，另一侧是止损。拖的过程中线的标题显示到这个价位平仓的预估盈亏（不含手续费），松手才提交，被拒（比如拖过了最新价）就退回原价位，拖动中按 Esc 作罢；双击止盈/止损线取消它。拖线不会平移图表；超出当前可见价格范围的线看不到也拖不到，先缩放图表让它露出来。
+  - **下单时带止盈止损**：下单表单里的「止盈」「止损」框可选填，跟着委托走，成交后挂到持仓上（只覆盖填了的那一项，没填的沿用持仓原来的）；下单成功后两个框自动清空。市价单按最新价校验；限价单按委托价校验，当场成交的再按最新价校验。只减仓或平仓的委托不能带（成交后没有同方向的持仓可挂），反手的可以。挂着的限价单带的止盈止损列在委托下面，成交时才挂上；如果挂单期间持仓变了、这笔成交只是减仓，就不挂。成交时价格若已越过止损/止盈价，挂上后紧接着就会触发。
+- **图表**：当前合约的成交在对应 K 线上只标一个字母（买在下方红色 **B**、卖在上方绿色 **S**，不画箭头），持仓均价画实线、止盈止损画点线、挂单价画虚线。
 - 「重置账户」清空持仓、委托与成交，按输入的初始资金重新开始。
 
 报价是 500ms 快照，结果只能当参考：小手数基本可信，大手数、薄盘口会把成交算得太顺利。
@@ -162,7 +166,7 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（两张图左右并
 - `GET /api/symbol?symbol=KQ.m@SHFE.fu`：合约选择器按钮上显示的合约名，返回 `{"symbol", "label"}`。主连先解析出当前标的月份合约再取中文名（`KQ.m@SHFE.fu` → 「燃油2611」，随主力换月变化），月份合约直接取自身名称；查询走合约服务的静态接口（不订阅行情），名字取不到时 `label` 回退成合约代码，所以按钮上永远不会空着或报错。代码走与订阅相同的校验，非法返回 400。
 - `GET /api/symbols?exchange=SHFE&product=fu&refresh=false`：合约选择器的数据源。不带参数时返回按交易所分组的全部主连品种（`exchangeId`/`exchangeName`/`productId`/`name`/`contSymbol`/`mainSymbol`/`openInterest`，组内按主力合约昨日持仓量降序）；带 `exchange`+`product` 时额外返回该品种的未下市月份合约（`symbol`/`name`/`openInterest`/`isMain`，同样按昨日持仓量降序）。`openInterest` 是交易所口径的**昨日持仓量**，只用于排序和下拉提示，不是实时值。`source` 为 `live` 或 `fallback`，`fallback` 表示行情源不可用（此时用内置常用品种、月份为空，`error`/`monthsError` 给出原因）；`refresh=true` 跳过缓存。查询全部是静态合约查询（不订阅行情）并在采集线程执行、带超时兜底，页面不会因为合约服务慢而卡住。
 - `GET /api/paper?symbol=...`：模拟交易面板的数据：`account`（`initialCash`/`cash`/`equity`/`floatPnl`/`margin`/`available`/`realizedPnl`/`fees`/`marginRate`）、`positions`、`orders`（全部挂单 + 最近 10 笔已结束的委托）、`trades`（最近 50 笔）、`contract`（主连解析成的标的月份合约）、`quote`（该合约盘口，含 `open`/`reason` 表示能否成交）、`contractTrades`（该合约的成交，供图表标记）、`fee`（该品种费率，查不到为 `null`）。第一次看某个代码时先到合约服务确认存在；查不到在 `error` 里说明，30 秒内不再重查。
-- `POST /api/paper/orders`，JSON `{symbol, side: "buy"|"sell", qty, type: "market"|"limit", price?, clientId?}`：下单，返回委托。市价单当场成交，否则 400 并说明原因；限价单能成交就成交，否则挂单。`DELETE /api/paper/orders/{id}` 撤单；`POST /api/paper/flatten?symbol=...` 按市价平掉该合约全部持仓；`POST /api/paper/reset?cash=1000000` 重置账户（带 `&symbol=` 加密合约代码时重置的是加密账户，资金按 USDT）。加密合约另有 `POST /api/paper/leverage?symbol=...&leverage=20` 设杠杆；加密账户的 `GET /api/paper` 多出 `mode: "crypto"`、`leverage`、`fundings`，持仓带 `leverage`/`liqPrice`，账户带 `funding`，报价带五档 `bids`/`asks`、`markPrice`、`fundingRate`/`nextFundingTime` 与数量步长 `qtyStep`/`minQty`。
+- `POST /api/paper/orders`，JSON `{symbol, side: "buy"|"sell", qty, type: "market"|"limit", price?, tp?, sl?, clientId?}`：下单，返回委托（`tp`/`sl` 是成交后挂到持仓上的止盈/止损价，委托里带着）。市价单当场成交，否则 400 并说明原因；限价单能成交就成交，否则挂单。`DELETE /api/paper/orders/{id}` 撤单；`POST /api/paper/flatten?symbol=...` 按市价平掉该合约全部持仓；`POST /api/paper/stops`，JSON `{symbol, tp, sl}` 设置该合约持仓的止盈/止损价（`null` 表示不设，两个都是 `null` 就是取消；持仓里带 `tp`/`sl`，触发了却平不掉时带 `stopError`）；`POST /api/paper/reset?cash=1000000` 重置账户（带 `&symbol=` 加密合约代码时重置的是加密账户，资金按 USDT）。加密合约另有 `POST /api/paper/leverage?symbol=...&leverage=20` 设杠杆；加密账户的 `GET /api/paper` 多出 `mode: "crypto"`、`leverage`、`fundings`，持仓带 `leverage`/`liqPrice`，账户带 `funding`，报价带五档 `bids`/`asks`、`markPrice`、`fundingRate`/`nextFundingTime` 与数量步长 `qtyStep`/`minQty`。
 - `POST /api/analyze`，JSON `{symbol, label, settings, paper, charts: [{tf, image, columns, rows, events, meta}]}`：AI 看图分析（见上一节）。`charts` 1～2 张，`image` 是 PNG / JPEG / WebP 的 data URL，`rows` 的列名见 `analysis.COLUMN_NOTES`。返回 `text/event-stream`：先 `meta`（模型与思考强度），再若干 `reasoning` / `delta`（思考与结论的增量文字），最后 `done` 或 `error`（`status`/`finish`/`usage`/`elapsed`/`saved`）。请求不合法 400，没配置 `DEEPSEEK_API_KEY` 503，上一次分析还没结束 429；开始推流之后的失败走 `error` 事件。
 - `WS /ws?symbol=...&ltf=0&tf=30&footprint=false`：先注册订阅，再发送 `snapshot` 完整快照，随后发送带版本号的 `bars` 批量增量，包含最新 bar 和历史修订。`footprint=true` 还会接收 `footprints` 或 `footprint_snapshot`；两种数据分别跟踪版本号。所有消息都带 `symbol`/`tf`（`bars` 另带 `ltf`），前端据此过滤，不同周期不会互相串消息。
 - 每次 WebSocket 重连都重新同步完整快照。慢客户端队列溢出时以 1013 关闭连接，前端自动重连补齐；15 秒无业务消息时发送包含行情源状态的 `ping`。

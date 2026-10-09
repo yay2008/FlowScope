@@ -101,6 +101,10 @@
         </select></label>
         <label id="trade-price-row" hidden>价格<input id="trade-price" type="number" min="0" step="any"></label>
         <label id="trade-leverage-row" hidden title="加密合约每个合约一个杠杆(全仓); 降杠杆后保证金不够会被拒">杠杆<select id="trade-leverage"></select></label>
+        <div class="trade-order-stops" title="可选, 留空表示不设。成交后挂到持仓上(只覆盖填了的那一项), 按最新价触发后市价平掉全部持仓。市价单按最新价校验, 限价单按委托价校验; 只减仓、平仓的委托不能带。下单成功后清空">
+          <label>止盈<input id="trade-order-tp" type="number" min="0" step="any" placeholder="不设"></label>
+          <label>止损<input id="trade-order-sl" type="number" min="0" step="any" placeholder="不设"></label>
+        </div>
       </div>
       <div class="trade-actions">
         <button id="trade-buy" class="trade-buy" title="市价: 按卖一价整笔成交; 限价: 卖一不高于限价就立即成交, 否则挂单">买入</button>
@@ -110,6 +114,12 @@
       <div id="trade-msg" class="trade-msg"></div>
       <div class="trade-section">持仓</div>
       <div id="trade-position" class="trade-grid"></div>
+      <div id="trade-stops" class="trade-stops" hidden title="按最新价触发: 多单最新价涨到止盈价或跌到止损价(空单反之)就按市价平掉全部持仓; 留空表示不设。也可以在 K 线上划线: 拖止盈/止损线改价, 从持仓均价线拖出新设, 双击线取消">
+        <label>止盈<input id="trade-tp" type="number" min="0" step="any" placeholder="不设"></label>
+        <label>止损<input id="trade-sl" type="number" min="0" step="any" placeholder="不设"></label>
+        <button id="trade-stops-set">设置止盈止损</button>
+        <div id="trade-stops-note" class="trade-stops-note"></div>
+      </div>
       <div class="trade-section">账户</div>
       <div id="trade-account" class="trade-grid"></div>
       <div class="trade-section">委托</div>

@@ -197,6 +197,8 @@ body { display: flex; flex-direction: column; }
   min-height: 0;
 }
 .chart-view + .chart-view { border-left: 1px solid #2a2e39; }
+/* 划线止盈止损: 鼠标在能拖的线上(或正拖着)时换成上下箭头; 库在自己的元素上写了内联光标, 要 !important 才盖得住 */
+.chart-view.paper-drag, .chart-view.paper-drag * { cursor: ns-resize !important; }
 
 /* 每张图的左上角(也就是主图窗格的左上角): 周期下拉框, 下面挂主图指标图例。
    容器不挡十字光标, 只有下拉框和图例的每一行接收鼠标(选周期、悬停看说明、点眼睛) */
@@ -462,7 +464,7 @@ button.ml-params:disabled, .ml-toggle:disabled { cursor: default; }
 .trade-form { display: flex; flex-wrap: wrap; gap: 6px 8px; padding: 8px 0 6px; }
 .trade-form label { display: flex; align-items: center; gap: 4px; color: #9598a1; }
 .trade-form label[hidden] { display: none; }
-.trade-form input, .trade-form select {
+.trade-form input, .trade-form select, .trade-stops input {
   background: #131722;
   color: #d1d4dc;
   border: 1px solid #2a2e39;
@@ -473,9 +475,11 @@ button.ml-params:disabled, .ml-toggle:disabled { cursor: default; }
 #trade-qty { width: 52px; }
 #trade.crypto #trade-qty { width: 84px; }   /* 加密合约的数量是小数的币 */
 #trade-price { width: 96px; }
+/* 下单时带的止盈止损: 表单里单独一整行, 两个框平分 */
+.trade-order-stops { width: 100%; display: flex; gap: 8px; }
 
 .trade-actions { display: flex; gap: 6px; }
-.trade-actions button, .trade-flatten, .trade-foot button, .trade-cancel {
+.trade-actions button, .trade-flatten, .trade-foot button, .trade-cancel, .trade-stops button {
   border: none;
   border-radius: 4px;
   cursor: pointer;
@@ -494,6 +498,16 @@ button.ml-params:disabled, .ml-toggle:disabled { cursor: default; }
 .trade-msg { min-height: 16px; padding: 4px 0 0; color: #9598a1; word-break: break-all; }
 .trade-msg.ok { color: #66bb6a; }
 .trade-msg.error { color: #f7525f; }
+
+/* 止盈止损: 持仓下方两个价格框 + 设置按钮, 当前合约有持仓才显示 */
+.trade-stops { display: flex; flex-wrap: wrap; gap: 6px 8px; padding-top: 6px; }
+.trade-stops[hidden] { display: none; }
+.trade-stops label, .trade-order-stops label { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; color: #9598a1; }
+.trade-stops input, .trade-order-stops input { flex: 1; min-width: 0; width: 0; }
+.trade-stops button { width: 100%; padding: 4px; background: #363c4e; }
+.trade-stops button:hover:not(:disabled) { background: #434a60; }
+.trade-stops-note { width: 100%; color: #f7525f; word-break: break-all; }
+.trade-stops-note:empty { display: none; }
 
 .trade-section {
   margin-top: 8px;
@@ -515,6 +529,8 @@ button.ml-params:disabled, .ml-toggle:disabled { cursor: default; }
 .trade-list li { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
 .trade-list li > span:nth-child(2) { flex: 1; text-align: right; }
 .trade-list li.done { opacity: 0.6; }
+.trade-list li.with-stops { flex-wrap: wrap; }
+.trade-order-stops-line { width: 100%; padding-left: 1em; color: #9598a1; font-size: 11px; }
 .trade-cancel { background: #363c4e; padding: 0 6px; }
 .trade-cancel:hover { background: #434a60; }
 

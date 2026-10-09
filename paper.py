@@ -24,6 +24,12 @@
 - 只在交易时段内、且报价是本时段的才撮合: 节假日没有新报价, 旧报价不能拿来成交。
 - 净持仓: 每个合约只有一个带符号的手数, 反向成交先平后开(反手)。平仓先平昨再平今。
 - 保证金按 ``MARGIN_RATE`` 乘最新价估算; 手续费来自 docs/ 下的手续费率表, 查不到按 0 计。
+- 止盈止损挂在持仓上(每个合约一对价格): 最新价**碰到**就按市价平掉全部持仓(碰到即触发: 它只是
+  触发条件, 成交价是对手价); 平不掉(涨跌停没有对手盘、一档量不够)就留着, 每轮重试。同向加减仓
+  保留, 反手或平完仓随持仓清掉。加密账户(paper_crypto.py)共用这里的校验与触发判断。
+- 下单时也能带止盈止损: 成交后挂到持仓上(只覆盖填了的那一项), 只减仓或平仓的委托不能带。
+  市价单按最新价校验; 限价单按委托价校验, 当场成交的再按最新价校验。挂着的限价单成交时价格若已经
+  越过止损/止盈价, 成交后紧接着就会触发 —— 和交易所的"成交后生效"一样。
 """
 from __future__ import annotations
 
@@ -274,14 +280,96 @@ def normalize_request(raw) -> dict:
         if price is None:
             raise OrderError("限价单要填价格")
     return {"symbol": symbol, "side": side, "type": kind, "qty": int(qty), "price": price,
+            "tp": normalize_stop(raw.get("tp"), "tp"), "sl": normalize_stop(raw.get("sl"), "sl"),
             "clientId": str(raw.get("clientId") or "")[:64]}
+
+
+def snap_to_tick(price: float, tick: float) -> float:
+    """价格要是最小变动价位的整数倍; 返回抹掉浮点尾数的价格。"""
+    steps = price / tick
+    if abs(steps - round(steps)) > 1e-6:
+        raise OrderError(f"价格要是最小变动价位 {tick:g} 的整数倍")
+    return round(round(steps) * tick, 10)
+
+
+STOP_LABELS = {"tp": "止盈", "sl": "止损"}
+
+
+def normalize_stop(value, kind: str) -> float | None:
+    """页面提交的止盈/止损价: null 或空串表示不设(取消), 其余必须是正数。"""
+    if value is None or value == "":
+        return None
+    price = None if isinstance(value, bool) else _price(value)
+    if price is None:
+        raise OrderError(f"{STOP_LABELS[kind]}价要是正数")
+    return price
+
+
+def check_stops(qty, tp: float | None, sl: float | None, last: float | None, basis: str = "最新价"):
+    """止盈止损价要在最新价(或限价单的委托价)两侧: 多单止盈在上、止损在下, 空单反之 —— 否则一设就触发。"""
+    if last is None:
+        raise OrderError("还没有最新价, 稍后再设")
+    long = qty > 0
+    side = "多" if long else "空"
+    if tp is not None and (tp <= last if long else tp >= last):
+        raise OrderError(f"{side}单止盈价要{'高' if long else '低'}于{basis} {last:.10g}")
+    if sl is not None and (sl >= last if long else sl <= last):
+        raise OrderError(f"{side}单止损价要{'低' if long else '高'}于{basis} {last:.10g}")
+
+
+def stop_hit(position: dict, last: float | None) -> str | None:
+    """最新价碰到止损价回 ``"sl"``, 碰到止盈价回 ``"tp"``, 都没碰到回 None。"""
+    if last is None:
+        return None
+    long = position["qty"] > 0
+    sl, tp = position.get("sl"), position.get("tp")
+    if sl is not None and (last <= sl if long else last >= sl):
+        return "sl"
+    if tp is not None and (last >= tp if long else last <= tp):
+        return "tp"
+    return None
+
+
+def keep_stops(old: dict, new: dict):
+    """成交后的新持仓与原持仓同向(加仓/减仓)就沿用止盈止损; 新开仓、反手、平完都不带。"""
+    if new["qty"] and old.get("qty") and (new["qty"] > 0) == (old["qty"] > 0):
+        new.update({key: old[key] for key in STOP_LABELS if old.get(key) is not None})
+
+
+def order_stops(request: dict, held, quote: dict, limit: float | None, fills_now: bool) -> dict:
+    """下单时带的止盈止损: 对齐最小变动价位并按委托方向校验, 返回要记在委托上的 ``{"tp", "sl"}``(没填的不在里面)。
+
+    ``held`` 是下单前的持仓(带符号)。只减仓或平仓的委托不能带: 成交后没有同向的持仓可挂。
+    限价单(``limit``)按委托价校验; 当场成交的(``fills_now``, 含市价单)再按最新价校验, 免得一成交就触发。
+    """
+    stops = {key: request.get(key) for key in STOP_LABELS if request.get(key) is not None}
+    if not stops:
+        return {}
+    signed = request["qty"] if request["side"] == "buy" else -request["qty"]
+    if held and (held > 0) != (signed > 0) and abs(signed) <= abs(held) + 1e-9:
+        raise OrderError("这笔委托只减仓或平仓, 不能带止盈止损")
+    stops = {key: snap_to_tick(value, quote["priceTick"]) for key, value in stops.items()}
+    if limit is not None:
+        check_stops(signed, stops.get("tp"), stops.get("sl"), limit, "委托价")
+    if fills_now:
+        check_stops(signed, stops.get("tp"), stops.get("sl"), quote.get("last"))
+    return stops
+
+
+def attach_stops(order: dict, position: dict):
+    """委托带的止盈止损在成交后挂到持仓上, 只覆盖委托填了的那一项。
+
+    只在成交后的持仓与委托同向(开仓、加仓、反手)时挂: 挂单期间持仓变了、这笔成交只是减仓的, 不挂。
+    """
+    if position["qty"] and (position["qty"] > 0) == (order["side"] == "buy"):
+        position.update({key: order[key] for key in STOP_LABELS if order.get(key) is not None})
 
 
 class PaperBook:
     """模拟账户的全部状态与规则(纯逻辑: 不加锁、不读写文件、不碰 SDK)。
 
     ``cash`` 是静态权益 = 初始资金 + 平仓盈亏 - 手续费; 动态权益再加各持仓的浮动盈亏。
-    持仓的 ``todayQty`` 是其中今天开的手数(算平今手续费用), 换交易日时清零。
+    持仓的 ``todayQty`` 是其中今天开的手数(算平今手续费用), 换交易日时清零; ``tp``/``sl`` 是止盈/止损价(没设就没有这个键)。
     """
 
     def __init__(self, state: dict | None = None, fees: FeeTable | None = None):
@@ -297,6 +385,7 @@ class PaperBook:
         self.seq = int(state.get("seq", 0))
         self.fees = fees if fees is not None else FeeTable()
         self.marks: dict[str, float] = {}   # 合约 -> 最新价(只在内存里, 重启后等报价补上)
+        self.stop_errors: dict[str, str] = {}   # 合约 -> 止盈止损触发了却平不掉的原因(只在内存里)
 
     def to_dict(self) -> dict:
         return {"version": STORE_VERSION, "initialCash": self.initial_cash, "cash": self.cash,
@@ -340,6 +429,8 @@ class PaperBook:
             # 够得着对手价就按对手价成交(可能比限价更好); 否则挂着等价格穿过限价。
             price = opposite if open_now and crosses and (volume or 0) >= qty else None
             self._check_funds(quote["contract"], side, qty, order["price"] if price is None else price, quote, now)
+        held = (self.positions.get(quote["contract"]) or {}).get("qty", 0)
+        order.update(order_stops(request, held, quote, order["price"], price is not None))
         order["id"] = self._next_id("O")
         self.orders.append(order)
         if price is not None:
@@ -393,6 +484,49 @@ class PaperBook:
             if last is not None:
                 self.marks[contract] = last
 
+    def set_stops(self, contract: str, tp: float | None, sl: float | None, quote: dict | None) -> dict:
+        """设置持仓的止盈/止损价, None 表示不设; 两个都是 None 就是取消。返回持仓。"""
+        position = self.positions.get(contract)
+        if not position:
+            raise OrderError("这个合约没有持仓")
+        if tp is not None or sl is not None:
+            if quote is None or not quote.get("priceTick"):
+                raise OrderError("行情未就绪, 稍后再试")
+            tp, sl = (None if value is None else snap_to_tick(value, quote["priceTick"]) for value in (tp, sl))
+            check_stops(position["qty"], tp, sl, quote.get("last"))
+        for key, value in (("tp", tp), ("sl", sl)):
+            if value is None:
+                position.pop(key, None)
+            else:
+                position[key] = value
+        self.stop_errors.pop(contract, None)
+        return position
+
+    def trigger_stops(self, quotes: dict, now: datetime) -> list[dict]:
+        """最新价碰到止盈/止损价的持仓按市价全部平掉; 返回平仓委托。
+
+        只在交易时段内触发; 平不掉(涨跌停没有对手盘、一档量不够)就留着, 下一轮再试,
+        原因记在 ``stop_errors`` 里给面板显示。
+        """
+        placed = []
+        for contract, position in list(self.positions.items()):
+            quote = quotes.get(contract)
+            kind = stop_hit(position, quote and quote.get("last"))
+            if kind is None:
+                self.stop_errors.pop(contract, None)
+                continue
+            if not market_status(quote, now)[0]:
+                continue
+            try:
+                order = self.flatten(contract, quote, now)
+            except OrderError as exc:
+                self.stop_errors[contract] = f"{STOP_LABELS[kind]}已触发, 平仓未成交: {exc}"
+                continue
+            order["reason"] = STOP_LABELS[kind]
+            self.stop_errors.pop(contract, None)
+            placed.append(order)
+        return placed
+
     # ---------- 规则 ----------
 
     @staticmethod
@@ -420,11 +554,7 @@ class PaperBook:
 
     @staticmethod
     def _check_limit_price(price: float, quote: dict) -> float:
-        tick = quote["priceTick"]
-        steps = price / tick
-        if abs(steps - round(steps)) > 1e-6:
-            raise OrderError(f"价格要是最小变动价位 {tick:g} 的整数倍")
-        price = round(round(steps) * tick, 10)
+        price = snap_to_tick(price, quote["priceTick"])
         if quote.get("upper") is not None and price > quote["upper"]:
             raise OrderError(f"价格高于涨停价 {quote['upper']:g}")
         if quote.get("lower") is not None and price < quote["lower"]:
@@ -460,6 +590,7 @@ class PaperBook:
         fee = self.fees.fee(contract, price, multiplier, opening, close_yesterday, close_today)
         position = {"qty": new_qty, "avgPrice": new_avg, "multiplier": multiplier,
                     "todayQty": today, "tradingDay": day.isoformat()}
+        keep_stops(old, position)
         return position, realized, fee, opening, closing
 
     def _check_funds(self, contract: str, side: str, qty: int, price: float, quote: dict, now: datetime):
@@ -484,6 +615,7 @@ class PaperBook:
         signed = order["qty"] if order["side"] == "buy" else -order["qty"]
         position, realized, fee, opening, closing = self._preview(
             order["contract"], signed, price, quote["multiplier"], day)
+        attach_stops(order, position)
         if position["qty"]:
             self.positions[order["contract"]] = position
         else:
@@ -531,7 +663,9 @@ class PaperBook:
             positions.append({"contract": contract, "qty": position["qty"],
                               "avgPrice": position["avgPrice"], "todayQty": position.get("todayQty", 0),
                               "last": self.marks.get(contract), "floatPnl": round(float_pnl, 2),
-                              "margin": round(margin, 2)})
+                              "margin": round(margin, 2), "multiplier": position["multiplier"],
+                              "tp": position.get("tp"), "sl": position.get("sl"),
+                              "stopError": self.stop_errors.get(contract)})
         equity = self.cash + float_total
         return {"account": {"initialCash": self.initial_cash, "cash": round(self.cash, 2),
                             "equity": round(equity, 2), "floatPnl": round(float_total, 2),
@@ -642,6 +776,20 @@ class PaperService:
             self._save(book)
             return order
 
+    def set_stops(self, symbol: str, tp, sl) -> dict:
+        """设置持仓的止盈/止损价(主连按当前标的月份)。
+
+        用采集循环刷新的报价快照校验, 不排进采集线程: 有持仓的合约每轮都在跟踪。
+        """
+        value = validate_symbol(symbol)
+        tp, sl = normalize_stop(tp, "tp"), normalize_stop(sl, "sl")
+        with self._lock:
+            book = self._book_now()
+            contract = self._aliases.get(value, value)
+            position = book.set_stops(contract, tp, sl, self._quotes.get(contract))
+            self._save(book)
+            return {"contract": contract, "qty": position["qty"], "tp": position.get("tp"), "sl": position.get("sl")}
+
     # ---------- 采集线程里执行的部分 ----------
 
     def _ref(self, api, symbol: str):
@@ -722,7 +870,7 @@ class PaperService:
         self._resolve(api, symbol)
 
     def on_loop(self, api):
-        """采集线程每轮 wait_update 之后调用: 刷新在看/持仓/挂单合约的报价, 撮合挂单。
+        """采集线程每轮 wait_update 之后调用: 刷新在看/持仓/挂单合约的报价, 撮合挂单, 检查止盈止损。
 
         页面在看的代码由 track 任务确认过存在, 下单时成交的合约来自 TqSdk 自己的报价;
         只有从账户文件读回来、本进程还没确认过的合约才在这里查一次合约服务(查不到就隔
@@ -750,7 +898,10 @@ class PaperService:
             # 重新取账户: 读报价期间可能有人重置了账户, 不能拿旧账户撮合再把它写回文件。
             book = self._book_now()
             book.mark(self._quotes)
-            if book.match(self._quotes, self._clock()):
+            now = self._clock()
+            matched = book.match(self._quotes, now)
+            stopped = book.trigger_stops(self._quotes, now)
+            if matched or stopped:
                 self._save(book)
 
     # ---------- HTTP 层调用 ----------

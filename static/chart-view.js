@@ -504,7 +504,7 @@
    */
   function create({ host, tf, symbol, settings, shown: initialShown, onStatus = noop, onSuiteSetting = noop,
                     onConfig = noop, onShownChange = noop, onBandK = noop, onCrosshair = noop,
-                    onRangeChange = noop, onTfChange = noop }) {
+                    onRangeChange = noop, onTfChange = noop, onPaperStops = noop }) {
     let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
     let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
     let derived = null;   // 派生数组(rolling sma/zscore 等)
@@ -752,14 +752,15 @@
     // 窗格名: 下标 -> 名称, 截图时照样补画(见 screenshot)
     const PANE_LABELS = [[1, "FlowMeter"], ...(lwPane ? [[2, "FlowWave"]] : [])];
 
-    // 模拟交易叠加: 成交标记(买红上箭头 / 卖绿下箭头, 带「买1 / 卖1」文字)与持仓均价、挂单价格线, 挂在 K 线上。
-    // 数据来自页面右侧交易面板的轮询, 由页面通过 setPaperState 交进来。
+    // 模拟交易叠加: 成交标记(买在下方红色「B」/ 卖在上方绿色「S」, 不画箭头)与持仓均价、止盈止损、挂单价格线, 挂在 K 线上。
+    // 数据来自页面右侧交易面板的轮询, 由页面通过 setPaperState 交进来。止盈止损线可以拖(划线, 见「划线止盈止损」)。
     const candleMarkers = LightweightCharts.createSeriesMarkers(candleSeries, []);
     let paperMarkerList = [];
     let candleMarkerKey = "";
     let paperState = null;
     let paperLineKey = "";
     let paperLines = [];
+    let paperLineSpecs = [];   // 与 paperLines 一一对应的 PaperPanel.priceLines 条目(划线按 kind 找线)
 
     // 库的 markers 插件把标记时间换算成时间轴上的序号缓存起来, 只在 K 线数据变动后的下一次视图刷新时重算;
     // 而 setData 每设一条 series 就同步刷新一次视图。renderAll 逐条 setData 的中途, 后面的 series 还留着
@@ -1190,16 +1191,139 @@
       if (!paperState) return;
       paperMarkerList = PaperPanel.buildMarkers(paperState.contractTrades, bars);
       applyCandleMarkers();
+      if (paperDrag || paperSaving) return;   // 正在划线或等提交结果: 线归划线代码管, 完了再按数据重画
       const lines = PaperPanel.priceLines(paperState);
       const lineKey = JSON.stringify(lines);
       if (lineKey === paperLineKey) return;
       paperLines.forEach((line) => candleSeries.removePriceLine(line));
       paperLines = lines.map((line) => candleSeries.createPriceLine({
         price: line.price, color: line.color, title: line.title, lineWidth: 1, axisLabelVisible: true,
-        lineStyle: line.style === "dashed" ? LightweightCharts.LineStyle.Dashed : LightweightCharts.LineStyle.Solid,
+        lineStyle: line.style === "dashed" ? LightweightCharts.LineStyle.Dashed
+          : line.style === "dotted" ? LightweightCharts.LineStyle.Dotted : LightweightCharts.LineStyle.Solid,
       }));
+      paperLineSpecs = lines;
       paperLineKey = lineKey;
     }
+
+    // ---------- 划线止盈止损 ----------
+    // 当前合约有持仓时(K 线视图): 止盈/止损线按住上下拖动改价; 从持仓均价线拖出来是新设 —— 落在最新价
+    // 盈利一侧的是止盈、另一侧是止损(见 PaperPanel.dragLine); 双击止盈/止损线取消。拖的过程中线跟着鼠标走,
+    // 标题显示到这个价位平仓的预估盈亏; 松手才提交(交给页面 onPaperStops, 被拒就按原数据画回去), 拖动中按 Esc 作罢。
+    // 按下时 preventDefault: 浏览器就不再补发 mousedown/mousemove, 库(只听鼠标事件)收不到, 不会把这次拖动
+    // 当成平移图表; 再在捕获阶段截住不往下传, 测量工具也不会把它当成一次点击。
+    const DRAG_HIT_PX = 6;
+    const DRAG_TIPS = { tp: "拖动修改止盈 · 双击取消", sl: "拖动修改止损 · 双击取消",
+                        avg: "从均价线拖出新设止盈止损：拖到最新价盈利一侧是止盈，另一侧是止损" };
+    let paperDrag = null;      // 按住的线 {from, pointerId, startY, rect, target}; target 是拖到的位置, 还没拖动时为 null
+    let paperSaving = false;   // 已松手、在等提交结果: 线停在松手的位置
+    let paperTempLine = null;  // 从均价线拖出来的那条临时线
+    let paperHover = "";
+
+    // 鼠标在哪条能拖的线上: 只认主图窗格(不含价格轴), 止盈止损优先于均价线; 测量中、足迹图、左上角控件上都不算
+    function paperHit(event) {
+      if (!paperState || settings.view === "footprint" || measurePhase === "armed" || measurePhase === "drawing") return null;
+      if (event.target && event.target.closest && event.target.closest(".chart-corner")) return null;
+      let paneEl = null;
+      try { paneEl = chart.panes()[0].getHTMLElement(); } catch (e) { return null; }
+      if (!paneEl) return null;
+      const rect = paneEl.getBoundingClientRect();
+      const x = event.clientX - rect.left, y = event.clientY - rect.top;
+      if (x < 0 || x > rect.width - chart.priceScale("right").width() || y < 0 || y > rect.height) return null;
+      const near = PaperPanel.dragTargets(paperState)
+        .map((target) => ({ from: target.from, distance: Math.abs((candleSeries.priceToCoordinate(target.price) ?? Infinity) - y) }))
+        .filter((item) => item.distance <= DRAG_HIT_PX)
+        .sort((a, b) => (a.from === "avg") - (b.from === "avg") || a.distance - b.distance);
+      return near.length ? { from: near[0].from, rect } : null;
+    }
+
+    function setPaperHover(from) {
+      if (from === paperHover) return;
+      paperHover = from;
+      el.classList.toggle("paper-drag", !!from);   // 光标换成上下箭头(style.css)
+      el.title = DRAG_TIPS[from] || "";
+    }
+
+    // 拖动中的线: 改的是止盈/止损就挪原来那条, 从均价线拖出来的另画一条临时线
+    function showDragTarget(target) {
+      const options = { price: target.price, color: target.color, title: target.title };
+      const index = paperDrag.from === "avg" ? -1 : paperLineSpecs.findIndex((line) => line.kind === paperDrag.from);
+      if (index >= 0) paperLines[index].applyOptions(options);
+      else if (paperTempLine) paperTempLine.applyOptions(options);
+      else paperTempLine = candleSeries.createPriceLine({ ...options, lineWidth: 1, axisLabelVisible: true,
+                                                          lineStyle: LightweightCharts.LineStyle.Dotted });
+    }
+
+    // 拖完(提交完或作罢): 去掉临时线, 按面板数据重画全部价格线(提交成功时面板已经把新价位写进数据)
+    function resetPaperLines() {
+      if (paperTempLine) {
+        candleSeries.removePriceLine(paperTempLine);
+        paperTempLine = null;
+      }
+      paperLineKey = "";
+      renderPaperOverlays();
+    }
+
+    function commitPaperStops(change) {
+      paperSaving = true;
+      Promise.resolve()
+        .then(() => onPaperStops(change))
+        .catch(() => {})
+        .finally(() => {
+          paperSaving = false;
+          resetPaperLines();
+        });
+    }
+
+    el.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || paperDrag || paperSaving) return;
+      const hit = paperHit(event);
+      if (!hit) return;
+      event.preventDefault();
+      event.stopPropagation();
+      try { el.setPointerCapture(event.pointerId); } catch (e) { /* 没有捕获也能拖, 只是移出图表后收不到 */ }
+      paperDrag = { from: hit.from, pointerId: event.pointerId, startY: event.clientY, rect: hit.rect, target: null };
+    }, true);
+    el.addEventListener("pointermove", (event) => {
+      if (!paperDrag) {
+        if (!paperSaving) setPaperHover(paperHit(event)?.from || "");
+        return;
+      }
+      if (event.pointerId !== paperDrag.pointerId) return;
+      event.stopPropagation();
+      if (!paperDrag.target && Math.abs(event.clientY - paperDrag.startY) <= 3) return;   // 手抖不算拖
+      const y = Math.min(Math.max(event.clientY - paperDrag.rect.top, 0), paperDrag.rect.height);
+      const target = PaperPanel.dragLine(paperState, paperDrag.from, candleSeries.coordinateToPrice(y));
+      if (!target) return;
+      paperDrag.target = target;
+      showDragTarget(target);
+    }, true);
+    el.addEventListener("pointerup", (event) => {
+      if (!paperDrag || event.pointerId !== paperDrag.pointerId) return;
+      event.stopPropagation();
+      const target = paperDrag.target;
+      paperDrag = null;
+      if (target) commitPaperStops({ [target.kind]: target.price });   // 只是点了一下(没拖)什么都不做
+    }, true);
+    const abandonPaperDrag = () => {
+      if (!paperDrag) return;
+      const moved = !!paperDrag.target;
+      paperDrag = null;
+      if (moved) resetPaperLines();
+    };
+    el.addEventListener("pointercancel", abandonPaperDrag, true);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") abandonPaperDrag();
+    });
+    el.addEventListener("pointerleave", () => {
+      if (!paperDrag) setPaperHover("");
+    });
+    el.addEventListener("dblclick", (event) => {
+      const hit = paperDrag || paperSaving ? null : paperHit(event);
+      if (!hit || hit.from === "avg") return;
+      event.preventDefault();
+      event.stopPropagation();
+      commitPaperStops({ [hit.from]: null });
+    }, true);
 
     // ---------- 足迹图视图切换与数据 ----------
 

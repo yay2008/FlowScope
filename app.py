@@ -318,10 +318,10 @@ async def paper_state(symbol: str = DEFAULT_SYMBOL):
 
 @app.post("/api/paper/orders")
 async def paper_order(order: dict = Body(...)):
-    """下单: ``{symbol, side: buy|sell, qty, type: market|limit, price?, clientId?}``。
+    """下单: ``{symbol, side: buy|sell, qty, type: market|limit, price?, tp?, sl?, clientId?}``。
 
     市价单当场成交或返回 400(对手盘不够、不在交易时段等); 限价单够得着就成交, 否则挂单。
-    同一个 clientId 只下一次, 页面双击或超时重发不会重复成交。
+    同一个 clientId 只下一次, 页面双击或超时重发不会重复成交。tp/sl 是成交后挂到持仓上的止盈/止损价。
     加密合约的数量是小数的币, 按五档盘口撮合(见 paper_crypto.py)。
     """
     try:
@@ -350,6 +350,24 @@ async def paper_flatten(symbol: str):
         if crypto_feed.is_crypto(symbol):
             return crypto_paper.flatten(symbol)
         return await paper.flatten(symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/paper/stops")
+def paper_stops(body: dict = Body(...)):
+    """设置持仓的止盈止损: ``{symbol, tp, sl}``, 价格为 null 表示不设, 两个都是 null 就是取消。
+
+    按最新价触发, 触发后市价平掉全部持仓(规则见 paper.py)。止盈止损价要在最新价两侧,
+    否则 400; 主连按当前标的月份合约的持仓。
+    """
+    try:
+        if not isinstance(body, dict):
+            raise ValueError("请求格式不对")
+        symbol = str(body.get("symbol") or "")
+        if crypto_feed.is_crypto(symbol):
+            return crypto_paper.set_stops(symbol, body.get("tp"), body.get("sl"))
+        return paper.set_stops(symbol, body.get("tp"), body.get("sl"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
