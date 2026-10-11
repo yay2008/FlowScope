@@ -1,4 +1,4 @@
-/* 指标计算: 滚动统计、Volume Suite 阈值分档、LSMA × CRVOL 共振、FlowWave 回归通道。
+/* 指标计算: 滚动统计、Volume Suite 阈值分档、LSMA × CRVOL 共振、FlowWave 回归通道、固定范围成交量分布。
  *
  * 纯函数, 不碰 DOM 与图表, 浏览器与 Node 回归测试共用(与 data-sync.js 同样的写法)。
  * 状态(bars / cfg / threshtype / 带宽 k)全部由调用方传入, 模块内不留全局状态。
@@ -305,10 +305,116 @@
     return 0;
   }
 
+  // ---------- 固定范围成交量分布(Fixed Range Volume Profile) ----------
+  // 口径同 TradingView 的 FRVP: 区间内的价格从最低到最高切成若干行(默认 24 行), 每根 K 线的成交量按它的
+  // 最低-最高价均匀摊进各行。TradingView 用小周期 K 线、按阴阳分上涨/下跌量; 这里直接用本图的 K 线(周期越大
+  // 价位分布越粗), 方向用逐笔判出的主动买/卖量, 判不出方向的部分(期货的未知量、没有买卖量的 bar)记为未知。
+  // 给了价格步长 step(最小价位)时按价位格子算: 一根 bar 覆盖最低到最高之间的每个价位, 每个价位分到一样多的量;
+  // 每行是整数个价位(同 TradingView 按最小变动价位取整), 每行几个价位取「实际行数离要求的行数更近」的那个,
+  // 所以实际行数可能和要求的差一两行。没给 step 时按连续价格均匀切。
+  // POC = 总量最多的行(并列取离中间近的, 再并列取上面的)。价值区按 TradingView 文档的步骤: 从 POC 开始,
+  // 每次比较上下两侧紧挨着的下一行, 取量大的(相等取离 POC 近的, 再相等取上面的); 加上它会超过目标量
+  // (总量 × 70%)就停, 所以价值区的量不超过目标量。一侧到头了只看另一侧。
+  const VP = { rowOptions: [12, 24, 48, 96], rowsDefault: 24, valueArea: 0.7 };
+
+  // bars[from..to](含两端)的成交量分布; 区间里没有 bar 时返回 null。
+  // 行按价格升序: {lo, hi, price, buy, sell, unknown, total}, lo/hi 是行的上下沿(画图用), price 是行中间的价格。
+  // poc / vaLow / vaHigh 是行下标; pocPrice 是 POC 行中间的价格, vah / val 是价值区最高 / 最低的价位。
+  function volumeProfile(bars, from, to, { rows = VP.rowsDefault, valueArea = VP.valueArea, step = 0 } = {}) {
+    const first = Math.max(from, 0), last = Math.min(to, bars.length - 1);
+    let top = -Infinity, bottom = Infinity;
+    for (let i = first; i <= last; i++) {
+      const b = bars[i];
+      if (!Number.isFinite(b.high) || !Number.isFinite(b.low)) continue;
+      top = Math.max(top, b.high);
+      bottom = Math.min(bottom, b.low);
+    }
+    if (!(top >= bottom)) return null;
+    // 统一换成「格」坐标: 有 step 时一个价位 p 占 [p/step - 0.5, p/step + 0.5], 一根 bar 就是一段连续区间,
+    // 与行求重叠长度就等于数价位; 没有 step 时就是价格本身。
+    const unit = step > 0 ? step : 1;
+    const pad = step > 0 ? 0.5 : 0;
+    const toUnit = (p) => (step > 0 ? Math.round(p / step) : p);
+    const base = toUnit(bottom) - pad;
+    const span = toUnit(top) + pad - base;
+    let height;
+    if (step > 0) {
+      const k1 = Math.max(Math.floor(span / rows), 1), k2 = k1 + 1;
+      height = Math.abs(Math.ceil(span / k2) - rows) < Math.abs(Math.ceil(span / k1) - rows) ? k2 : k1;
+    } else {
+      height = span / rows;
+    }
+    const n = height > 0 ? Math.ceil(span / height - 1e-9) : 1;
+    const out = Array.from({ length: n }, (_, j) => {
+      const lo = (base + j * height) * unit, hi = (base + (j + 1) * height) * unit;
+      return { lo, hi, price: (lo + hi) / 2, buy: 0, sell: 0, unknown: 0, total: 0 };
+    });
+    const rowOf = (u) => Math.min(Math.max(height > 0 ? Math.floor((u - base) / height) : 0, 0), n - 1);
+    let count = 0;
+    for (let i = first; i <= last; i++) {
+      const b = bars[i];
+      const volume = b.volume;
+      if (!(volume > 0) || !Number.isFinite(b.high) || !Number.isFinite(b.low)) continue;
+      count += 1;
+      // 主动买/卖占这根量的比例; 买卖量之和比成交量还大(取整误差)时按买卖量之和算, 没有未知量
+      const buy = buyOf(b), sell = sellOf(b);
+      const known = Number.isFinite(buy) && Number.isFinite(sell) ? buy + sell : 0;
+      const whole = Math.max(volume, known);
+      const buyShare = known ? buy / whole : 0, sellShare = known ? sell / whole : 0;
+      const add = (j, v) => {
+        const row = out[j];
+        row.buy += v * buyShare;
+        row.sell += v * sellShare;
+        row.unknown += v * (1 - buyShare - sellShare);
+        row.total += v;
+      };
+      const a = toUnit(b.low) - pad, z = toUnit(b.high) + pad;
+      if (z <= a) {           // 没有 step 时最高 = 最低: 整根落进那一行
+        add(rowOf(a), volume);
+        continue;
+      }
+      for (let j = rowOf(a), jEnd = rowOf(z - 1e-9 * (z - a)); j <= jEnd; j++) {
+        const overlap = Math.min(z, base + (j + 1) * height) - Math.max(a, base + j * height);
+        if (overlap > 0) add(j, volume * overlap / (z - a));
+      }
+    }
+    let total = 0, buy = 0, sell = 0, maxTotal = 0, poc = 0;
+    const middle = (n - 1) / 2;
+    for (let j = 0; j < n; j++) {
+      const row = out[j];
+      total += row.total;
+      buy += row.buy;
+      sell += row.sell;
+      if (row.total > maxTotal ||
+          (row.total === maxTotal && Math.abs(j - middle) <= Math.abs(poc - middle))) {
+        maxTotal = row.total;
+        poc = j;
+      }
+    }
+    // 价值区: 从 POC 往两侧扩, 加上下一行会超过目标量就停(见上方说明)
+    const target = total * valueArea * (1 + 1e-12);
+    let acc = out[poc].total, vaLow = poc, vaHigh = poc;
+    for (;;) {
+      const above = vaHigh + 1 < n ? out[vaHigh + 1].total : null;
+      const below = vaLow > 0 ? out[vaLow - 1].total : null;
+      if (above == null && below == null) break;
+      const up = below == null ? true : above == null ? false
+        : above !== below ? above > below : vaHigh + 1 - poc <= poc - (vaLow - 1);
+      const v = up ? above : below;
+      if (acc + v > target) break;
+      acc += v;
+      if (up) vaHigh += 1; else vaLow -= 1;
+    }
+    return {
+      rows: out, poc, vaLow, vaHigh, total, buy, sell, maxTotal, count,
+      pocPrice: out[poc].price, vah: out[vaHigh].hi - pad * unit, val: out[vaLow].lo + pad * unit,
+    };
+  }
+
   const api = {
-    LW, BAND, EMA_PERIODS, buyOf, sellOf, deltaOf,
+    LW, BAND, EMA_PERIODS, VP, buyOf, sellOf, deltaOf,
     rollingSma, rollingZ, ema, rma, rsi, linreg, smaStrict, channelIndex,
-    deriveLw, deriveBand, derive, levelOf,
+    deriveLw, deriveBand, derive, levelOf, volumeProfile,
   };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.FlowIndicators = api;

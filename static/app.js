@@ -96,6 +96,32 @@ function saveShown() {
   } catch (error) { /* 记不住不影响使用 */ }
 }
 
+// 各图画的成交量分布记在 localStorage, 按合约、左右图各记一份: {合约: [[{from, to, rows, extend, visible}, ...], [...]]}。
+// 区间按时间记, 切周期、重载之后还是同一段时间; 条目合不合法由图表组件自己判(不合法的丢掉)。
+// 某个合约两张图都删光了就不再记它。
+const CHART_PROFILES_KEY = "flowscope.chartProfiles";
+
+function loadProfiles(index) {
+  try {
+    const all = JSON.parse(localStorage.getItem(CHART_PROFILES_KEY) || "null");
+    const mine = all && typeof all === "object" && Array.isArray(all[symbol]) ? all[symbol][index] : null;
+    return Array.isArray(mine) ? mine : [];
+  } catch (error) {
+    return [];   // 记不住不影响使用
+  }
+}
+
+function saveProfiles() {
+  try {
+    let all = JSON.parse(localStorage.getItem(CHART_PROFILES_KEY) || "null");
+    if (!all || typeof all !== "object" || Array.isArray(all)) all = {};
+    const lists = charts.map((c) => c.profiles());
+    if (lists.some((list) => list.length)) all[symbol] = lists;
+    else delete all[symbol];
+    localStorage.setItem(CHART_PROFILES_KEY, JSON.stringify(all));
+  } catch (error) { /* 记不住不影响使用 */ }
+}
+
 // 鼠标所在(最近进入)的那张图: 十字光标与缩放/拖动以它为准同步另一张, AI 分析默认发它。默认右边那张。
 // 只由鼠标进入图表区域来切换, 十字光标事件不算(见 syncCrosshair)。
 let activeChart = null;
@@ -109,10 +135,12 @@ function makeChart(tf, index) {
     symbol,
     settings,
     shown: loadShown(index, tf),
+    profiles: loadProfiles(index),
     onStatus: (ok, text) => setChartStatus(index, ok, text),
     onSuiteSetting: setSuiteSetting,
     onConfig: refreshLtfOptions,
     onShownChange: saveShown,
+    onProfilesChange: saveProfiles,
     onBandK: setBandK,
     onCrosshair: (time, price) => syncCrosshair(chartView, time, price),
     onRangeChange: syncRanges,
@@ -197,10 +225,10 @@ function syncRanges() {
   }
 }
 
-// 测量工具(每张图左上角的尺子): Esc 取消所有图上的测量。合约选择器的搜索框自己处理 Esc(收起菜单, 已 preventDefault),
-// 那一下不算。
+// 画图工具(每张图左上角的尺子与成交量分布): Esc 取消所有图上的测量和画了一半的成交量分布。
+// 合约选择器的搜索框自己处理 Esc(收起菜单, 已 preventDefault), 那一下不算。
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !event.defaultPrevented) charts.forEach((c) => c.cancelMeasure());
+  if (event.key === "Escape" && !event.defaultPrevented) charts.forEach((c) => c.cancelTools());
 });
 
 // FlowWave带 的带宽 k 两张图共用: 哪张图的图例里点了「2σ」, 两张一起换。

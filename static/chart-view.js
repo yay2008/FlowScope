@@ -10,12 +10,13 @@
  * 模式/阈值的下拉框每张图各有一份, 选了交给页面(onSuiteSetting), 页面写进 settings 再让各图一起刷新。
  * 主图指标的显示开关不在 settings 里: 每张图左上角各有一份图例, 眼睛按钮只管本图。
  * 读数每张图各显示各的: 主图左上角周期框右边是 OHLC 与涨跌, FlowMeter 窗格名后面是量能读数与覆盖标记。
+ * 周期框右边还有两个画图工具: 测量(尺子)与固定范围成交量分布, 画好的成交量分布在图例里一个一行, 由页面记下来。
  * 连接状态和多图联动(十字光标、可视时间范围)是页面的事, 组件通过回调报出事件、
  * 提供按时间操作的入口, 时间在不同周期之间怎么对应由组件按本图的 bar 换算。
  */
 (function (root) {
   "use strict";
-  const { LW, BAND, EMA_PERIODS, buyOf, sellOf, deltaOf } = FlowIndicators;
+  const { LW, BAND, EMA_PERIODS, VP, buyOf, sellOf, deltaOf } = FlowIndicators;
 
   // 可选主周期(秒), 与后端 indicator.TF_OPTIONS 一致(tests/test_rollup.py 核对两边相同)
   const TF_CHOICES = [10, 30, 60, 300, 900, 3600, 14400];
@@ -478,6 +479,115 @@
   // 尺子图标
   const RULER_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 17 17 3l4 4L7 21z"/><path d="M6.5 13.5l2 2M9.5 10.5l1.5 1.5M12.5 7.5l2 2M15.5 4.5l1.5 1.5"/></svg>';
 
+  // ---------- 固定范围成交量分布 ----------
+  // 每张图左上角尺子右边的按钮: 第一下点区间起点, 移动鼠标预览, 第二下点终点, 分布就留在图上(同 TradingView 的
+  // Fixed Range Volume Profile, 算法见 indicators.js 的 volumeProfile)。可以画多个, 每个在主图图例里占一行:
+  // 行数、延伸、POC / VAH / VAL 读数、眼睛、删除。终点点在最新一根上时自动「延伸」, 区间右端跟着新 K 线走。
+  // 区间按时间记(起点那根的开始到终点那根的结束), 切周期、重载后还是同一段时间; 起点滚出已加载的数据时只统计
+  // 还在图上的部分, 读数标「部分」。画法: 直方图从区间左端往右长, 最长那行占区间宽度的 30%(同 TradingView 默认);
+  // 每行主动买蓝、主动卖黄、未知灰依次排开, 价值区内的行颜色深、区外的淡; POC 红实线、价值区上下沿灰虚线横贯区间,
+  // POC 价位另标在右侧价格轴上。足迹图下和其他主图叠加一样不画。
+  const VP_COLORS = {
+    buy: (alpha) => `rgba(21, 146, 230, ${alpha})`,
+    sell: (alpha) => `rgba(251, 193, 35, ${alpha})`,
+    unknown: (alpha) => `rgba(149, 152, 161, ${alpha})`,
+    poc: "#ff5252",
+    va: "rgba(209, 212, 220, 0.5)",
+    edge: "rgba(149, 152, 161, 0.4)",
+  };
+  const VP_ALPHA = { inside: 0.7, outside: 0.3 };   // 价值区内 / 外的行
+  const VP_WIDTH = 0.3;                             // 最长那行占区间宽度的比例
+  const VP_MIN_WIDTH = 40;                          // 区间太窄时直方图至少这么宽(px), 不超过区间本身
+  const VP_MAX = 8;                                 // 每张图最多几个, 再画就替换最早的那个
+
+  // 挂在 K 线 series 上, zOrder 为 bottom: 画在所有 series 之下、网格之上, 半透明的行不挡 K 线。
+  // geometry() 返回要画的各个分布(已换成像素坐标), axisLabels() 返回 POC 的价格轴标签 [{coordinate(), text}],
+  // coordinate() 每次绘制时现算, 价格换不出坐标时为 null(标签不画)。
+  class VolumeProfilePrimitive {
+    constructor(geometry, axisLabels) {
+      this._geometry = geometry;
+      this._axisLabels = axisLabels;
+      this._requestUpdate = null;
+      this._view = { zOrder: () => "bottom", renderer: () => ({ draw: (target) => this._draw(target) }) };
+      this._axisViews = [];
+    }
+    attached({ requestUpdate }) { this._requestUpdate = requestUpdate; }
+    detached() { this._requestUpdate = null; }
+    refresh() {
+      if (this._requestUpdate) this._requestUpdate();
+    }
+    updateAllViews() {
+      this._axisViews = this._axisLabels().map((label) => ({
+        coordinate: () => label.coordinate() ?? 0, visible: () => label.coordinate() != null,
+        text: () => label.text, textColor: () => "#ffffff", backColor: () => VP_COLORS.poc,
+      }));
+    }
+    paneViews() { return [this._view]; }
+    priceAxisViews() { return this._axisViews; }
+    _draw(target) {
+      const items = this._geometry();
+      if (!items.length) return;
+      target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
+        for (const g of items) {
+          const left = Math.min(g.x1, g.x2), right = Math.max(g.x1, g.x2);
+          if (right < 0 || left > mediaSize.width) continue;
+          const width = right - left;
+          const histW = Math.max(width * VP_WIDTH, Math.min(width, VP_MIN_WIDTH));
+          // 区间两端的竖线, 只画到分布的价格范围
+          ctx.strokeStyle = VP_COLORS.edge;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath();
+          for (const x of [left + 0.5, right - 0.5]) {
+            ctx.moveTo(x, g.yTop);
+            ctx.lineTo(x, g.yBottom);
+          }
+          ctx.stroke();
+          for (const row of g.rows) {
+            if (!(row.total > 0) || !(g.maxTotal > 0)) continue;
+            const alpha = row.inValue ? VP_ALPHA.inside : VP_ALPHA.outside;
+            const top = Math.min(row.y1, row.y2), rowH = Math.abs(row.y2 - row.y1);
+            const h = rowH >= 3 ? rowH - 1 : Math.max(rowH, 1);   // 行之间留 1px 缝, 太挤就不留
+            let x = left;
+            for (const key of ["buy", "sell", "unknown"]) {
+              const w = (row[key] / g.maxTotal) * histW;
+              if (!(w > 0)) continue;
+              ctx.fillStyle = VP_COLORS[key](alpha);
+              ctx.fillRect(x, top, w, h);
+              x += w;
+            }
+          }
+          const hline = (y, color, lineWidth, dash) => {
+            if (y == null) return;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = lineWidth;
+            ctx.setLineDash(dash);
+            ctx.beginPath();
+            ctx.moveTo(left, y);
+            ctx.lineTo(right, y);
+            ctx.stroke();
+          };
+          hline(g.vahY, VP_COLORS.va, 1, [4, 3]);
+          hline(g.valY, VP_COLORS.va, 1, [4, 3]);
+          hline(g.pocY, VP_COLORS.poc, 1.5, []);
+        }
+        ctx.setLineDash([]);
+      });
+    }
+  }
+  // 成交量分布图标: 左边一条竖轴, 右边长短不一的横条
+  const PROFILE_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 3v18"/><path d="M4 6.5h7M4 10.5h13M4 14.5h16M4 18.5h9"/></svg>';
+  // 删除按钮(图例里成交量分布那一行)
+  const CROSS_SVG = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>';
+
+  // 记下来的分布(页面从 localStorage 读回来的)整理成内部格式, 不合法的丢掉
+  function normalizeProfile(item) {
+    if (!item || typeof item !== "object" || !Number.isFinite(item.from) || !Number.isFinite(item.to) ||
+        item.to <= item.from) return null;
+    return { from: item.from, to: item.to, rows: VP.rowOptions.includes(item.rows) ? item.rows : VP.rowsDefault,
+             extend: item.extend === true, visible: item.visible !== false };
+  }
+
   function fmt(v, digits = 0) {
     return v == null ? "-" : Number(v).toFixed(digits);
   }
@@ -494,6 +604,7 @@
    *   shown     本图主图指标的初始显示开关 {ema, emaAll, band, bandMid}, 之后由本图图例的眼睛按钮切换
    *             (emaAll 是 EMA 画全部历史还是只画最近 EMA_DRAW_BARS 根, 由那一行的「近200 / 全部」按钮切换;
    *             bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换)
+   *   profiles  本图已画的成交量分布 [{from, to, rows, extend, visible}](页面记下来的, 不合法的条目丢掉)
    * 回调(都可省略):
    *   onStatus(ok, text)        连接状态变了
    *   onSuiteSetting(key, value) 用户在本图 FlowMeter 窗格选了模式(key = "mode")或阈值(key = "threshtype");
@@ -506,10 +617,12 @@
    *                             time 为 null, 光标不在主图窗格时 price 为 null
    *   onRangeChange()           本图的可视范围变了(用户缩放拖动, 也包括新 bar 自动右移、加载后滚到最新)
    *   onTfChange()              用户在左上角切换了本图周期(新周期用 tf 取, 本图已开始按新周期加载)
+   *   onProfilesChange()        用户画了、删了或改了本图的成交量分布(新列表用 profiles() 取)
    */
   function create({ host, tf, symbol, settings, shown: initialShown, onStatus = noop, onSuiteSetting = noop,
                     onConfig = noop, onShownChange = noop, onBandK = noop, onCrosshair = noop,
-                    onRangeChange = noop, onTfChange = noop, onPaperStops = noop }) {
+                    onRangeChange = noop, onTfChange = noop, onPaperStops = noop,
+                    profiles: initialProfiles = [], onProfilesChange = noop }) {
     let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
     let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
     let derived = null;   // 派生数组(rolling sma/zscore 等)
@@ -548,7 +661,7 @@
     badge.title = "主图周期：K 线、成交量、CVD 都按该周期计算，1 分钟及以上由 30s 合成（足迹图只有 10s、30s）。" +
                   "指标长度按根数固定（与 TradingView 切周期行为一致），周期越大，同样根数覆盖的时长越长。";
     badge.addEventListener("change", () => setTf(Number(badge.value)));
-    // 周期下拉框右边是测量按钮(说明见文件上部「测量工具」), 量的过程中旁边提示下一步
+    // 周期下拉框右边是测量按钮(说明见文件上部「测量工具」)
     const measureBtn = document.createElement("button");
     measureBtn.type = "button";
     measureBtn.className = "measure-btn";
@@ -556,6 +669,17 @@
     measureBtn.title = "测量：点击起点、再点击终点，显示涨跌幅、K 线根数、时长和起止时刻；" +
                        "也可以按住 Shift 在主图上点击直接开始。量完再点一下图表或按 Esc 清除。";
     measureBtn.addEventListener("click", () => toggleMeasure());
+    // 再往右是成交量分布按钮(说明见文件上部「固定范围成交量分布」)
+    const profileBtn = document.createElement("button");
+    profileBtn.type = "button";
+    profileBtn.className = "vp-btn";
+    profileBtn.innerHTML = PROFILE_SVG;
+    profileBtn.title = "固定范围成交量分布：点击区间起点、再点击终点，统计这段 K 线在各价位的成交量" +
+                       "（POC、70% 价值区），可以画多个，在图例里调行数、隐藏或删除。" +
+                       `终点点在最新一根上会自动延伸；每张图最多 ${VP_MAX} 个，再画替换最早的。`;
+    profileBtn.addEventListener("click", () => toggleProfileTool());
+    profileBtn.disabled = settings.view === "footprint";   // 足迹图下不画, 见 setView
+    // 测量、画成交量分布的过程中, 旁边提示下一步(两个工具共用)
     const measureHint = document.createElement("span");
     measureHint.className = "measure-hint";
     measureHint.hidden = true;
@@ -564,7 +688,7 @@
     priceReadout.className = "readout";
     const cornerRow = document.createElement("div");
     cornerRow.className = "chart-corner-row";
-    cornerRow.append(badge, measureBtn, measureHint, priceReadout);
+    cornerRow.append(badge, measureBtn, profileBtn, measureHint, priceReadout);
     corner.appendChild(cornerRow);
     el.appendChild(corner);
     host.appendChild(el);
@@ -932,6 +1056,7 @@
       renderPaperOverlays();   // bar 集合变了(补历史/修订), 成交标记要重新对齐到 bar
       applyCandleMarkers(true);   // 所有 series 都设完了, 标记按最终时间轴重算序号(见 applyCandleMarkers)
       refreshReadout();
+      refreshProfiles();
     }
 
     // 增量更新最后一根 bar
@@ -962,6 +1087,7 @@
       renderLw();            // 同上
       renderBand();          // 同上: 回归通道只影响末尾若干根, 但一样整体重建最省心
       refreshReadout();
+      refreshProfiles();     // 区间含最新一根的分布跟着变
     }
 
     // ---------- FlowWave 主图叠加: 数据与开关 ----------
@@ -1099,21 +1225,32 @@
       measurePhase = phase;
       if (phase === "off" || phase === "armed") measureA = measureB = null;
       measureBtn.classList.toggle("on", phase === "armed" || phase === "drawing");
-      measureHint.textContent = MEASURE_HINTS[phase] || "";
-      measureHint.hidden = !MEASURE_HINTS[phase];
+      renderToolHint();
       measurePrimitive.refresh();
     }
 
-    // 正在量(等起点 / 拉区间)时点尺子是取消, 否则(没在量、已量完)是开始新的一次
+    function measuring() {
+      return measurePhase === "armed" || measurePhase === "drawing";
+    }
+
+    // 正在量(等起点 / 拉区间)时点尺子是取消, 否则(没在量、已量完)是开始新的一次; 正在画成交量分布就先作罢
     function toggleMeasure() {
-      setMeasurePhase(measurePhase === "armed" || measurePhase === "drawing" ? "off" : "armed");
+      if (!measuring()) setProfilePhase("off");
+      setMeasurePhase(measuring() ? "off" : "armed");
+    }
+
+    // 测量与画成交量分布共用一个提示, 同一时刻只会有一个在进行
+    function renderToolHint() {
+      const text = PROFILE_HINTS[profilePhase] || MEASURE_HINTS[measurePhase] || "";
+      measureHint.textContent = text;
+      measureHint.hidden = !text;
     }
 
     // 鼠标事件 -> 测量端点: 时间吸附到最近的 bar(不越出首末根); 价格取鼠标所在价位,
     // 鼠标不在主图窗格时价格没有意义, 用 fallbackPrice(拉区间时就是终点原来的价位, 只动时间)
     function measurePoint(param, fallbackPrice = null) {
-      if (!bars.length || param.logical == null || !param.point) return null;
-      const i = Math.min(Math.max(Math.round(param.logical), 0), bars.length - 1);
+      const i = barIndexOf(param);
+      if (i == null) return null;
       const price = param.paneIndex === 0 ? candleSeries.coordinateToPrice(param.point.y) : fallbackPrice;
       return price == null ? null : { time: bars[i].time, price };
     }
@@ -1146,7 +1283,13 @@
       }
     }
 
-    // 点击自己用 DOM 事件判, 不用 chart.subscribeClick: 库把间隔很短(约 300ms 内)的两下当成双击的前半截,
+    // 鼠标所在的 bar 下标: 吸附到最近的一根, 不越出首末根; 鼠标不在窗格里为 null
+    function barIndexOf(param) {
+      if (!bars.length || !param || param.logical == null || !param.point) return null;
+      return Math.min(Math.max(Math.round(param.logical), 0), bars.length - 1);
+    }
+
+    // 测量和画成交量分布的点击自己用 DOM 事件判, 不用 chart.subscribeClick: 库把间隔很短(约 300ms 内)的两下当成双击的前半截,
     // 第二下不报, 快速量一小段时终点会点不住。位置取十字光标最近一次报的(按下之前鼠标一定先移到了那里);
     // 按下后挪动超过几像素是拖动(平移、拉窗格), 不算点击; 左上角的按钮和图例不归这里管。
     let lastPointer = null;
@@ -1159,7 +1302,8 @@
       const press = pressAt;
       pressAt = null;
       if (press && Math.hypot(event.clientX - press.x, event.clientY - press.y) <= 4) {
-        onMeasureClick(lastPointer, event.shiftKey);
+        if (profilePhase !== "off") onProfileClick(lastPointer);
+        else onMeasureClick(lastPointer, event.shiftKey);
       }
     });
 
@@ -1174,6 +1318,7 @@
           measurePrimitive.refresh();
         }
       }
+      if (profilePhase === "drawing") moveProfileDraft(param);
       const price = param.time != null && param.point && param.paneIndex === 0
         ? candleSeries.coordinateToPrice(param.point.y) : null;
       onCrosshair(param.time ?? null, price);
@@ -1181,6 +1326,227 @@
       refreshReadout();
     });
     chart.timeScale().subscribeVisibleLogicalRangeChange(() => onRangeChange());
+
+    // ---------- 固定范围成交量分布(交互与画法见文件上部) ----------
+
+    // off: 没在画 / armed: 等点起点 / drawing: 起点已定, 终点跟着鼠标
+    let profilePhase = "off";
+    // 画的过程中的区间: start / end 是两端 bar 的时间(按点击先后), from / to 同已画好的; 也带现算的 span / result
+    let profileDraft = null;
+    const PROFILE_HINTS = { armed: "点击区间起点 · Esc 取消", drawing: "点击区间终点 · Esc 取消" };
+    // 已画好的: {id, from, to, rows, extend, visible}, from 是起点那根的开始、to 是终点那根的结束(都是时间, to 不含);
+    // 另带现算的 span(本图的 bar 下标范围 {from, to, partial})与 result(volumeProfile 的结果)
+    const profiles = [];
+    let profileSeq = 0;
+    for (const item of initialProfiles) {
+      const p = normalizeProfile(item);
+      if (p && profiles.length < VP_MAX) profiles.push({ ...p, id: ++profileSeq, span: null, result: null });
+    }
+    const profilePrimitive = new VolumeProfilePrimitive(profileGeometry, profileAxisLabels);
+    candleSeries.attachPrimitive(profilePrimitive);
+
+    function setProfilePhase(phase) {
+      profilePhase = phase;
+      if (phase !== "drawing") profileDraft = null;
+      profileBtn.classList.toggle("on", phase !== "off");
+      renderToolHint();
+      profilePrimitive.refresh();
+    }
+
+    // 正在画时点按钮是取消, 否则开始画新的一个; 正在测量就先作罢
+    function toggleProfileTool() {
+      if (profilePhase === "off" && measuring()) setMeasurePhase("off");
+      setProfilePhase(profilePhase === "off" ? "armed" : "off");
+    }
+
+    // 区间 -> 本图的 bar 下标范围; 不在已加载的数据里为 null。起点取包含 from 时刻的那根(大周期上就是起点所在的
+    // 那根, 落在休市缺口里取缺口后第一根), 终点取 to 之前开始的最后一根, 延伸的取最新一根。
+    // partial: 起点早于已加载的第一根, 只统计了还在图上的部分
+    function profileSpan(p) {
+      if (!bars.length) return null;
+      let from = indexAtOrBefore(bars, p.from);
+      if (from >= 0 && bars[from].time + tf <= p.from) from += 1;
+      from = Math.max(from, 0);
+      const to = p.extend ? bars.length - 1 : indexAtOrBefore(bars, p.to - 1);
+      return to >= from ? { from, to, partial: p.from < bars[0].time } : null;
+    }
+
+    function computeProfile(p) {
+      p.span = profileSpan(p);
+      // 行高按价格显示位数的最小单位取整; 位数未知就按连续价格切
+      const step = cfg?.priceDigits != null ? 10 ** -cfg.priceDigits : 0;
+      p.result = p.span ? FlowIndicators.volumeProfile(bars, p.span.from, p.span.to, { rows: p.rows, step }) : null;
+    }
+
+    // 数据变了(整体重设、末根更新)就全部重算: 每个最多几百根 bar, 每笔推送都算一遍也很轻
+    function refreshProfiles() {
+      profiles.forEach(computeProfile);
+      if (profileDraft) computeProfile(profileDraft);
+      renderProfileLegend();
+      profilePrimitive.refresh();
+    }
+
+    function setDraftEnd(time) {
+      const d = profileDraft;
+      d.end = time;
+      d.from = Math.min(d.start, d.end);
+      d.to = Math.max(d.start, d.end) + tf;
+      computeProfile(d);
+      profilePrimitive.refresh();
+    }
+
+    // 终点跟着鼠标: 只取时间, 鼠标在副图窗格里也算
+    function moveProfileDraft(param) {
+      const i = barIndexOf(param);
+      if (i != null) setDraftEnd(bars[i].time);
+    }
+
+    // param 同 onMeasureClick
+    function onProfileClick(param) {
+      const i = barIndexOf(param);
+      if (profilePhase === "armed") {
+        if (i == null || param.paneIndex !== 0) return;   // 起点只认主图窗格
+        profileDraft = { start: bars[i].time, rows: VP.rowsDefault, extend: false };
+        setProfilePhase("drawing");
+        setDraftEnd(bars[i].time);
+        return;
+      }
+      if (i != null) setDraftEnd(bars[i].time);
+      const d = profileDraft;
+      // 终点点在最新一根上: 自动延伸
+      const extend = Math.max(d.start, d.end) >= bars[bars.length - 1].time;
+      if (profiles.length >= VP_MAX) profiles.shift();
+      profiles.push({ id: ++profileSeq, from: d.from, to: d.to, rows: d.rows, extend, visible: true,
+                      span: null, result: null });
+      setProfilePhase("off");
+      refreshProfiles();
+      onProfilesChange();
+    }
+
+    function changeProfile(id, change) {
+      const p = profiles.find((item) => item.id === id);
+      if (!p) return;
+      Object.assign(p, change);
+      refreshProfiles();
+      onProfilesChange();
+    }
+
+    function removeProfile(id) {
+      const k = profiles.findIndex((item) => item.id === id);
+      if (k < 0) return;
+      profiles.splice(k, 1);
+      refreshProfiles();
+      onProfilesChange();
+    }
+
+    // 画哪些: 显示着的、算出了结果的, 加上正在画的那个; 坐标现算, 跟着滚动缩放走。足迹图下不画
+    function shownProfiles() {
+      if (settings.view === "footprint") return [];
+      const items = profiles.filter((p) => p.visible && p.result);
+      if (profileDraft && profileDraft.result) items.push(profileDraft);
+      return items;
+    }
+
+    // 区间左右两端在首末两根 bar 的外沿。logicalToCoordinate 只认整数下标(带小数的一律返回 0),
+    // 所以取两端那根的中心再各让出半根的宽度
+    function profileGeometry() {
+      const ts = chart.timeScale();
+      const y = (price) => candleSeries.priceToCoordinate(price);
+      const x = (i) => ts.logicalToCoordinate(i);
+      return shownProfiles().map(({ span, result: r }) => ({
+        x1: x(span.from) - (x(span.from + 1) - x(span.from)) / 2, x2: x(span.to) + (x(span.to + 1) - x(span.to)) / 2,
+        yTop: y(r.rows[r.rows.length - 1].hi), yBottom: y(r.rows[0].lo),
+        pocY: y(r.pocPrice), vahY: y(r.rows[r.vaHigh].hi), valY: y(r.rows[r.vaLow].lo), maxTotal: r.maxTotal,
+        rows: r.rows.map((row, j) => ({ y1: y(row.lo), y2: y(row.hi), buy: row.buy, sell: row.sell,
+                                        unknown: row.unknown, total: row.total, inValue: j >= r.vaLow && j <= r.vaHigh }))
+          .filter((row) => row.y1 != null && row.y2 != null),
+      })).filter((g) => g.x1 != null && g.x2 != null && g.yTop != null && g.yBottom != null);
+    }
+
+    // POC 价位标在右侧价格轴上; 按分布对象现取结果, 重算之后不用等视图重建
+    function profileAxisLabels() {
+      return shownProfiles().map((p) => ({
+        coordinate: () => (p.result ? candleSeries.priceToCoordinate(p.result.pocPrice) : null),
+        text: fmt(p.result.pocPrice, cfg?.priceDigits ?? 0),
+      }));
+    }
+
+    // 图例里每个分布一行: 名称 + 行数(点击循环) + 延伸开关 + POC / VAH / VAL + 眼睛 + 删除。
+    // 行的 DOM 跟着分布走, 推送更新只改文字: 按着按钮时整行被换掉, 这一下点击就丢了
+    const profileRows = new Map();   // id -> {row, rowsBtn, extendBtn, readout, eye}
+    let profileLegendKey = "";
+
+    function profileRowFor(p) {
+      if (profileRows.has(p.id)) return profileRows.get(p.id);
+      const row = document.createElement("div");
+      row.className = "ml-item";
+      row.setAttribute("data-key", "vp");
+      const name = document.createElement("span");
+      name.className = "ml-name";
+      name.textContent = "成交量分布";
+      name.title = "固定范围成交量分布(同 TradingView 的 FRVP): 区间内每根 K 线的成交量按它的最低-最高价均匀摊到各价位, " +
+        "按本图周期的 K 线计算(周期越大, 价位分布越粗)。蓝 = 主动买, 黄 = 主动卖, 灰 = 方向未知; 颜色深的行是 70% 价值区。" +
+        "红线 POC = 成交最多的价位(右侧价格轴上标价), 两条灰虚线 = 价值区上沿 VAH / 下沿 VAL。";
+      const rowsBtn = document.createElement("button");
+      rowsBtn.type = "button";
+      rowsBtn.className = "ml-params";
+      rowsBtn.addEventListener("click", () => {
+        const options = VP.rowOptions;
+        changeProfile(p.id, { rows: options[(options.indexOf(p.rows) + 1) % options.length] });
+      });
+      const extendBtn = document.createElement("button");
+      extendBtn.type = "button";
+      extendBtn.className = "ml-toggle";
+      extendBtn.textContent = "延伸";
+      extendBtn.addEventListener("click", () => changeProfile(p.id, { extend: !p.extend }));
+      const readout = document.createElement("span");
+      readout.className = "readout vp-read";
+      const eye = document.createElement("button");
+      eye.className = "ml-eye";
+      eye.type = "button";
+      eye.innerHTML = EYE_SVG;
+      eye.addEventListener("click", () => changeProfile(p.id, { visible: !p.visible }));
+      const remove = document.createElement("button");
+      remove.className = "ml-eye ml-del";
+      remove.type = "button";
+      remove.innerHTML = CROSS_SVG;
+      remove.title = "删除这个成交量分布";
+      remove.addEventListener("click", () => removeProfile(p.id));
+      row.append(name, rowsBtn, extendBtn, readout, eye, remove);
+      const parts = { row, rowsBtn, extendBtn, readout, eye };
+      profileRows.set(p.id, parts);
+      return parts;
+    }
+
+    function renderProfileLegend() {
+      const px = (v) => fmt(v, cfg?.priceDigits ?? 0);
+      for (const id of [...profileRows.keys()]) {
+        if (!profiles.some((p) => p.id === id)) profileRows.delete(id);
+      }
+      for (const p of profiles) {
+        const { row, rowsBtn, extendBtn, readout, eye } = profileRowFor(p);
+        row.classList.toggle("off", !p.visible);
+        rowsBtn.textContent = `${p.rows}行`;
+        rowsBtn.title = `价格分成几行, 点击按 ${VP.rowOptions.join(" → ")} 循环。每行取整数个最小价位, 实际行数可能差一两行`;
+        extendBtn.classList.toggle("on", p.extend);
+        extendBtn.title = p.extend ? "延伸: 区间右端跟着最新 K 线走, 新成交实时计入。点击关掉, 右端回到画的时候的终点"
+          : "延伸: 点击打开, 区间右端跟着最新 K 线走, 新成交实时计入";
+        eye.title = p.visible ? "隐藏" : "显示";
+        const r = p.result;
+        readout.title = r && p.span.partial ? "区间起点早于本图已加载的数据, 只统计了还在图上的部分" : "";
+        readout.replaceChildren(...(r ? [field("POC", px(r.pocPrice)), field("VAH", px(r.vah)), field("VAL", px(r.val)),
+                                          ...(p.span.partial ? [field("", "部分", "warn")] : [])]
+          : bars.length ? [field("", "不在已加载的数据里", "warn")] : []));
+      }
+      // 行增删了才重排图例(见上面: 不能每次都把行换掉)
+      const key = profiles.map((p) => p.id).join();
+      if (key !== profileLegendKey) {
+        profileLegendKey = key;
+        legendEl.replaceChildren(...Object.values(legendRows).map((item) => item.row),
+                                 ...profiles.map((p) => profileRows.get(p.id).row));
+      }
+    }
+    renderProfileLegend();
 
     // ---------- 主图指标图例 ----------
 
@@ -1248,7 +1614,7 @@
 
     // 鼠标在哪条能拖的线上: 只认主图窗格(不含价格轴), 止盈止损优先于均价线; 测量中、足迹图、左上角控件上都不算
     function paperHit(event) {
-      if (!paperState || settings.view === "footprint" || measurePhase === "armed" || measurePhase === "drawing") return null;
+      if (!paperState || settings.view === "footprint" || measuring() || profilePhase !== "off") return null;
       if (event.target && event.target.closest && event.target.closest(".chart-corner")) return null;
       let paneEl = null;
       try { paneEl = chart.panes()[0].getHTMLElement(); } catch (e) { return null; }
@@ -1379,6 +1745,9 @@
       fpSeries.applyOptions({ visible: isFp });
       applyBandVisibility();   // 足迹图下强制隐藏叠加带, 切回 K 线按开关恢复
       renderLegend();          // 足迹图下主图指标全部隐藏, 图例跟着收起
+      if (isFp) setProfilePhase("off");
+      profileBtn.disabled = isFp;   // 成交量分布同样只在 K 线视图画, 足迹图下按钮置灰
+      profilePrimitive.refresh();
       refreshReadout();        // 覆盖标记换成足迹的口径
       if (isFp) {
         fpBarSpacing = chart.timeScale().options().barSpacing;
@@ -1607,6 +1976,7 @@
       tf = next;
       badge.value = String(tf);
       setMeasurePhase("off");   // 量的是旧周期的 bar, 换周期就清掉
+      setProfilePhase("off");   // 画了一半的作罢; 画好的按时间记, 新周期的数据到了按它重算
       bars = [];
       barsLtf = null;
       fpBars = [];
@@ -1720,9 +2090,14 @@
         hoverTime = null;
         refreshReadout();
       },
-      cancelMeasure() {                // Esc: 取消测量, 已量完留在图上的也清掉
+      cancelTools() {                  // Esc: 取消测量(已量完留在图上的也清掉)和画了一半的成交量分布
         if (measurePhase !== "off") setMeasurePhase("off");
+        if (profilePhase !== "off") setProfilePhase("off");
       },
+      // 已画好的成交量分布(页面记进 localStorage), 格式同 create 的 profiles
+      profiles: () => profiles.map(({ from, to, rows, extend, visible }) => ({ from, to, rows, extend, visible })),
+      // 当前成交量分布(只供测试): 画的阶段、画了一半的那个、已画好的(带结果)
+      profileState: () => ({ phase: profilePhase, draft: profileDraft, profiles }),
       screenshot,                      // AI 看图分析: 本图截图(canvas) 与数值摘要的原料
       analysisInput,
       // 当前测量: 阶段、两端与读数(两端还没定时 stats 为 null)

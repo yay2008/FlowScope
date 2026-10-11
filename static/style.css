@@ -273,8 +273,8 @@ body { display: flex; flex-direction: column; }
 .readout .up { color: #f23645; }
 .readout .down { color: #00e676; }
 .readout .warn { color: #f0b90d; }
-/* 测量按钮: 正在量(等点起点 / 拉区间)时高亮 */
-.measure-btn {
+/* 测量与成交量分布按钮: 正在量 / 正在画(等点起点 / 拉区间)时高亮 */
+.measure-btn, .vp-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -288,8 +288,10 @@ body { display: flex; flex-direction: column; }
   cursor: pointer;
   pointer-events: auto;
 }
-.measure-btn:hover { color: #d1d4dc; }
-.measure-btn.on { color: #131722; background: #f0b90d; border-color: #f0b90d; }
+.measure-btn:hover, .vp-btn:hover { color: #d1d4dc; }
+.measure-btn.on, .vp-btn.on { color: #131722; background: #f0b90d; border-color: #f0b90d; }
+.vp-btn:disabled { opacity: 0.4; cursor: default; }
+.vp-btn:disabled:hover { color: #9598a1; }
 .measure-hint {
   padding: 1px 6px;
   border-radius: 3px;
@@ -338,7 +340,10 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
 .ml-toggle { color: #9598a1; opacity: 0.45; }
 .ml-toggle.on { color: #d1d4dc; opacity: 1; }
 .ml-range { color: #9598a1; }
-.ml-item.off .ml-name, .ml-item.off .ml-params, .ml-item.off .ml-toggle, .ml-item.off .ml-range { opacity: 0.4; }
+.ml-item.off .ml-name, .ml-item.off .ml-params, .ml-item.off .ml-toggle, .ml-item.off .ml-range,
+.ml-item.off .vp-read { opacity: 0.4; }
+/* 成交量分布那一行的 POC / VAH / VAL 读数: 读数样式, 但不撑满整行 */
+.main-legend .vp-read { flex: 0 1 auto; }
 .ml-eye {
   display: inline-flex;
   padding: 0;

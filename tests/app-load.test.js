@@ -505,7 +505,8 @@ test("工具栏的周期下拉框已移除: 默认 10s、30s 两张图左右并�
   for (const corner of corners) {
     assert.equal(corner.children[0].className, "chart-corner-row");
     assert.deepEqual(corner.children[0].children.map((node) => node.className),
-                     ["tf-select", "measure-btn", "measure-hint", "readout"], "周期下拉框右边是测量按钮, 再往右是价格读数");
+                     ["tf-select", "measure-btn", "vp-btn", "measure-hint", "readout"],
+                     "周期下拉框右边是测量与成交量分布按钮, 再往右是价格读数");
     assert.equal(corner.children[1].className, "main-legend", "主图图例应挂在周期标签下面");
   }
 });
@@ -763,7 +764,8 @@ test("WaveTrend 已删除: 图例只有 EMA 与 FlowWave带, 工具栏没有 WT�
   })()`, context);
   assert.equal(vm.runInContext("'wt' in charts[1].derived", context), false, "不再计算 WaveTrend");
   assert.ok(stubCharts[1].markers.every((list) => list.length === 0), "没有成交时 K 线上一个标记都没有");
-  assert.deepEqual(stubCharts[1].primitives.map((p) => p.constructor.name), ["MeasurePrimitive"], "K 线上只挂测量工具");
+  assert.deepEqual(stubCharts[1].primitives.map((p) => p.constructor.name), ["MeasurePrimitive", "VolumeProfilePrimitive"],
+                   "K 线上只挂测量工具与成交量分布");
 
   setView("footprint");
   assert.equal(legendOf(context, 1).hidden, true, "足迹图下主图指标全部隐藏, 图例收起");
@@ -1540,6 +1542,196 @@ test("测量: Esc 取消所有图上的测量(合约选择器已处理的 Esc �
   select.value = "60";
   select.handlers.change[0]();
   assert.equal(phases(), "off,off");
+});
+
+// ---------- 成交量分布 ----------
+
+// 在第 index 张图上画一个成交量分布: 点按钮, 在逻辑坐标 a 点起点、b 点终点(都在主图窗格)
+function drawProfile(context, index, a, b) {
+  const chart = stubCharts[index];
+  findByClass(chartEl(context, index), "vp-btn").handlers.click[0]();
+  chart.crosshairHandlers[0]({ logical: a, point: { x: a * 6, y: 0 }, paneIndex: 0 });
+  pressChart(context, index);
+  chart.crosshairHandlers[0]({ logical: b, point: { x: b * 6, y: 0 }, paneIndex: 0 });
+  pressChart(context, index);
+}
+
+const profileRowsOf = (context, index) =>
+  findAll(chartEl(context, index), (node) => node.className === "ml-item" && node.getAttribute("data-key") === "vp");
+const profilePrimitiveOf = (index) => stubCharts[index].primitives.find((p) => p.constructor.name === "VolumeProfilePrimitive");
+
+test("成交量分布: 按钮 → 点起点(只认主图) → 终点跟鼠标预览 → 点终点定住; 图例里一行, 读数是 POC / VAH / VAL", () => {
+  const context = runBrowser();
+  feedBothCharts(context);
+  vm.runInContext("charts[1].cfg.priceDigits = 0; charts[1].renderAll()", context);
+  const chart30 = stubCharts[1];
+  const button = findByClass(chartEl(context, 1), "vp-btn");
+  const hint = findByClass(chartEl(context, 1), "measure-hint");
+  const move = (param) => chart30.crosshairHandlers[0](param);
+  const click = (param, options) => {
+    move(param);
+    pressChart(context, 1, options);
+  };
+  const state = () => vm.runInContext("charts[1].profileState()", context);
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  const primitive = profilePrimitiveOf(1);
+
+  button.handlers.click[0]();
+  assert.equal(state().phase, "armed");
+  assert.ok(button.classList.contains("on"));
+  assert.match(hint.textContent, /区间起点/);
+  click({ logical: 10, point: { x: 60, y: 0 }, paneIndex: 1 });
+  assert.equal(state().phase, "armed", "起点只认主图窗格");
+  click({ logical: 10.3, point: { x: 60, y: 0 }, paneIndex: 0 }, { dx: 20 });
+  assert.equal(state().phase, "armed", "拖动(平移)不算点击");
+  click({ logical: 10.3, point: { x: 60, y: 0 }, paneIndex: 0 });
+  assert.equal(state().phase, "drawing");
+  assert.match(hint.textContent, /区间终点/);
+  assert.equal(vm.runInContext("charts[1].measurement().phase", context), "off", "画分布时的点击不归测量管");
+
+  // 终点跟着鼠标(副图窗格里也算, 只取时间); 往左拉也行, 区间按时间先后排
+  move({ logical: 39.6, point: { x: 238, y: 600 }, paneIndex: 1 });
+  assert.deepEqual([state().draft.from, state().draft.to], [T0 + 300, T0 + 40 * 30 + 30], "起点那根的开始到终点那根的结束");
+  assert.deepEqual(plain(state().draft.span), { from: 10, to: 40, partial: false });
+  assert.equal(primitive._geometry().length, 1, "画的过程中就预览");
+  move({ logical: 4, point: { x: 24, y: 0 }, paneIndex: 0 });
+  assert.deepEqual(plain(state().draft.span), { from: 4, to: 10, partial: false });
+  move({ logical: 39.6, point: { x: 238, y: 0 }, paneIndex: 0 });
+  pressChart(context, 1);
+
+  assert.equal(state().phase, "off");
+  assert.equal(button.classList.contains("on"), false);
+  assert.equal(hint.hidden, true);
+  assert.deepEqual(plain(vm.runInContext("charts[1].profiles()", context)),
+                   [{ from: T0 + 300, to: T0 + 1230, rows: 24, extend: false, visible: true }]);
+  const expected = vm.runInContext("FlowIndicators.volumeProfile(charts[1].bars, 10, 40, { rows: 24, step: 1 })", context);
+  const rows = profileRowsOf(context, 1);
+  assert.equal(rows.length, 1);
+  assert.equal(profileRowsOf(context, 0).length, 0, "只画在本图");
+  assert.equal(findByClass(rows[0], "ml-params").textContent, "24行");
+  assert.equal(findByClass(rows[0], "ml-toggle").classList.contains("on"), false, "终点不在最新一根: 不延伸");
+  assert.equal(textOf(findByClass(rows[0], "readout vp-read")),
+               `POC ${expected.pocPrice.toFixed(0)} VAH ${expected.vah.toFixed(0)} VAL ${expected.val.toFixed(0)}`);
+
+  // 画法: 区间两端在首末两根 bar 的外沿(stub 的 x = 逻辑坐标 × 6), 价值区内的行标出来; POC 价位标到价格轴上
+  const [g] = primitive._geometry();
+  assert.deepEqual([g.x1, g.x2], [9.5 * 6, 40.5 * 6]);
+  assert.equal(g.rows.length, expected.rows.length);
+  assert.deepEqual(g.rows.map((row) => row.inValue),
+                   expected.rows.map((_, j) => j >= expected.vaLow && j <= expected.vaHigh));
+  primitive.updateAllViews();
+  assert.deepEqual([...primitive.priceAxisViews().map((view) => view.text())], [expected.pocPrice.toFixed(0)]);
+
+  // 足迹图下不画、按钮置灰, 切回 K 线照旧
+  const setView = viewSetter(context);
+  setView("footprint");
+  assert.equal(primitive._geometry().length, 0);
+  assert.equal(button.disabled, true);
+  setView("candle");
+  assert.equal(primitive._geometry().length, 1);
+  assert.equal(button.disabled, false);
+});
+
+test("成交量分布: 终点点在最新一根上自动延伸; 行数循环、延伸、眼睛、删除; 按合约记进 localStorage, 重载后照旧", () => {
+  const localStorage = createLocalStorage();
+  const context = runBrowser({ localStorage });
+  feedBothCharts(context);
+  const state = () => vm.runInContext("charts[1].profileState()", context);
+  const saved = () => JSON.parse(localStorage.getItem("flowscope.chartProfiles"));
+
+  drawProfile(context, 1, 100, 500);   // 越出数据就停在最后一根
+  const p = state().profiles[0];
+  assert.equal(p.extend, true, "终点在最新一根: 自动延伸");
+  assert.deepEqual([p.span.from, p.span.to], [100, 119]);
+  vm.runInContext(`(() => {
+    const c = charts[1];
+    c.bars = [...c.bars, { time: ${T0 + 3600}, open: 3999, high: 4003, low: 3998, close: 4001, volume: 50 }];
+    c.renderAll();
+  })()`, context);
+  assert.equal(state().profiles[0].span.to, 120, "延伸: 新 K 线计入");
+
+  const [row] = profileRowsOf(context, 1);
+  const rowsBtn = findByClass(row, "ml-params");
+  const extendBtn = findByClass(row, "ml-toggle");
+  assert.ok(extendBtn.classList.contains("on"));
+  rowsBtn.handlers.click[0]();
+  assert.equal(rowsBtn.textContent, "48行");
+  rowsBtn.handlers.click[0]();
+  rowsBtn.handlers.click[0]();
+  assert.equal(rowsBtn.textContent, "12行", "按 12 → 24 → 48 → 96 循环");
+  assert.ok(Math.abs(state().profiles[0].result.rows.length - 12) <= 2, "实际行数差不了一两行");
+  extendBtn.handlers.click[0]();
+  assert.equal(state().profiles[0].span.to, 119, "关掉延伸: 右端回到画的时候的终点");
+  findByClass(row, "ml-eye").handlers.click[0]();
+  assert.ok(row.classList.contains("off"));
+  assert.equal(profilePrimitiveOf(1)._geometry().length, 0, "隐藏了就不画");
+  assert.deepEqual(saved(), { "KQ.m@SHFE.fu": [[], [{ from: T0 + 3000, to: T0 + 3600, rows: 12, extend: false,
+                                                         visible: false }]] });
+
+  // 重载: 数据还没到时图例里就有这一行, 读数等数据到了再出
+  const again = runBrowser({ localStorage });
+  assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext("charts.map((c) => c.profiles())", again))),
+                   saved()["KQ.m@SHFE.fu"]);
+  const [reloaded] = profileRowsOf(again, 1);
+  assert.equal(findByClass(reloaded, "ml-params").textContent, "12行");
+  assert.ok(reloaded.classList.contains("off"));
+  assert.equal(textOf(findByClass(reloaded, "readout vp-read")), "");
+
+  findByClass(row, "ml-eye ml-del").handlers.click[0]();
+  assert.equal(profileRowsOf(context, 1).length, 0);
+  assert.deepEqual(saved(), {}, "两张图都删光了就不再记这个合约");
+});
+
+test("成交量分布: 每张图最多 8 个, 再画就替换最早的那个", () => {
+  const context = runBrowser();
+  feedBothCharts(context);
+  for (let k = 0; k < 9; k++) drawProfile(context, 1, k * 10, k * 10 + 5);
+  const spans = vm.runInContext("charts[1].profileState().profiles.map((p) => p.span.from)", context);
+  assert.deepEqual([...spans], [10, 20, 30, 40, 50, 60, 70, 80]);
+  assert.equal(profileRowsOf(context, 1).length, 8);
+});
+
+test("成交量分布: Esc 取消画了一半的; 和测量互斥; 切周期按时间换算到新周期的 bar", () => {
+  const context = runBrowser();
+  feedBothCharts(context);
+  const phase = (index) => vm.runInContext(`charts[${index}].profileState().phase`, context);
+  const esc = () => context.document.handlers.keydown.forEach((fn) => fn({ key: "Escape", defaultPrevented: false }));
+  const measureBtn = findByClass(chartEl(context, 1), "measure-btn");
+  const profileBtn = findByClass(chartEl(context, 1), "vp-btn");
+
+  profileBtn.handlers.click[0]();
+  stubCharts[1].crosshairHandlers[0]({ logical: 3, point: { x: 18, y: 0 }, paneIndex: 0 });
+  pressChart(context, 1);
+  assert.equal(phase(1), "drawing");
+  esc();
+  assert.equal(phase(1), "off");
+  assert.equal(vm.runInContext("charts[1].profiles().length", context), 0, "作罢的不留");
+
+  profileBtn.handlers.click[0]();
+  measureBtn.handlers.click[0]();
+  assert.equal(phase(1), "off", "开始测量: 画分布作罢");
+  assert.equal(vm.runInContext("charts[1].measurement().phase", context), "armed");
+  profileBtn.handlers.click[0]();
+  assert.equal(vm.runInContext("charts[1].measurement().phase", context), "off", "开始画分布: 测量作罢");
+  assert.equal(phase(1), "armed");
+  profileBtn.handlers.click[0]();
+  assert.equal(phase(1), "off", "画的过程中点按钮是取消");
+
+  // 30s 图上画第 10~40 根, 切到 10s: 同一段时间是第 30~122 根
+  drawProfile(context, 1, 10, 40);
+  const select = tfSelectOf(context, 1);
+  select.value = "10";
+  select.handlers.change[0]();
+  vm.runInContext(`(() => {
+    const c = charts[1];
+    c.bars = [];
+    for (let t = ${T0}; t < ${T0 + 3600}; t += 10) {
+      c.bars.push({ time: t, open: 3999, high: 4002, low: 3998, close: 4000, volume: 10 });
+    }
+    c.renderAll();
+  })()`, context);
+  const span = vm.runInContext("charts[1].profileState().profiles[0].span", context);
+  assert.deepEqual([span.from, span.to, span.partial], [30, 122, false]);
 });
 
 // ---------- 切换周期 ----------
