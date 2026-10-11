@@ -293,11 +293,15 @@
 
   // 主图 EMA 21/55/100/200(金/蓝/青/紫); 图例里的周期数字也按这个上色, 兼当色标
   const EMA_COLORS = ["#f0b90d", "#2962ff", "#009688", "#ab47bc"];
+  // EMA 默认只画最右边这么多根(图例里 EMA 后面的「近200 / 全部」切换, 记在显示开关 emaAll):
+  // 计算仍用全部历史(数值不变), 只是更早的部分不画, 免得几条线铺满整段历史。
+  // 新 bar 进来走 renderAll 整体重设, 窗口随之右移; updateLast 只改末根, 不会越出窗口。
+  const EMA_DRAW_BARS = 200;
 
   // 主图左上角图例的两行: 名称(悬停看说明) + 参数 + 眼睛按钮
   const LEGEND_ITEMS = [
     { key: "ema", name: "EMA", params: true,
-      title: "主图指数移动平均线, 周期 21 / 55 / 100 / 200, 按收盘价计算" },
+      title: "主图指数移动平均线, 周期 21 / 55 / 100 / 200, 按收盘价计算(数值按全部历史算, 画多长由后面的「近200 / 全部」切换)" },
     { key: "band", name: "FlowWave带", params: true,
       title: "FlowWave 的回归通道: 中线 = 收盘价线性回归 21 根(默认不画, 点后面的「中线」显示成淡虚线), 上下轨 = 中线 ±k 倍回归残差标准差(k 点后面的「2σ」切换)。平时只有两条淡轨线; wt2 超买(大于80)时中线到上轨之间染红、上轨加粗, 超卖(小于20)时中线到下轨之间染绿、下轨加粗, 上色段的起点就是首次越界。轨道是真实价格, 可当动态支撑压力看。" },
   ];
@@ -487,8 +491,9 @@
    *   tf        初始主周期(秒), 之后由左上角的下拉框切换(setTf)
    *   symbol    合约代码(切合约是整页重载, 所以也不变)
    *   settings  页面的工具栏状态, 按引用共用, 组件只读
-   *   shown     本图主图指标的初始显示开关 {ema, band, bandMid}, 之后由本图图例的眼睛按钮切换
-   *             (bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换)
+   *   shown     本图主图指标的初始显示开关 {ema, emaAll, band, bandMid}, 之后由本图图例的眼睛按钮切换
+   *             (emaAll 是 EMA 画全部历史还是只画最近 EMA_DRAW_BARS 根, 由那一行的「近200 / 全部」按钮切换;
+   *             bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换)
    * 回调(都可省略):
    *   onStatus(ok, text)        连接状态变了
    *   onSuiteSetting(key, value) 用户在本图 FlowMeter 窗格选了模式(key = "mode")或阈值(key = "threshtype");
@@ -523,7 +528,7 @@
     let loadController = null;
     let retryTimer = null;
     let retryAttempts = 0;
-    const shown = { ema: true, band: false, bandMid: false, ...initialShown };   // 本图主图指标的显示开关
+    const shown = { ema: true, emaAll: false, band: false, bandMid: false, ...initialShown };   // 本图主图指标的显示开关
 
     // ---------- 容器: 图表本身 + 左上角的周期下拉框和主图指标图例 ----------
 
@@ -596,6 +601,7 @@
     // 主图指标图例: 每行 名称 + 参数 + 眼睛按钮, 眼睛只管本图。
     // FlowWave带 的参数(带宽)是个按钮, 点一下按 BAND.kOptions 循环到下一档; 两张图共用, 交给页面去改。
     // 它后面还有「中线」开关(亮 = 显示), 和眼睛一样只管本图、记进显示开关。
+    // EMA 的周期后面是画线范围按钮, 写着当前范围(「近200」/「全部」), 点一下切到另一种; 同样只管本图、记进显示开关。
     const legendEl = document.createElement("div");
     legendEl.className = "main-legend";
     const legendRows = {};
@@ -608,11 +614,18 @@
       name.title = item.title;
       name.textContent = item.name;
       row.appendChild(name);
-      let params = null, mid = null;
+      let params = null, mid = null, range = null;
       if (item.params) {
         params = document.createElement(item.key === "band" ? "button" : "span");
         params.className = "ml-params";
         row.appendChild(params);
+      }
+      if (item.key === "ema") {
+        range = document.createElement("button");
+        range.className = "ml-range";
+        range.type = "button";
+        range.addEventListener("click", () => toggleShown("emaAll"));
+        row.appendChild(range);
       }
       if (item.key === "band") {
         params.type = "button";
@@ -637,7 +650,7 @@
       eye.addEventListener("click", () => toggleShown(item.key));
       row.appendChild(eye);
       legendEl.appendChild(row);
-      legendRows[item.key] = { row, params, mid, eye };
+      legendRows[item.key] = { row, params, mid, range, eye };
     }
     EMA_PERIODS.forEach((p, j) => {   // EMA 的周期按各自线色列出, 兼当色标
       const span = document.createElement("span");
@@ -912,8 +925,7 @@
     function renderAll() {
       derive();
       candleSeries.setData(bars.map(candleOf));
-      emaSeries.forEach((s, j) =>
-        s.setData(bars.map((b, i) => ({ time: b.time, value: derived.emaLines[j][i] })).filter((p) => p.value != null)));
+      renderEma();
       renderSuite();
       renderLw();
       renderBand();
@@ -980,6 +992,15 @@
       bandSeries.applyOptions({ visible: bandShown(), midVisible: shown.bandMid });
     }
 
+    // EMA 按画线范围整体 setData: 默认只取最右边 EMA_DRAW_BARS 根, emaAll 打开时画全部
+    function renderEma() {
+      if (!derived) return;   // 还没数据: 切范围只记状态, 数据到了 renderAll 会按它画
+      const from = shown.emaAll ? 0 : Math.max(0, bars.length - EMA_DRAW_BARS);
+      emaSeries.forEach((s, j) =>
+        s.setData(bars.slice(from).map((b, k) => ({ time: b.time, value: derived.emaLines[j][from + k] }))
+          .filter((p) => p.value != null)));
+    }
+
     function emaShown() {
       return shown.ema && settings.view !== "footprint";
     }
@@ -989,7 +1010,8 @@
       emaSeries.forEach((s) => s.applyOptions({ visible: on }));
     }
 
-    const APPLY_SHOWN = { ema: applyEmaVisibility, band: applyBandVisibility, bandMid: applyBandVisibility };
+    const APPLY_SHOWN = { ema: applyEmaVisibility, emaAll: renderEma,
+                          band: applyBandVisibility, bandMid: applyBandVisibility };
 
     // ---------- 读数 ----------
     // 主图左上角: OHLC 与涨跌; FlowMeter 窗格左上角: 模式主值、Δ、CVD、买卖量、RVOL 等与覆盖标记。
@@ -1171,6 +1193,11 @@
       mid.classList.toggle("on", shown.bandMid);
       mid.title = "中线 = 收盘价线性回归 21 根, 画成淡虚线(和 EMA 的实线分得开), 只管本图。" +
                   (shown.bandMid ? "现在显示, 点击隐藏" : "现在隐藏, 点击显示");
+      const range = legendRows.ema.range;              // EMA 的画线范围: 写当前范围, EMA 关着时同样不能点
+      range.disabled = !shown.ema;
+      range.textContent = shown.emaAll ? "全部" : `近${EMA_DRAW_BARS}`;
+      range.title = `EMA 画线范围(数值都按全部历史计算), 只管本图。现在画${shown.emaAll ? "全部历史" : `最近 ${EMA_DRAW_BARS} 根 K 线`}, ` +
+                    `点击改成${shown.emaAll ? `只画最近 ${EMA_DRAW_BARS} 根` : "画全部历史"}`;
       for (const key of Object.keys(legendRows)) {
         legendRows[key].row.classList.toggle("off", !shown[key]);
         legendRows[key].eye.title = shown[key] ? "隐藏" : "显示";

@@ -810,7 +810,8 @@ test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各
   assert.deepEqual(applied.slice(-4).map((o) => o.visible), [false, false, false, false]);
   assert.equal(eyeOf(context, 1, "ema").title, "显示");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")),
-                   [{ ema: true, band: false, bandMid: false }, { ema: false, band: false, bandMid: false }]);
+                   [{ ema: true, emaAll: false, band: false, bandMid: false },
+                    { ema: false, emaAll: false, band: false, bandMid: false }]);
 
   // 切合约是整页重载: 新页面的两张图各按记下的状态画(删掉 WaveTrend 之前记的 wt 忽略掉)
   storage.setItem("flowscope.chartShown", JSON.stringify([
@@ -855,7 +856,8 @@ test("两张图选同一个周期时开关各管各的, 重载后不串; 切周�
   select.value = "300";
   select.handlers.change[0]();
   assert.deepEqual(offFlags(again, 0), [true, true], "切周期后本图开关不变");
-  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0], { ema: false, band: false, bandMid: false });
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0],
+                   { ema: false, emaAll: false, band: false, bandMid: false });
 });
 
 test("图例里的带宽只在本图打开 FlowWave带 时能点", () => {
@@ -904,6 +906,55 @@ test("FlowWave带 的「中线」开关: 默认不画, 带关着时不能点; �
   assert.ok(stubCharts[1].applied.some((o) => o.midVisible === true), "重载后 series 也按记下的状态画");
   midOf(again, 1).handlers.click[0]();
   assert.equal(stubCharts[1].applied.at(-1).midVisible, false, "再点一下隐藏");
+});
+
+test("EMA 的「近200 / 全部」: 默认只画最右边 200 根, 点了画全部; 数值不变, 只管本图, 记进 localStorage, 重载后照旧", () => {
+  const storage = createLocalStorage();
+  const context = runBrowser({ localStorage: storage });
+  const rangeOf = (ctx, index) => findByClass(legendRow(ctx, index, "ema"), "ml-range");
+  // setData 收到的数组属于页面的 vm 上下文, 转成本上下文的数组再比(deepEqual 认不出别的上下文的数组)
+  const emaData = () => JSON.parse(JSON.stringify(
+    stubCharts[1].series.filter((s) => s.type === "LineSeries" && s.pane === 0).map((s) => s.data)));
+  const load = (ctx) => vm.runInContext(`(() => {
+    const c = charts[1];
+    c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
+    c.bars = [];
+    for (let i = 0; i < 300; i++) {
+      const price = 4000 + Math.sin(i / 7) * 20;
+      c.bars.push({ time: 1700000000 + i * 30, open: price - 1, high: price + 2, low: price - 2,
+                    close: price, volume: 100, buy: 60, sell: 40, delta: 20 });
+    }
+    c.renderAll();
+  })()`, ctx);
+
+  assert.equal(rangeOf(context, 1).textContent, "近200", "默认只画最近 200 根");
+  load(context);
+  let lines = emaData();
+  assert.equal(lines.length, 4, "主图有四条 EMA");
+  assert.ok(lines.every((d) => d.length === 200), "每条 EMA 只交给图表最右边 200 根");
+  const times = JSON.parse(vm.runInContext("JSON.stringify(charts[1].bars.map((b) => b.time))", context));
+  assert.deepEqual(lines[3].map((p) => p.time), times.slice(-200), "画的是最右边 200 根");
+  const ema200 = JSON.parse(vm.runInContext("JSON.stringify(charts[1].derived.emaLines[3])", context));
+  assert.deepEqual(lines[3].map((p) => p.value), ema200.slice(-200), "数值仍是按全部历史算出来的");
+
+  rangeOf(context, 1).handlers.click[0]();
+  lines = emaData();
+  assert.equal(rangeOf(context, 1).textContent, "全部");
+  assert.ok(lines.every((d) => d.length === 300), "画全部历史");
+  assert.equal(rangeOf(context, 0).textContent, "近200", "另一张图不受影响");
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")).map((s) => s.emaAll), [false, true]);
+
+  clickEye(context, 1, "ema");
+  assert.equal(rangeOf(context, 1).disabled, true, "EMA 关着时不能点");
+  clickEye(context, 1, "ema");
+  assert.equal(rangeOf(context, 1).textContent, "全部", "关掉 EMA 再打开, 范围保持原样");
+
+  const again = runBrowser({ localStorage: storage });
+  assert.equal(rangeOf(again, 1).textContent, "全部", "重载后照旧画全部");
+  load(again);
+  assert.ok(emaData().every((d) => d.length === 300), "重载后 series 也按记下的范围画");
+  rangeOf(again, 1).handlers.click[0]();
+  assert.ok(emaData().every((d) => d.length === 200), "再点一下切回最近 200 根");
 });
 
 test("点图例里的带宽按 1.5σ → 2σ → 2.5σ 循环, 两张图共用, 半宽按 k 线性变化; 顶部读数不再列带", () => {

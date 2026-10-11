@@ -322,19 +322,23 @@ body { display: flex; flex-direction: column; }
 .ml-name { font-weight: 600; cursor: default; }
 .ml-params { display: inline-flex; gap: 4px; color: #9598a1; }
 /* FlowWave带 的带宽是按钮(点一下切下一档), 外观与其他参数一致, 只在悬停时提示可点;
-   后面的「中线」开关同样是文字按钮: 亮 = 显示, 暗 = 隐藏 */
-button.ml-params, .ml-toggle {
+   后面的「中线」开关同样是文字按钮: 亮 = 显示, 暗 = 隐藏。EMA 的「近200 / 全部」写着当前范围, 外观同参数 */
+button.ml-params, .ml-toggle, .ml-range {
   padding: 0;
   border: none;
   background: none;
   font: inherit;
   cursor: pointer;
 }
-button.ml-params:hover:not(:disabled), .ml-toggle:hover:not(:disabled) { color: #d1d4dc; text-decoration: underline dotted; }
-button.ml-params:disabled, .ml-toggle:disabled { cursor: default; }
+button.ml-params:hover:not(:disabled), .ml-toggle:hover:not(:disabled), .ml-range:hover:not(:disabled) {
+  color: #d1d4dc;
+  text-decoration: underline dotted;
+}
+button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: default; }
 .ml-toggle { color: #9598a1; opacity: 0.45; }
 .ml-toggle.on { color: #d1d4dc; opacity: 1; }
-.ml-item.off .ml-name, .ml-item.off .ml-params, .ml-item.off .ml-toggle { opacity: 0.4; }
+.ml-range { color: #9598a1; }
+.ml-item.off .ml-name, .ml-item.off .ml-params, .ml-item.off .ml-toggle, .ml-item.off .ml-range { opacity: 0.4; }
 .ml-eye {
   display: inline-flex;
   padding: 0;
