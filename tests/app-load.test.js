@@ -18,7 +18,7 @@ const vm = require("node:vm");
 const ROOT = path.join(__dirname, "..");
 const STATIC = path.join(ROOT, "static");
 const SCRIPTS = ["data-sync.js", "indicators.js", "picker-core.js", "contract-picker.js", "paper-panel.js",
-                 "ai-panel.js", "chart-view.js", "app.js"];
+                 "ai-panel.js", "ai-history.js", "chart-view.js", "app.js"];
 
 // ---------- 最小 DOM ----------
 

@@ -182,6 +182,7 @@
    *   byId               取页面元素
    *   collect(both)      点按钮时取原料: {symbol, label, settings, paper, sources: [{tf, input, screenshot()}]}
    *                      (sources 由页面按「双图」挑好、排好顺序; input 是图表组件的 analysisInput())
+   *   onSaved(path)      可选: 服务端确认存盘后通知历史列表; 不等待回调, 不共享请求或面板状态。
    */
   function create(options) {
     const byId = options.byId;
@@ -299,6 +300,10 @@
         else if (FINISH_NOTES[data.finish]) els.error.textContent = FINISH_NOTES[data.finish];
         setStatus(event === "error" ? "出错" : `完成 · ${data.elapsed} 秒`);
         els.foot.textContent = footText(meta, data);
+        if (data.saved && options.onSaved) {
+          Promise.resolve().then(() => options.onSaved(data.saved))
+            .catch((error) => console.warn("刷新分析历史失败", error));
+        }
         return true;
       }
       return false;
@@ -413,7 +418,7 @@
     return { run, stop, close, busy: () => controller !== null };
   }
 
-  const api = { COLUMNS, MIN_ROWS, MAX_ROWS, rowSpan, buildChartData, shotTitle, parseSse, footText,
+  const api = { COLUMNS, MIN_ROWS, MAX_ROWS, FINISH_NOTES, tfLabel, rowSpan, buildChartData, shotTitle, parseSse, footText,
                 create };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.AiPanel = api;

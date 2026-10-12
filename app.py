@@ -12,12 +12,13 @@ import os
 import time
 
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import crypto_feed
 import ingest
 from analysis import AnalysisService, Busy, NotConfigured
+from analysis_history import AnalysisHistory, InvalidRecord
 from backup import BackupScheduler
 from binance_feed import BinanceAdapter
 from catalog import CatalogService
@@ -58,6 +59,7 @@ crypto_paper = CryptoPaperService(lambda: crypto,
                                   PaperStore(lambda: os.path.join(ingest.DATA_DIR, "paper", "crypto.json")))
 # AI 看图分析(DeepSeek): 每次分析的结论与截图存在数据目录里, 随定期快照一起备份。
 analysis = AnalysisService(lambda: os.path.join(ingest.DATA_DIR, "analysis"))
+analysis_history = AnalysisHistory(lambda: os.path.join(ingest.DATA_DIR, "analysis"))
 
 
 def manager_for(symbol: str):
@@ -395,6 +397,43 @@ def paper_leverage(symbol: str, leverage: int):
         return crypto_paper.set_leverage(symbol, leverage)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def history_response(read):
+    """档案读取跑在同步路由的线程池里, 不占用分析锁或阻塞 SSE 的事件循环。"""
+    try:
+        return read()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidRecord as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="暂时无法读取历史分析, 请重试") from exc
+
+
+@app.get("/api/analysis/history")
+def analysis_history_list(symbol: str = "", q: str = "", date_from: str = "", date_to: str = "",
+                          tf: int = 0, status: str = "", offset: int = 0, limit: int = 20):
+    return history_response(lambda: JSONResponse(analysis_history.list(
+        symbol=symbol, q=q, date_from=date_from, date_to=date_to, tf=tf, status=status, offset=offset, limit=limit),
+        headers={"Cache-Control": "no-store"}))
+
+
+@app.get("/api/analysis/history/{identity}")
+def analysis_history_detail(identity: str):
+    return history_response(lambda: JSONResponse(analysis_history.detail(identity),
+                                                 headers={"Cache-Control": "no-store"}))
+
+
+@app.get("/api/analysis/history/{identity}/images/{index}")
+def analysis_history_image(identity: str, index: int):
+    def read():
+        path, media_type = analysis_history.image(identity, index)
+        return FileResponse(path, media_type=media_type,
+                            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"})
+    return history_response(read)
 
 
 @app.post("/api/analyze")

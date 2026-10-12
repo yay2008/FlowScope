@@ -144,6 +144,7 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（两张图左右并
   模型看每张图只有约 1300×1300 像素的量、读不准数字，所以提示词要求价格和指标以数值表为准，图只用来看结构；这些自研指标怎么读也写在提示词里（`analysis.py` 的 `SYSTEM_PROMPT`）。
 - **结果**：思考过程折叠显示（可展开），结论逐字输出，按【结论】【结构与趋势】【量价与资金流】【关键价位】【情景】【风险】分段。底栏显示模型、token 用量、耗时和存盘位置。「停止」或关掉浮层会中断这次分析；一次只跑一个分析。
 - **存盘**：`data/analysis/YYYYmmdd/HHMMSS-合约-周期.json`（北京时间），记着发出去的提示词、思考过程、结论、token 用量与状态；截图同名加 `-1.png` / `-2.png`。中途停止或出错时已有的输出照样存（`status` 为 `stopped` / `error`）；一开始就失败（key 无效、余额不足）不留记录。随 `data/` 快照一起备份。
+- **历史分析**：工具栏「历史分析」打开独立窗口，默认按当前合约查看，支持全部合约、名称／代码搜索、北京时间日期范围、周期和状态筛选，每次加载 20 条。双图记录任一周期匹配即可。点击记录查看完整结论、折叠的思考过程、原始截图（点击放大）和模型用量，可复制分析全文；停止、出错或截断的记录有明确提示。旧 JSON 和截图可直接读取，无需迁移，也不需要模型 API key。打开、切换或关闭历史窗口不会停止正在进行的 AI 分析；新分析确认保存后自动刷新列表，并保留正在阅读的详情。手动停止后可点击「刷新」查看服务端已保存的部分内容。截图缺失不影响正文，损坏的记录会单独跳过并提示。
 - 只做技术面参考，不构成投资建议。
 
 ## 数据备份
@@ -169,6 +170,8 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（两张图左右并
 - `GET /api/paper?symbol=...`：模拟交易面板的数据：`account`（`initialCash`/`cash`/`equity`/`floatPnl`/`margin`/`available`/`realizedPnl`/`fees`/`marginRate`）、`positions`、`orders`（全部挂单 + 最近 10 笔已结束的委托）、`trades`（最近 50 笔）、`contract`（主连解析成的标的月份合约）、`quote`（该合约盘口，含 `open`/`reason` 表示能否成交）、`contractTrades`（该合约的成交，供图表标记）、`fee`（该品种费率，查不到为 `null`）。第一次看某个代码时先到合约服务确认存在；查不到在 `error` 里说明，30 秒内不再重查。
 - `POST /api/paper/orders`，JSON `{symbol, side: "buy"|"sell", qty, type: "market"|"limit", price?, tp?, sl?, clientId?}`：下单，返回委托（`tp`/`sl` 是成交后挂到持仓上的止盈/止损价，委托里带着）。市价单当场成交，否则 400 并说明原因；限价单能成交就成交，否则挂单。`DELETE /api/paper/orders/{id}` 撤单；`POST /api/paper/flatten?symbol=...` 按市价平掉该合约全部持仓；`POST /api/paper/stops`，JSON `{symbol, tp, sl}` 设置该合约持仓的止盈/止损价（`null` 表示不设，两个都是 `null` 就是取消；持仓里带 `tp`/`sl`，触发了却平不掉时带 `stopError`）；`POST /api/paper/reset?cash=1000000` 重置账户（带 `&symbol=` 加密合约代码时重置的是加密账户，资金按 USDT）。加密合约另有 `POST /api/paper/leverage?symbol=...&leverage=20` 设杠杆；加密账户的 `GET /api/paper` 多出 `mode: "crypto"`、`leverage`、`fundings`，持仓带 `leverage`/`liqPrice`，账户带 `funding`，报价带五档 `bids`/`asks`、`markPrice`、`fundingRate`/`nextFundingTime` 与数量步长 `qtyStep`/`minQty`。
 - `POST /api/analyze`，JSON `{symbol, label, settings, paper, charts: [{tf, image, columns, rows, events, meta}]}`：AI 看图分析（见上一节）。`charts` 1～2 张，`image` 是 PNG / JPEG / WebP 的 data URL，`rows` 的列名见 `analysis.COLUMN_NOTES`。返回 `text/event-stream`：先 `meta`（模型与思考强度），再若干 `reasoning` / `delta`（思考与结论的增量文字），最后 `done` 或 `error`（`status`/`finish`/`usage`/`elapsed`/`saved`）。请求不合法 400，没配置 `DEEPSEEK_API_KEY` 503，上一次分析还没结束 429；开始推流之后的失败走 `error` 事件。
+- `GET /api/analysis/history`：只读的分析摘要列表。可选 `symbol`（精确合约）、`q`（名称／代码）、`date_from` / `date_to`（北京时间日期，含两端）、`tf`（秒）、`status`（`done` / `stopped` / `error` / `unknown`）、`offset`（默认 0）、`limit`（默认 20，最多 100）。按分析时间倒序返回 `items`、`total`、`offset`、`hasMore`、可用 `periods` 和跳过的损坏记录数 `skipped`。每条摘要带稳定的 `id`，不返回提示词或完整正文。
+- `GET /api/analysis/history/{id}`：历史详情，包含结论、思考过程、用量、状态及各张截图的 `imageUrl`；截图缺失时 URL 为 `null`。`GET /api/analysis/history/{id}/images/{index}` 读取该记录关联的截图（从 0 编号）。记录不存在返回 404、损坏返回 422；只允许读取分析目录内的记录与关联图片。
 - `WS /ws?symbol=...&ltf=0&tf=30&footprint=false`：先注册订阅，再发送 `snapshot` 完整快照，随后发送带版本号的 `bars` 批量增量，包含最新 bar 和历史修订。`footprint=true` 还会接收 `footprints` 或 `footprint_snapshot`；两种数据分别跟踪版本号。所有消息都带 `symbol`/`tf`（`bars` 另带 `ltf`），前端据此过滤，不同周期不会互相串消息。
 - 每次 WebSocket 重连都重新同步完整快照。慢客户端队列溢出时以 1013 关闭连接，前端自动重连补齐；15 秒无业务消息时发送包含行情源状态的 `ping`。
 
@@ -197,7 +200,7 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（两张图左右并
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-node --test tests/app-load.test.js tests/indicators.test.js tests/data-sync.test.js tests/load-history.test.js tests/picker-core.test.js tests/contract-picker.test.js tests/paper-panel.test.js tests/ai-panel.test.js
+node --test tests/app-load.test.js tests/indicators.test.js tests/data-sync.test.js tests/load-history.test.js tests/picker-core.test.js tests/contract-picker.test.js tests/paper-panel.test.js tests/ai-panel.test.js tests/ai-history.test.js
 node --check static/app.js
 node --check static/chart-view.js
 ```

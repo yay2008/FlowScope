@@ -45,6 +45,7 @@
   </label>
   <span class="ai-group">
     <button id="ai-run" type="button" title="把图表截图连同这段行情的数值交给 DeepSeek 分析，结果显示在图表上方的浮层里，并存到 data/analysis/。默认只发鼠标所在的那张图。">AI 分析</button>
+    <button id="ai-history-open" type="button" aria-controls="ai-history" aria-expanded="false" title="查看已保存的分析结论与当时的截图">历史分析</button>
     <label title="勾上后两张图一起发给 AI（大周期在前：先定方向再找位置）；两张图周期相同时只发鼠标所在的那张"><input id="ai-both" type="checkbox">双图</label>
   </span>
   <!-- 状态点: 两张图的连接状态 + 合约目录/自选的提示, 细节在悬停提示里(app.js 的 showStatus) -->
@@ -137,6 +138,49 @@
     </div>
   </aside>
 </div>
+<!-- 历史窗口有独立的 DOM 与请求状态, 打开/关闭它不会操作正在进行的分析。 -->
+<section id="ai-history" class="ai-history" role="dialog" aria-labelledby="ai-history-title" hidden>
+  <div class="ai-history-head">
+    <h2 id="ai-history-title">历史分析</h2>
+    <span id="ai-history-count" class="ai-history-dim"></span>
+    <button id="ai-history-refresh" type="button">刷新</button>
+    <button id="ai-history-close" type="button" aria-label="关闭历史分析" title="关闭历史分析">×</button>
+  </div>
+  <form id="ai-history-filters" class="ai-history-filters">
+    <label>范围<select id="ai-history-scope"><option value="current">当前合约</option><option value="all">全部合约</option></select></label>
+    <label class="ai-history-search">搜索<input id="ai-history-query" type="search" maxlength="120" placeholder="合约名称 / 代码" autocomplete="off"></label>
+    <label>开始日期<input id="ai-history-from" type="date" aria-label="开始日期"></label>
+    <label>结束日期<input id="ai-history-to" type="date" aria-label="结束日期"></label>
+    <label>周期<select id="ai-history-tf"><option value="">全部周期</option></select></label>
+    <label>状态<select id="ai-history-status"><option value="">全部状态</option><option value="done">已完成</option><option value="stopped">已停止</option><option value="error">出错</option><option value="unknown">未知状态</option></select></label>
+  </form>
+  <div id="ai-history-content" class="ai-history-content">
+    <aside class="ai-history-sidebar">
+      <div id="ai-history-notice" class="ai-history-notice" role="status" aria-live="polite"></div>
+      <ul id="ai-history-list" class="ai-history-list" aria-label="历史分析记录"></ul>
+      <button id="ai-history-more" class="ai-history-more" type="button" hidden>加载更多</button>
+    </aside>
+    <section class="ai-history-detail" aria-label="分析详情" aria-busy="false" id="ai-history-detail">
+      <button id="ai-history-back" class="ai-history-back" type="button">‹ 返回列表</button>
+      <div id="ai-history-placeholder" class="ai-history-placeholder" role="status">选择一条记录查看分析详情</div>
+      <div id="ai-history-record" class="ai-history-record" hidden>
+        <div class="ai-history-record-head">
+          <div><span class="ai-history-tag">历史记录</span><h3 id="ai-history-record-title"></h3></div>
+          <button id="ai-history-copy" type="button">复制全文</button>
+        </div>
+        <div id="ai-history-record-time" class="ai-history-dim"></div>
+        <div id="ai-history-copy-status" class="ai-history-dim" role="status"></div>
+        <div id="ai-history-warning" class="ai-history-warning" role="status" hidden></div>
+        <div id="ai-history-shots" class="ai-history-shots"></div>
+        <details id="ai-history-thinking" class="ai-thinking" hidden>
+          <summary>思考过程</summary><div id="ai-history-thinking-text" class="ai-thinking-text"></div>
+        </details>
+        <div id="ai-history-answer" class="ai-text"></div>
+        <div id="ai-history-foot" class="ai-history-foot"></div>
+      </div>
+    </section>
+  </div>
+</section>
 <script src="vendor/lightweight-charts.standalone.production.js"></script>
 <script>window.LightweightCharts || document.write('<script src="https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js"><\/script>')</script>
 <script src="data-sync.js"></script>
@@ -145,6 +189,7 @@
 <script src="contract-picker.js"></script>
 <script src="paper-panel.js"></script>
 <script src="ai-panel.js"></script>
+<script src="ai-history.js"></script>
 <script src="chart-view.js"></script>
 <script src="app.js"></script>
 </body>

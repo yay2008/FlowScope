@@ -531,8 +531,10 @@ paperPanel.start();
 // ---------- AI 看图分析(图表区上方的浮层; 调 DeepSeek 与存盘在服务端 analysis.py) ----------
 // 默认只发鼠标所在的那张图; 工具栏勾上「双图」两张一起发, 大周期在前。两张图周期相同时只发鼠标所在那张。
 
+const aiHistory = AiHistory.create({ byId: $, getSymbol: () => symbol, getLabel: () => symbolLabel || symbol });
 const aiPanel = AiPanel.create({
   byId: $,
+  onSaved: () => aiHistory.refresh(),
   collect(both) {
     const picked = both && new Set(charts.map((c) => c.tf)).size > 1
       ? [...charts].sort((a, b) => b.tf - a.tf) : [activeChart];
