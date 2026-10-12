@@ -158,6 +158,7 @@
       buy: byId("trade-buy"), sell: byId("trade-sell"), flatten: byId("trade-flatten"), msg: byId("trade-msg"),
       position: byId("trade-position"), account: byId("trade-account"), orders: byId("trade-orders"),
       trades: byId("trade-trades"), note: byId("trade-note"), reset: byId("trade-reset"),
+      ordersCount: byId("trade-orders-count"),
       qtyLabel: byId("trade-qty-label"), leverageRow: byId("trade-leverage-row"), leverage: byId("trade-leverage"),
       stops: byId("trade-stops"), tp: byId("trade-tp"), sl: byId("trade-sl"), stopsSet: byId("trade-stops-set"),
       stopsNote: byId("trade-stops-note"), orderTp: byId("trade-order-tp"), orderSl: byId("trade-order-sl"),
@@ -415,6 +416,9 @@
         els.orders.appendChild(item);
       }
       if (!els.orders.children.length) els.orders.textContent = "无";
+      // 委托默认折叠: 标题上标出挂单数, 折叠着也看得到还有单没成交
+      const open = (state.orders || []).filter((order) => order.status === "open").length;
+      els.ordersCount.textContent = open ? `挂单 ${open}` : "";
     }
 
     function renderTrades() {

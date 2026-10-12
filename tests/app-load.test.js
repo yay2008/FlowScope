@@ -330,6 +330,7 @@ test("下单时填的止盈止损随委托提交, 成功后清空; 挂单带的�
   const lines = byId("trade-orders").children.flatMap((item) => item.children || [])
     .filter((child) => child.className === "trade-order-stops-line");
   assert.deepEqual(lines.map((line) => line.textContent), ["止盈 3100 · 止损 2950"], "只有带了止盈止损的挂单多一行");
+  assert.equal(byId("trade-orders-count").textContent, "挂单 2", "委托默认折叠, 标题上标出挂单数(桩里原有一张挂单 + O4)");
 
   byId("trade-order-tp").value = "3100";
   byId("trade-order-sl").value = "2950";

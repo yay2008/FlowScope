@@ -534,6 +534,14 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
 }
 .trade-grid > span:nth-child(2n) { text-align: right; }
 
+/* 委托、成交默认折叠: 标题行可点; 委托标题右侧标挂单数, 折叠着也不会漏撤 */
+.trade-fold > summary { display: flex; gap: 4px; cursor: pointer; list-style: none; user-select: none; }
+.trade-fold > summary::-webkit-details-marker { display: none; }
+.trade-fold > summary::before { content: "▸"; width: 1em; color: #787b86; }
+.trade-fold[open] > summary::before { content: "▾"; }
+.trade-fold > summary:hover { color: #d1d4dc; }
+.trade-fold-count { margin-left: auto; color: #f0b90b; font-weight: normal; }
+
 .trade-list { list-style: none; margin: 0; padding: 4px 0 0; color: #9598a1; font-family: Consolas, "Microsoft YaHei", monospace; }
 .trade-list li { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
 .trade-list li > span:nth-child(2) { flex: 1; text-align: right; }

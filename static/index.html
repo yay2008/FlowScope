@@ -122,10 +122,14 @@
       </div>
       <div class="trade-section">账户</div>
       <div id="trade-account" class="trade-grid"></div>
-      <div class="trade-section">委托</div>
-      <ul id="trade-orders" class="trade-list"></ul>
-      <div class="trade-section">成交</div>
-      <ul id="trade-trades" class="trade-list"></ul>
+      <details class="trade-fold">
+        <summary class="trade-section" title="点击展开/折叠">委托<span id="trade-orders-count" class="trade-fold-count"></span></summary>
+        <ul id="trade-orders" class="trade-list"></ul>
+      </details>
+      <details class="trade-fold">
+        <summary class="trade-section" title="点击展开/折叠">成交</summary>
+        <ul id="trade-trades" class="trade-list"></ul>
+      </details>
       <div class="trade-foot">
         <span id="trade-note"></span>
         <button id="trade-reset" title="清空持仓、委托与成交, 以新的初始资金重新开始">重置账户</button>
