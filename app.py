@@ -30,6 +30,7 @@ from ingest import FeedManager, validate_symbol, validate_tf
 from okx_feed import OkxAdapter
 from paper import DEFAULT_CASH, PaperService, PaperStore
 from paper_crypto import CryptoPaperService
+from trade_review import ReviewHistory, TradeReviewService, validate_account
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "KQ.m@SHFE.fu"
@@ -60,6 +61,10 @@ crypto_paper = CryptoPaperService(lambda: crypto,
 # AI 看图分析(DeepSeek): 每次分析的结论与截图存在数据目录里, 随定期快照一起备份。
 analysis = AnalysisService(lambda: os.path.join(ingest.DATA_DIR, "analysis"))
 analysis_history = AnalysisHistory(lambda: os.path.join(ingest.DATA_DIR, "analysis"))
+trade_review = TradeReviewService(
+    lambda account: (crypto_paper if account == "crypto" else paper).review_snapshot(),
+    lambda: os.path.join(ingest.DATA_DIR, "review"))
+review_history = ReviewHistory(lambda: os.path.join(ingest.DATA_DIR, "review"))
 
 
 def manager_for(symbol: str):
@@ -434,6 +439,46 @@ def analysis_history_image(identity: str, index: int):
         return FileResponse(path, media_type=media_type,
                             headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"})
     return history_response(read)
+
+
+@app.get("/api/review/snapshot")
+def review_snapshot(account: str = "futures", date: str = ""):
+    """指定账户和日期的全量留存成交统计；不依赖行情或模型配置。"""
+    try:
+        return JSONResponse(trade_review.snapshot(account, date), headers={"Cache-Control": "no-store"})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/review/history")
+def review_history_list(account: str = "", offset: int = 0, limit: int = 20):
+    def read():
+        if account:
+            validate_account(account)
+        return JSONResponse(review_history.list(symbol=account, offset=offset, limit=limit),
+                            headers={"Cache-Control": "no-store"})
+    return history_response(read)
+
+
+@app.get("/api/review/history/{identity}")
+def review_history_detail(identity: str):
+    return history_response(lambda: JSONResponse(review_history.detail(identity),
+                                                 headers={"Cache-Control": "no-store"}))
+
+
+@app.post("/api/review")
+async def review(body: dict = Body(...)):
+    """只接受账户与日期；复盘原料始终从服务端模拟账本读取。返回与 AI 分析相同的 SSE。"""
+    try:
+        job = trade_review.start(body, asyncio.get_running_loop())
+    except NotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Busy as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return StreamingResponse(trade_review.events(job), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
 
 
 @app.post("/api/analyze")

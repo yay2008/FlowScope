@@ -2,7 +2,7 @@
 
 仅生成模拟行情，使用临时 CSV；不连接 TqSdk 与交易所，不读取或改写真实历史。
 加密永续用 ?symbol=BINANCE.BTCUSDT.P / OKX.BTC-USDT-SWAP / AGG.BTC 打开（模拟逐笔成交，回填最近一天）。
-「AI 分析」默认用假的 DeepSeek（固定文字慢慢吐出，结果存进临时数据目录）；加 --deepseek 才按 .env 调真的。
+「AI 分析」和「AI 复盘」默认用假的 DeepSeek（固定文字慢慢吐出，结果存进临时数据目录）；加 --deepseek 才按 .env 调真的。
 """
 import argparse
 import json
@@ -322,15 +322,25 @@ def preview_crypto():
 def preview_deepseek(settings, payload, cancelled):
     """离线预览的 DeepSeek: 不发请求, 按固定文字一小段一小段吐出思考与结论, 用来验收浮层、停止和存盘。"""
     user = payload["messages"][1]["content"]
-    images = sum(part["type"] == "image_url" for part in user)
-    rows = user[0]["text"].count("\n") + 1
-    reasoning = f"(预览, 没有调用 DeepSeek) 收到 {images} 张截图、{rows} 行文字。先看结构, 再看量价……"
-    answer = ("【结论】预览模式, 这里是假的结论: 震荡偏多, 把握程度低。\n"
-              "【结构与趋势】\n- EMA21 在 EMA55 上方, 短线结构抬高。\n"
-              "【量价与资金流】\n- CVD 跟随价格上行, 没有明显背离。\n"
-              "【关键价位】\n- 支撑 2990(前低)\n- 压力 3015(前高)\n"
-              "【情景】\n- 多: 站上 3015 看 3030, 跌回 3000 失效。\n- 空: 跌破 2990 看 2975, 收回 3000 失效。\n"
-              "【风险】\n- 模拟行情, 仅用于验收界面。")
+    parts = user if isinstance(user, list) else [{"type": "text", "text": str(user)}]
+    images = sum(part.get("type") == "image_url" for part in parts if isinstance(part, dict))
+    prompt = "\n".join(str(part.get("text") or "") for part in parts if isinstance(part, dict))
+    rows = prompt.count("\n") + 1
+    is_review = images == 0 and any(word in prompt for word in ("复盘", "成交记录", "交易日"))
+    if is_review:
+        reasoning = f"(预览, 没有调用 DeepSeek) 收到 {rows} 行复盘数据。核对成交、费用和风险……"
+        answer = ("【当日表现】预览模式，以下是用于验收界面的示例复盘。\n"
+                  "【执行观察】留意连续亏损后是否增加了下单频率，并逐笔核对进出场理由。\n"
+                  "【改进建议】明天先写好入场条件、止损和单笔风险上限，盘后再对照执行记录。\n"
+                  "【数据边界】具体盈亏与胜率以页面统计为准；这里的文字由离线假模型生成。")
+    else:
+        reasoning = f"(预览, 没有调用 DeepSeek) 收到 {images} 张截图、{rows} 行文字。先看结构, 再看量价……"
+        answer = ("【结论】预览模式, 这里是假的结论: 震荡偏多, 把握程度低。\n"
+                  "【结构与趋势】\n- EMA21 在 EMA55 上方, 短线结构抬高。\n"
+                  "【量价与资金流】\n- CVD 跟随价格上行, 没有明显背离。\n"
+                  "【关键价位】\n- 支撑 2990(前低)\n- 压力 3015(前高)\n"
+                  "【情景】\n- 多: 站上 3015 看 3030, 跌回 3000 失效。\n- 空: 跌破 2990 看 2975, 收回 3000 失效。\n"
+                  "【风险】\n- 模拟行情, 仅用于验收界面。")
     for kind, text in (("reasoning_content", reasoning), ("content", answer)):
         for start in range(0, len(text), 6):
             if cancelled.is_set():
@@ -422,9 +432,12 @@ if __name__ == "__main__":
         server.crypto = preview_crypto()
         # 模拟数据的快照必须留在临时目录: 混进真实 backups/ 会被当成最新一份, 推迟真实备份。
         if not args.deepseek:
+            preview_settings = lambda: {"api_key": "", "model": "preview-deepseek", "base_url": "", "reasoning_effort": "high"}
             server.analysis = analysis.AnalysisService(
                 lambda: os.path.join(ingest.DATA_DIR, "analysis"), transport=preview_deepseek,
-                settings=lambda: {"api_key": "", "model": "preview-deepseek", "base_url": "", "reasoning_effort": "high"})
+                settings=preview_settings)
+            server.trade_review.transport = preview_deepseek
+            server.trade_review.settings = preview_settings
         server.backups = BackupScheduler(lambda: ingest.DATA_DIR,
                                          lambda: os.path.join(directory, "backups"))
         # 预置几个自选, 打开页面就能看到面板(写在临时数据目录里, 不碰真实自选)。

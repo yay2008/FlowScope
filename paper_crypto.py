@@ -22,6 +22,8 @@
 """
 from __future__ import annotations
 
+import copy
+
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -302,7 +304,7 @@ class CryptoBook:
                 self.funding += amount
                 self.fundings.append({"contract": symbol, "time": chart_time(due), "at": _stamp(due),
                                       "rate": rate, "markPrice": mark, "qty": position["qty"],
-                                      "amount": round(amount, 6)})
+                                      "amount": round(amount, 6), "amountRaw": amount})
                 self.fundings = self.fundings[-MAX_FUNDINGS:]
                 changed = True
             self._schedule_funding(symbol, quote, now_ms)
@@ -427,7 +429,7 @@ class CryptoBook:
         self.trades.append({"id": self._next_id("T"), "orderId": order["id"], "contract": order["contract"],
                             "side": order["side"], "qty": order["qty"], "price": price, "liquidity": liquidity,
                             "open": opening, "close": closing, "pnl": round(realized, 6),
-                            "fee": round(fee, 6), "position": position["qty"],
+                            "fee": round(fee, 6), "pnlRaw": realized, "feeRaw": fee, "position": position["qty"],
                             "time": chart_time(now_ms), "at": _stamp(now_ms)})
         order.update(status="filled", fillPrice=price, filledAt=_stamp(now_ms), updatedAt=_stamp(now_ms))
 
@@ -530,6 +532,11 @@ class CryptoPaperService:
         except OSError as exc:
             self.save_error = f"模拟账户保存失败: {exc}"
             print(f"[paper] {self.save_error}", flush=True)
+
+    def review_snapshot(self) -> dict:
+        """复盘读取全部留存成交与资金费, 不触碰实时盘口和撮合状态。"""
+        with self._lock:
+            return {**copy.deepcopy(self._book_now().to_dict()), "saveError": self.save_error}
 
     def _tradable(self, symbol: str):
         """合约 -> Instrument; 多所汇总与不认识的代码不能交易。"""

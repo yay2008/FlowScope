@@ -132,7 +132,7 @@ body { display: flex; flex-direction: column; }
 .picker-empty { color: #9598a1; font-size: 12px; padding: 6px 10px; }
 .picker-foot { color: #9598a1; font-size: 12px; padding: 5px 8px; border-top: 1px solid #2a2e39; }
 
-#ai-run, #ai-history-open {
+#ai-run, #ai-history-open, #trade-review-open {
   background: #2962ff;
   color: #fff;
   border: none;
@@ -632,6 +632,40 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
 .ai-error:empty { display: none; }
 .ai-foot { padding: 5px 12px; border-top: 1px solid #2a2e39; color: #787b86; font-size: 12px; overflow-wrap: anywhere; }
 .ai-foot:empty { display: none; }
+
+/* 账户复盘沿用 AI 浮层；统计在模型输出前即可查看。 */
+.trade-review-panel { width: 600px; min-height: 360px; }
+.trade-review-panel .ai-body { display: block; }
+.trade-review-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.trade-review-controls label { display: flex; flex-direction: column; gap: 4px; color: #9598a1; font-size: 12px; }
+.trade-review-controls select, .trade-review-controls input {
+  min-height: 28px; box-sizing: border-box; padding: 3px 6px; color: #d1d4dc; background: #1e222d;
+  border: 1px solid #434a60; border-radius: 4px; font: inherit;
+}
+.trade-review-controls button, .trade-review-history-controls button, .trade-review-history button {
+  min-height: 28px; padding: 3px 9px; color: #d1d4dc; background: #363c4e;
+  border: 1px solid #434a60; border-radius: 4px; font: inherit; cursor: pointer;
+}
+.trade-review-controls #trade-review-start { color: #fff; background: #2962ff; border-color: #2962ff; }
+.trade-review-panel button:disabled { opacity: .5; cursor: default; }
+.trade-review-basis { color: #9598a1; font-size: 12px; overflow-wrap: anywhere; }
+.trade-review-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 9px 0; }
+.trade-review-stat { min-width: 0; padding: 7px 8px; background: #242936; border-radius: 4px; }
+.trade-review-stat span { display: block; color: #9598a1; font-size: 11px; }
+.trade-review-stat strong { display: block; margin-top: 4px; overflow-wrap: anywhere; font-size: 13px; font-variant-numeric: tabular-nums; }
+.trade-review-contracts { max-height: 92px; overflow: auto; color: #b4bdd0; font-size: 12px; }
+.trade-review-contract + .trade-review-contract { margin-top: 3px; }
+.trade-review-warnings { margin: 8px 0; color: #edc879; font-size: 12px; white-space: pre-wrap; }
+.trade-review-warnings:empty { display: none; }
+.trade-review-history-controls { margin: 8px 0 4px; }
+.trade-review-history { margin-bottom: 12px; padding: 7px 8px; border: 1px solid #363c4e; border-radius: 4px; }
+.trade-review-history > summary { color: #a5b6d4; font-size: 12px; cursor: pointer; }
+.trade-review-history > button { margin: 8px 4px 6px 0; }
+#trade-review-history-status { color: #9598a1; font-size: 12px; }
+.trade-review-history-list { max-height: 164px; overflow: auto; }
+.trade-review-history .trade-review-history-item { display: block; width: 100%; margin-top: 4px; text-align: left; white-space: normal; overflow-wrap: anywhere; }
+#trade-review-answer:not(:empty) { padding-top: 9px; border-top: 1px solid #363c4e; }
+@media (max-width: 650px) { .trade-review-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
 /* 历史档案是独立的非模态窗口; 不捕获主图或实时分析面板的请求。 */
 .ai-history {

@@ -46,6 +46,7 @@
   <span class="ai-group">
     <button id="ai-run" type="button" title="把图表截图连同这段行情的数值交给 DeepSeek 分析，结果显示在图表上方的浮层里，并存到 data/analysis/。默认只发鼠标所在的那张图。">AI 分析</button>
     <button id="ai-history-open" type="button" aria-controls="ai-history" aria-expanded="false" title="查看已保存的分析结论与当时的截图">历史分析</button>
+    <button id="trade-review-open" type="button" aria-controls="trade-review-panel" aria-expanded="false" title="按日期复盘模拟账户的全部成交与资金费">AI 复盘</button>
     <label title="勾上后两张图一起发给 AI（大周期在前：先定方向再找位置）；两张图周期相同时只发鼠标所在的那张"><input id="ai-both" type="checkbox">双图</label>
   </span>
   <!-- 状态点: 两张图的连接状态 + 合约目录/自选的提示, 细节在悬停提示里(app.js 的 showStatus) -->
@@ -81,6 +82,43 @@
         <div id="ai-error" class="ai-error"></div>
       </div>
       <div id="ai-foot" class="ai-foot"></div>
+    </div>
+    <div id="trade-review-panel" class="ai-panel trade-review-panel" role="dialog" aria-labelledby="trade-review-title" hidden>
+      <div id="trade-review-head" class="ai-head">
+        <span id="trade-review-title" class="ai-title">AI 交易复盘</span>
+        <span id="trade-review-status" class="ai-status" role="status"></span>
+        <button id="trade-review-stop" type="button" hidden>停止</button>
+        <button id="trade-review-again" type="button" hidden>重新复盘</button>
+        <button id="trade-review-close" type="button" class="ai-close" aria-label="关闭 AI 复盘">×</button>
+      </div>
+      <div id="trade-review-body" class="ai-body">
+        <div class="trade-review-controls">
+          <label>模拟账户<select id="trade-review-account"><option value="futures">期货模拟</option><option value="crypto">加密模拟</option></select></label>
+          <label>复盘日期<input id="trade-review-date" type="date"></label>
+          <button id="trade-review-refresh" type="button" title="重新读取当前账户和日期的交易记录">刷新记录</button>
+          <button id="trade-review-start" type="button" disabled>开始复盘</button>
+        </div>
+        <div id="trade-review-basis" class="trade-review-basis"></div>
+        <div id="trade-review-summary" class="trade-review-summary" aria-label="当日交易统计"></div>
+        <div id="trade-review-contracts" class="trade-review-contracts"></div>
+        <div id="trade-review-warnings" class="trade-review-warnings" role="status"></div>
+        <div class="trade-review-history-controls">
+          <button id="trade-review-history-toggle" type="button">历史复盘</button>
+        </div>
+        <details id="trade-review-history" class="trade-review-history">
+          <summary>已保存的报告</summary>
+          <button id="trade-review-history-refresh" type="button">刷新</button>
+          <span id="trade-review-history-status"></span>
+          <div id="trade-review-history-list" class="trade-review-history-list"></div>
+        </details>
+        <details id="trade-review-thinking" class="ai-thinking" hidden>
+          <summary id="trade-review-thinking-summary">思考过程</summary>
+          <div id="trade-review-thinking-text" class="ai-thinking-text"></div>
+        </details>
+        <div id="trade-review-answer" class="ai-text"></div>
+        <div id="trade-review-error" class="ai-error"></div>
+      </div>
+      <div id="trade-review-foot" class="ai-foot"></div>
     </div>
   </div>
   <aside id="trade">
@@ -190,6 +228,7 @@
 <script src="paper-panel.js"></script>
 <script src="ai-panel.js"></script>
 <script src="ai-history.js"></script>
+<script src="trade-review.js"></script>
 <script src="chart-view.js"></script>
 <script src="app.js"></script>
 </body>

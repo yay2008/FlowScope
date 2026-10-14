@@ -549,6 +549,7 @@ const aiPanel = AiPanel.create({
     };
   },
 });
+const tradeReview = TradeReview.create({ byId: $, getSymbol: () => symbol });
 
 charts.forEach((c) => c.load());
 loadFavorites();  // 自选独立: 面板先列出代码, 报价随轮询补齐(合约目录在 picker.load() 里自己拉)

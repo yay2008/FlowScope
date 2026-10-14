@@ -147,6 +147,15 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（两张图左右并
 - **历史分析**：工具栏「历史分析」打开独立窗口，默认按当前合约查看，支持全部合约、名称／代码搜索、北京时间日期范围、周期和状态筛选，每次加载 20 条。双图记录任一周期匹配即可。点击记录查看完整结论、折叠的思考过程、原始截图（点击放大）和模型用量，可复制分析全文；停止、出错或截断的记录有明确提示。旧 JSON 和截图可直接读取，无需迁移，也不需要模型 API key。打开、切换或关闭历史窗口不会停止正在进行的 AI 分析；新分析确认保存后自动刷新列表，并保留正在阅读的详情。手动停止后可点击「刷新」查看服务端已保存的部分内容。截图缺失不影响正文，损坏的记录会单独跳过并提示。
 - 只做技术面参考，不构成投资建议。
 
+## AI 交易复盘
+
+工具栏「AI 复盘」可按日期分析模拟账户的交易记录，沿用 AI 分析的 `DEEPSEEK_*` 配置。打开后先查看统计，点击「开始复盘」才调用模型；「刷新记录」可重读新增成交，报告支持停止、重新复盘与查看历史。
+
+- **范围与日期**：期货、加密模拟账户各自统计该账户所有合约，不限当前图表。期货默认当前交易日，包含前一晚夜盘（沿用账户的 18:00 切日、周末顺延规则，未处理节假日）；加密默认北京时间自然日。人民币与 USDT 分开计算。
+- **统计**：使用服务器账本的全部留存记录，包含成交笔数、平仓成交毛胜率、毛盈亏、手续费、资金费、净收益、连续亏损和已实现收益曲线回撤。净收益 = 平仓毛盈亏 − 当日全部手续费 + 资金费收支，不含未平仓浮盈；平仓成交并非完整往返交易，回撤也不是账户权益回撤。新成交保存实际入账金额供汇总，旧记录仅有舍入金额时显示精度提示。
+- **建议**：报告给出当日表现、有证据的优点与问题、优先改进建议和下次交易检查项；缺少行情、入场理由或止损调整历史时明确说明，避免据此猜测交易动机。统计不依赖模型配置或行情连接，所选日期无成交和资金费时不会调用模型。
+- **留档与限制**：报告及当时的交易快照保存在 `data/review/YYYYmmdd/HHMMSS-账户-复盘日期.json`，可在复盘窗口查看最近 20 份报告，随 `data/` 一起备份。账户只保留最近 5000 笔成交、加密资金费最近 500 笔，重置会清空账本；达到上限或账户保存失败时显示提示。AI 最多收到 500 笔成交明细，超过输入长度预算时继续抽样，并保留全天统计及平仓盈亏极值。
+
 ## 数据备份
 
 `data/` 里的买卖量历史无法从 TqSdk 重新生成，丢了就是丢了，所以服务在后台定期给它打快照（`backup.py`）：
@@ -172,6 +181,9 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（两张图左右并
 - `POST /api/analyze`，JSON `{symbol, label, settings, paper, charts: [{tf, image, columns, rows, events, meta}]}`：AI 看图分析（见上一节）。`charts` 1～2 张，`image` 是 PNG / JPEG / WebP 的 data URL，`rows` 的列名见 `analysis.COLUMN_NOTES`。返回 `text/event-stream`：先 `meta`（模型与思考强度），再若干 `reasoning` / `delta`（思考与结论的增量文字），最后 `done` 或 `error`（`status`/`finish`/`usage`/`elapsed`/`saved`）。请求不合法 400，没配置 `DEEPSEEK_API_KEY` 503，上一次分析还没结束 429；开始推流之后的失败走 `error` 事件。
 - `GET /api/analysis/history`：只读的分析摘要列表。可选 `symbol`（精确合约）、`q`（名称／代码）、`date_from` / `date_to`（北京时间日期，含两端）、`tf`（秒）、`status`（`done` / `stopped` / `error` / `unknown`）、`offset`（默认 0）、`limit`（默认 20，最多 100）。按分析时间倒序返回 `items`、`total`、`offset`、`hasMore`、可用 `periods` 和跳过的损坏记录数 `skipped`。每条摘要带稳定的 `id`，不返回提示词或完整正文。
 - `GET /api/analysis/history/{id}`：历史详情，包含结论、思考过程、用量、状态及各张截图的 `imageUrl`；截图缺失时 URL 为 `null`。`GET /api/analysis/history/{id}/images/{index}` 读取该记录关联的截图（从 0 编号）。记录不存在返回 404、损坏返回 422；只允许读取分析目录内的记录与关联图片。
+- `GET /api/review/snapshot?account=futures&date=YYYY-MM-DD`：模拟账户指定日期的全部留存成交统计、合约统计、成交与资金费明细及数据限制。`account` 为 `futures` / `crypto`，省略日期采用当前交易日或北京时间自然日，不依赖模型 API key。
+- `POST /api/review`，JSON `{account, date}`：根据服务器账本生成 AI 复盘，返回与 `/api/analyze` 相同的 SSE；`meta` 额外包含本次实际使用的 `snapshot`。客户端提交的成交与统计不作为复盘原料。日期无留存记录或参数非法返回 400，缺模型配置 503，同一复盘服务繁忙 429。
+- `GET /api/review/history?account=futures&offset=0&limit=20` / `GET /api/review/history/{id}`：按生成时间倒序的复盘摘要与详情；详情包含当时的账本快照，历史不依赖实时账户和模型配置。
 - `WS /ws?symbol=...&ltf=0&tf=30&footprint=false`：先注册订阅，再发送 `snapshot` 完整快照，随后发送带版本号的 `bars` 批量增量，包含最新 bar 和历史修订。`footprint=true` 还会接收 `footprints` 或 `footprint_snapshot`；两种数据分别跟踪版本号。所有消息都带 `symbol`/`tf`（`bars` 另带 `ltf`），前端据此过滤，不同周期不会互相串消息。
 - 每次 WebSocket 重连都重新同步完整快照。慢客户端队列溢出时以 1013 关闭连接，前端自动重连补齐；15 秒无业务消息时发送包含行情源状态的 `ping`。
 
@@ -200,7 +212,7 @@ FlowScope 是一个基于 TqSdk 的期货行情监控页面（两张图左右并
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-node --test tests/app-load.test.js tests/indicators.test.js tests/data-sync.test.js tests/load-history.test.js tests/picker-core.test.js tests/contract-picker.test.js tests/paper-panel.test.js tests/ai-panel.test.js tests/ai-history.test.js
+node --test tests/*.test.js
 node --check static/app.js
 node --check static/chart-view.js
 ```
@@ -211,7 +223,7 @@ node --check static/chart-view.js
 .\.venv\Scripts\python.exe tests/preview_app.py --duration 300
 ```
 
-访问 `http://127.0.0.1:8765/`。模拟器也会制造 K 线与 tick 分批到达的短暂部分覆盖，用于检查图表恢复；300 秒后自动停止。加密永续用 `?symbol=BINANCE.BTCUSDT.P`、`OKX.BTC-USDT-SWAP`、`AGG.BTC` 打开：两家都是模拟的逐笔成交（按时间确定性生成，推送与回填同一套数据，启动后回填最近一天），盘口、资金费率也是模拟的，同样不连交易所。「AI 分析」默认接一个假的 DeepSeek（固定文字慢慢吐出，存进临时数据目录），用来验收浮层、停止与存盘；加 `--deepseek` 才按 `.env` 调真的。
+访问 `http://127.0.0.1:8765/`。模拟器也会制造 K 线与 tick 分批到达的短暂部分覆盖，用于检查图表恢复；300 秒后自动停止。加密永续用 `?symbol=BINANCE.BTCUSDT.P`、`OKX.BTC-USDT-SWAP`、`AGG.BTC` 打开：两家都是模拟的逐笔成交（按时间确定性生成，推送与回填同一套数据，启动后回填最近一天），盘口、资金费率也是模拟的，同样不连交易所。「AI 分析」和「AI 复盘」默认接一个假的 DeepSeek（固定文字慢慢吐出，存进临时数据目录），用来验收浮层、停止与存盘；加 `--deepseek` 才按 `.env` 调真的。
 
 ## 研究报告（docs/）
 

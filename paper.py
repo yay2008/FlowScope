@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import calendar
+import copy
 import csv
 import glob
 import json
@@ -627,7 +628,7 @@ class PaperBook:
         self.trades.append({"id": self._next_id("T"), "orderId": order["id"], "contract": order["contract"],
                             "side": order["side"], "qty": order["qty"], "price": price,
                             "open": opening, "close": closing, "pnl": round(realized, 2),
-                            "fee": round(fee, 2), "position": position["qty"],
+                            "fee": round(fee, 2), "pnlRaw": realized, "feeRaw": fee, "position": position["qty"],
                             "time": chart_time(moment), "at": _stamp(moment),
                             "tradingDay": day.isoformat()})
         order.update(status="filled", fillPrice=price, filledAt=_stamp(moment), updatedAt=_stamp(now))
@@ -757,6 +758,11 @@ class PaperService:
         except OSError as exc:
             self.save_error = f"模拟账户保存失败: {exc}"
             print(f"[paper] {self.save_error}", flush=True)
+
+    def review_snapshot(self) -> dict:
+        """复盘读取全部留存记录; 不订阅行情, 不修改账户, 拷贝后可在锁外统计。"""
+        with self._lock:
+            return {**copy.deepcopy(self._book_now().to_dict()), "saveError": self.save_error}
 
     def reset(self, initial_cash: float) -> dict:
         cash = _num(initial_cash)

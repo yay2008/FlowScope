@@ -11,7 +11,7 @@
 - 一次只跑一个分析(第二个请求 429)。上游调用在独立线程里跑, 页面断开(点停止、关浮层、关页面)就不再读上游,
   已经出来的部分照样存盘。
 - 存盘: data/analysis/YYYYmmdd/HHMMSS-合约-周期.json, 截图同名加 -1.png / -2.png(时间按北京时间, 同图表),
-  随 data/ 快照一起备份。有结论文字或正常结束才存; 一开始就失败(key 无效、余额不足)不留记录。
+  随 data/ 快照一起备份。有结论文字才存; 一开始就失败(key 无效、余额不足)或模型未返回正文不留记录。
 """
 from __future__ import annotations
 
@@ -414,7 +414,7 @@ class AnalysisService:
         self._busy = threading.Lock()
 
     def start(self, body, loop: asyncio.AbstractEventLoop) -> Job:
-        request = parse_request(body)
+        request = self._parse_request(body)
         settings = self.settings()
         if not self._busy.acquire(blocking=False):
             raise Busy("上一次分析还没结束")
@@ -425,6 +425,16 @@ class AnalysisService:
             self._busy.release()
             raise
         return job
+
+    def _parse_request(self, body) -> dict:
+        return parse_request(body)
+
+    def _messages(self, job: Job) -> list[dict]:
+        return build_messages(job.request, job.created)
+
+    def _metadata(self, job: Job) -> dict:
+        return {"model": job.settings["model"], "reasoningEffort": job.settings["reasoning_effort"],
+                "images": len(job.request["charts"])}
 
     async def events(self, job: Job):
         """SSE: meta → reasoning / delta …… → done 或 error。生成器被关掉(页面断开)时通知分析线程收手。"""
@@ -447,11 +457,10 @@ class AnalysisService:
         usage = finish = error = None
         try:
             settings = job.settings
-            payload = {"model": settings["model"], "messages": build_messages(job.request, job.created),
+            payload = {"model": settings["model"], "messages": self._messages(job),
                        "stream": True, "stream_options": {"include_usage": True}, "max_tokens": MAX_TOKENS,
                        "reasoning_effort": settings["reasoning_effort"]}
-            job.emit("meta", {"model": settings["model"], "reasoningEffort": settings["reasoning_effort"],
-                              "images": len(job.request["charts"])})
+            job.emit("meta", self._metadata(job))
             for chunk in self.transport(settings, payload, job.cancelled):
                 if job.cancelled.is_set():
                     break
@@ -469,6 +478,9 @@ class AnalysisService:
             error = str(exc)
         except Exception as exc:   # 解析失败之类的意外也要告诉页面, 不能让它干等
             error = f"分析出错: {type(exc).__name__}: {exc}"
+        if not error and not job.cancelled.is_set() and not "".join(answer).strip():
+            error = "模型没有返回分析正文，请重试"
+            answer = []
         try:
             status = "stopped" if job.cancelled.is_set() else "error" if error else "done"
             result = {"status": status, "finish": finish, "usage": usage,
