@@ -486,6 +486,15 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
 #trade-price { width: 96px; }
 /* 下单时带的止盈止损: 表单里单独一整行, 两个框平分 */
 .trade-order-stops { width: 100%; display: flex; gap: 8px; }
+.trade-order-stops[hidden], .trade-auto-stops[hidden], .trade-auto-fields[hidden], .trade-auto-note[hidden] { display: none; }
+.trade-auto-stops { width: 100%; padding: 6px; border: 1px solid #2a2e39; border-radius: 4px; }
+.trade-form .trade-auto-toggle { color: #d1d4dc; }
+#trade-auto-enabled { margin: 0 2px 0 0; accent-color: #ffa726; }
+.trade-auto-fields { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; margin-top: 6px; }
+#trade-auto-loss { width: 58px; }
+#trade-auto-profit { color: #ffa726; }
+.trade-auto-note { margin-top: 4px; font-size: 11px; color: #9598a1; }
+.trade-auto-note.error { color: #f7525f; }
 
 .trade-actions { display: flex; gap: 6px; }
 .trade-actions button, .trade-flatten, .trade-foot button, .trade-cancel, .trade-stops button {

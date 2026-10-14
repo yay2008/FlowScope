@@ -842,6 +842,20 @@
     // FLOWWAVE_PANE 为 false 时不建(见文件上部), 图表只有两个窗格, lwPane 为 null。
     const lwPane = FLOWWAVE_PANE ? createLwPane() : null;
 
+    // 各连续交易时段的截止线贯穿所有窗格, 标签放在主图底部; 加密合约全天交易, 不挂此标记。
+    const sessionPrimitives = CRYPTO_SYMBOL.test(symbol) ? [] :
+      [candleSeries, histA, ...(lwPane ? [lwPane.wave] : [])].map((series, index) => {
+        const primitive = new FlowSessions.SessionEndPrimitive(() => chart.timeScale(), index === 0);
+        series.attachPrimitive(primitive);
+        return primitive;
+      });
+
+    function renderSessionEnds() {
+      if (!sessionPrimitives.length) return;
+      const markers = FlowSessions.markers(bars, tf, cfg?.tradingTime);
+      sessionPrimitives.forEach((primitive) => primitive.setMarkers(markers));
+    }
+
     function createLwPane() {
       // wave 主线固定灰色阶梯线(原版按超买红/超卖绿着色, 按需求去掉状态色, 超买超卖仍由虚线和圆点标示)
       const lineOpts = { lineWidth: 1, lineType: LightweightCharts.LineType.WithSteps, priceLineVisible: false, lastValueVisible: false };
@@ -1057,6 +1071,7 @@
       applyCandleMarkers(true);   // 所有 series 都设完了, 标记按最终时间轴重算序号(见 applyCandleMarkers)
       refreshReadout();
       refreshProfiles();
+      renderSessionEnds();
     }
 
     // 增量更新最后一根 bar
@@ -1881,12 +1896,13 @@
       }
     }
 
-    function onBars(updates) {
-      if (!updates.length) return;
+    function onBars(updates, nextCfg) {
+      if (!updates.length && !nextCfg) return;
+      if (nextCfg) { cfg = nextCfg; onConfig(); }
       const oldLast = bars[bars.length - 1]?.time;
       const onlyLast = updates.length === 1 && updates[0].time === oldLast;
       bars = FlowData.mergeBars(bars, updates);
-      if (onlyLast) updateLast();
+      if (onlyLast && !nextCfg) updateLast();
       else renderAll();  // 补齐/修订历史和窗口裁剪时，所有图表使用同一份数据。
       if (settings.view === "footprint" && fpBars.length) {
         const latest = fpBars[fpBars.length - 1];
@@ -1952,7 +1968,7 @@
             onStatus(true, "已连接");
           } else if (synced && msg.symbol === symbol && msg.tf === tf) {
             if (msg.type === "bars" && msg.ltf === ltf && msg.revision > barRevision) {
-              onBars(msg.bars);
+              onBars(msg.bars, msg.cfg);
               barRevision = msg.revision;
             } else if ((msg.type === "footprints" || msg.type === "footprint_snapshot") && msg.revision > fpRevision) {
               applyFootprint(msg, msg.type === "footprint_snapshot");

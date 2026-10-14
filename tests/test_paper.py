@@ -449,6 +449,126 @@ class StopTest(unittest.TestCase):
         self.assertEqual({"tp", "sl"} & set(account.positions[CONTRACT]), set())   # 空单的止盈止损不挂到多单上
 
 
+class AutomaticStopsTest(unittest.TestCase):
+    def test_long_and_short_use_actual_fill_and_total_position(self):
+        for side, qty, tp, sl in (("buy", 1, 3016, 2991), ("sell", 1, 2984, 3009),
+                                  ("buy", 2, 3009, 2996), ("sell", 2, 2991, 3004)):
+            with self.subTest(side=side, qty=qty):
+                account = book(fees=FeeTable())
+                placed = account.place(order(side, qty) | {"autoStopLoss": 100}, snap(ask_price1=3001), NOW)
+                position = account.positions[CONTRACT]
+                self.assertEqual((position["tp"], position["sl"]), (tp, sl))
+                self.assertTrue(placed["autoStopApplied"])
+                self.assertEqual(account.summary()["positions"][0]["autoStopLoss"], 100)
+
+    def test_add_reduce_and_reverse_recalculate_for_remaining_position(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("buy", 2), snap(ask_price1=3001), NOW)
+        position = account.positions[CONTRACT]
+        self.assertAlmostEqual(position["avgPrice"], 3000 + 2 / 3)
+        self.assertEqual((position["qty"], position["sl"], position["tp"]), (3, 2997, 3006))
+        # 只减仓的委托不能把新的金额设置挂上, 原金额模式按剩余手数重算。
+        reduced = account.place(order("sell", 1) | {"autoStopLoss": 200}, snap(), NOW)
+        position = account.positions[CONTRACT]
+        self.assertFalse(reduced["autoStopApplied"])
+        self.assertEqual((position["autoStopLoss"], position["sl"], position["tp"]), (100, 2995, 3009))
+        account.place(order("sell", 3) | {"autoStopLoss": 100}, snap(), NOW)
+        position = account.positions[CONTRACT]
+        self.assertEqual((position["qty"], position["avgPrice"], position["sl"], position["tp"]),
+                         (-1, 2999, 3009, 2984))
+        account.flatten(CONTRACT, snap(), NOW)
+        self.assertEqual(account.positions, {})
+        account.place(order("sell", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("buy", 2), snap(), NOW)
+        self.assertNotIn("autoStopLoss", account.positions[CONTRACT])
+        self.assertNotIn("sl", account.positions[CONTRACT])
+
+    def test_tick_rounding_reaches_targets_in_both_directions(self):
+        for qty in (1, -1, 3, -3):
+            for tick, multiplier in ((1, 10), (0.2, 1000), (5, 100)):
+                with self.subTest(qty=qty, tick=tick):
+                    position = {"qty": qty, "avgPrice": 3000 + 1 / 3, "multiplier": multiplier}
+                    stops = paper.automatic_stops(position, 100, tick)
+                    loss = -(stops["sl"] - position["avgPrice"]) * qty * multiplier
+                    profit = (stops["tp"] - position["avgPrice"]) * qty * multiplier
+                    self.assertGreaterEqual(loss + 1e-7, 100)
+                    self.assertLess(loss, 100 + abs(qty) * multiplier * tick)
+                    self.assertGreaterEqual(profit + 1e-7, 150)
+                    self.assertLess(profit, 150 + abs(qty) * multiplier * tick)
+                    for price in stops.values():
+                        self.assertEqual(paper.snap_to_tick(price, tick), price)
+
+    def test_manual_changes_exit_amount_mode(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.set_stops(CONTRACT, 3020, 2995, snap())
+        account.place(order("buy", 1), snap(), NOW)
+        self.assertNotIn("autoStopLoss", account.positions[CONTRACT])
+        self.assertEqual((account.positions[CONTRACT]["tp"], account.positions[CONTRACT]["sl"]), (3020, 2995))
+        account.place(order("buy", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("buy", 1) | {"tp": 3040}, snap(), NOW)
+        self.assertNotIn("autoStopLoss", account.positions[CONTRACT])
+        account.place(order("buy", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.set_stops(CONTRACT, None, None, None)
+        account.place(order("buy", 1), snap(), NOW)
+        self.assertFalse({"tp", "sl", "autoStopLoss"} & account.positions[CONTRACT].keys())
+
+    def test_limits_compute_on_fill_and_survive_reload(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 1, "limit", 3005) | {"autoStopLoss": 100}, snap(), NOW)
+        self.assertEqual((account.positions[CONTRACT]["avgPrice"], account.positions[CONTRACT]["sl"]), (3000, 2990))
+        account.flatten(CONTRACT, snap(), NOW)
+        resting = account.place(order("buy", 1, "limit", 2990) | {"autoStopLoss": 100}, snap(), NOW)
+        self.assertEqual(resting["status"], "open")
+        account = PaperBook(json.loads(json.dumps(account.to_dict())), FeeTable())
+        account.match({CONTRACT: snap(ask_price1=2989, last_price=2989)}, NOW)
+        self.assertEqual((account.positions[CONTRACT]["avgPrice"], account.positions[CONTRACT]["tp"],
+                          account.positions[CONTRACT]["sl"]), (2990, 3005, 2980))
+        account = PaperBook(json.loads(json.dumps(account.to_dict())), FeeTable())
+        account.place(order("buy", 1), snap(ask_price1=2990), NOW)
+        self.assertEqual((account.positions[CONTRACT]["autoStopLoss"], account.positions[CONTRACT]["sl"]), (100, 2985))
+
+    def test_reducing_resting_order_does_not_attach_automatic_stops(self):
+        account = book(fees=FeeTable())
+        resting = account.place(order("sell", 1, "limit", 3010) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("buy", 2), snap(), NOW)
+        account.match({CONTRACT: snap(bid_price1=3011, last_price=3010)}, NOW)
+        self.assertFalse(resting["autoStopApplied"])
+        self.assertFalse({"tp", "sl", "autoStopLoss"} & account.positions[CONTRACT].keys())
+
+    def test_trigger_boundary_and_failed_close_retry(self):
+        for side, before, hit, reason, expected in (("buy", 2991, 2990, "止损", -100),
+                                                   ("sell", 2985, 2984, "止盈", 150)):
+            with self.subTest(side=side):
+                account = book(fees=FeeTable())
+                account.place(order(side, 1) | {"autoStopLoss": 100}, snap(), NOW)
+                self.assertEqual(account.trigger_stops({CONTRACT: snap(last_price=before)}, NOW), [])
+                self.assertEqual(account.trigger_stops({CONTRACT: snap(last_price=hit, bid_volume1=0, ask_volume1=0)}, NOW), [])
+                self.assertIn("平仓未成交", account.stop_errors[CONTRACT])
+                placed = account.trigger_stops({CONTRACT: snap(last_price=hit, bid_price1=hit, ask_price1=hit)}, NOW)
+                self.assertEqual(placed[0]["reason"], reason)
+                self.assertEqual(account.trades[-1]["pnl"], expected)
+                self.assertEqual(account.positions, {})
+                self.assertEqual(account.trigger_stops({CONTRACT: snap(last_price=hit)}, NOW), [])
+
+    def test_invalid_amount_or_conflicting_prices_leave_no_partial_order(self):
+        for value in (0, -1, True, "", "no", float("nan"), float("inf"), 1.7e308):
+            with self.subTest(value=value), self.assertRaises(OrderError):
+                paper.normalize_request(order("buy", 1) | {"autoStopLoss": value})
+        for request in (order("buy", 1) | {"autoStopLoss": 100, "tp": 3100},
+                        order("buy", 1) | {"autoStopLoss": 1e6}):
+            account = book()
+            original = json.dumps(account.to_dict(), sort_keys=True)
+            with self.assertRaises(OrderError):
+                account.place(request, snap(), NOW)
+            self.assertEqual(json.dumps(account.to_dict(), sort_keys=True), original)
+        account = book(fees=FeeTable())
+        request = order("buy", 1, client_id="automatic-once") | {"autoStopLoss": 100}
+        self.assertIs(account.place(request, snap(), NOW), account.place(request, snap(), NOW))
+        self.assertEqual(account.positions[CONTRACT]["qty"], 1)
+
+
 class RequestTest(unittest.TestCase):
     def test_normalize_request(self):
         good = paper.normalize_request({"symbol": " KQ.m@SHFE.fu ", "side": "buy", "qty": 2.0})
@@ -531,6 +651,7 @@ class ServiceTest(unittest.TestCase):
     def test_state_resolves_main_contract_and_reports_session(self):
         state = self.run_async(self.service.state("KQ.m@SHFE.fu"))
         self.assertEqual(state["contract"], CONTRACT)
+        self.assertEqual(state["autoStopRatio"], 1.5)
         self.assertEqual((state["quote"]["ask"], state["quote"]["open"]), (3000.0, True))
         self.assertEqual(state["fee"]["mode"], "ratio")
         self.assertIsNone(state["error"])
@@ -644,6 +765,18 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual((state["positions"][0]["tp"], state["positions"][0]["sl"]), (3100.0, 2950.0))
         with self.assertRaisesRegex(OrderError, "止盈价要是正数"):
             self.run_async(self.service.place({"symbol": CONTRACT, "side": "buy", "qty": 1, "tp": 0}))
+
+    def test_automatic_stops_persist_and_trigger_without_browser_polling(self):
+        self.run_async(self.service.place(
+            {"symbol": "KQ.m@SHFE.fu", "side": "buy", "qty": 1, "autoStopLoss": "100"}))
+        restored = self.make_service()
+        self.quotes[CONTRACT].last_price = 2990
+        self.quotes[CONTRACT].bid_price1 = 2989
+        restored.on_loop(self.api)
+        with open(self.path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["positions"], {})
+        self.assertEqual((saved["orders"][-1]["reason"], saved["orders"][-1]["fillPrice"]), ("止损", 2989))
 
     def test_watch_expires(self):
         self.run_async(self.service.state(CONTRACT))

@@ -18,7 +18,7 @@ const vm = require("node:vm");
 const ROOT = path.join(__dirname, "..");
 const STATIC = path.join(ROOT, "static");
 const SCRIPTS = ["data-sync.js", "indicators.js", "picker-core.js", "contract-picker.js", "paper-panel.js",
-                 "ai-panel.js", "ai-history.js", "trade-review.js", "chart-view.js", "app.js"];
+                 "ai-panel.js", "ai-history.js", "trade-review.js", "session-markers.js", "chart-view.js", "app.js"];
 
 // ---------- 最小 DOM ----------
 
@@ -206,6 +206,7 @@ function stubFetch(url) {
 function paperResponse() {
   return {
     symbol: "KQ.m@SHFE.fu", contract: "SHFE.fu2611", error: null, fee: null, feeSource: null,
+    autoStopRatio: 1.5,
     quote: { contract: "SHFE.fu2611", name: "燃油2611", ask: 3001, bid: 3000, askVolume: 5, bidVolume: 7,
              last: 3000, priceTick: 1, priceDecs: 0, open: true, reason: "", datetime: "2026-09-30 10:00:00" },
     account: { initialCash: 1000000, cash: 1000000, equity: 1000100, floatPnl: 100, margin: 4500,
@@ -332,6 +333,9 @@ test("下单时填的止盈止损随委托提交, 成功后清空; 挂单带的�
   assert.deepEqual(lines.map((line) => line.textContent), ["止盈 3100 · 止损 2950"], "只有带了止盈止损的挂单多一行");
   assert.equal(byId("trade-orders-count").textContent, "挂单 2", "委托默认折叠, 标题上标出挂单数(桩里原有一张挂单 + O4)");
 
+  byId("trade-auto-enabled").checked = false;
+  byId("trade-auto-enabled").handlers.change[0]();
+  assert.equal(byId("trade-order-stops").hidden, false);
   byId("trade-order-tp").value = "3100";
   byId("trade-order-sl").value = "2950";
   byId("trade-buy").handlers.click[0]();
@@ -351,6 +355,91 @@ test("下单时填的止盈止损随委托提交, 成功后清空; 挂单带的�
   byId("trade-buy").handlers.click[0]();
   assert.equal(posts.length, 2);
   assert.equal(byId("trade-msg").textContent, "止盈止损价要是正数");
+});
+
+test("期货默认自动止损100元止盈150元, 金额随委托提交并记住, 加密不使用", async () => {
+  const posts = [];
+  const storage = createLocalStorage();
+  let crypto = false;
+  const fetch = (url, init) => {
+    if (String(url).split("?")[0] === "/api/paper/orders" && init?.method === "POST") {
+      const body = JSON.parse(init.body);
+      posts.push(body);
+      return Promise.resolve(jsonResponse({ ...body, status: "filled", fillPrice: 3001, autoStopApplied: true }));
+    }
+    if (String(url).split("?")[0] === "/api/paper") {
+      const state = paperResponse();
+      if (crypto) {
+        state.mode = "crypto";
+        state.fee = { maker: 0.0002, taker: 0.0005 };
+        state.quote.qtyStep = state.quote.minQty = 0.01;
+        state.leverage = 20;
+      }
+      return Promise.resolve(jsonResponse(state));
+    }
+    return stubFetch(url);
+  };
+  const context = runBrowser({ fetch, localStorage: storage });
+  await vm.runInContext("paperPanel.refresh()", context);
+  const byId = (id) => context.document.getElementById(id);
+  assert.equal(byId("trade-auto-enabled").checked, true);
+  assert.equal(byId("trade-auto-loss").value, "100");
+  assert.equal(byId("trade-auto-profit").textContent, "止盈 150.00 元 · 1:1.5");
+  assert.equal(byId("trade-order-stops").hidden, true);
+  byId("trade-order-sl").value = "999";  // 隐藏的手动价不能混入金额委托
+  byId("trade-buy").handlers.click[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts[0].autoStopLoss, 100);
+  assert.ok(!("tp" in posts[0]) && !("sl" in posts[0]));
+  byId("trade-auto-loss").value = "0";
+  byId("trade-buy").handlers.click[0]();
+  assert.equal(posts.length, 1);
+  byId("trade-auto-loss").value = "200";
+  byId("trade-auto-loss").handlers.input[0]();
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.equal(byId("trade-auto-loss").value, "200", "轮询不冲掉金额");
+  assert.equal(byId("trade-auto-profit").textContent, "止盈 300.00 元 · 1:1.5");
+  byId("trade-sell").handlers.click[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts[1].autoStopLoss, 200);
+  assert.equal(byId("trade-auto-loss").value, "200", "成交不清空金额");
+  let reloaded = runBrowser({ localStorage: storage });
+  assert.equal(reloaded.document.getElementById("trade-auto-loss").value, "200");
+  byId("trade-auto-enabled").checked = false;
+  byId("trade-auto-enabled").handlers.change[0]();
+  reloaded = runBrowser({ localStorage: storage });
+  assert.equal(reloaded.document.getElementById("trade-auto-enabled").checked, false);
+  // 即使金额模式勾着, 加密仍显示手动价格且不发人民币目标。
+  byId("trade-auto-enabled").checked = true;
+  crypto = true;
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.equal(byId("trade-auto-stops").hidden, true);
+  assert.equal(byId("trade-order-stops").hidden, false);
+  byId("trade-buy").handlers.click[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts.length, 3);
+  assert.ok(!("autoStopLoss" in posts[2]));
+});
+
+test("只刷新前端但后端未重启时, 自动止盈止损不能静默变成无保护开仓", async () => {
+  const posts = [];
+  const fetch = (url, init) => {
+    if (String(url).split("?")[0] === "/api/paper") {
+      const state = paperResponse();
+      delete state.autoStopRatio;
+      return Promise.resolve(jsonResponse(state));
+    }
+    if (init?.method === "POST") posts.push(url);
+    return stubFetch(url);
+  };
+  const context = runBrowser({ fetch });
+  await vm.runInContext("paperPanel.refresh()", context);
+  const byId = (id) => context.document.getElementById(id);
+  assert.match(byId("trade-auto-note").textContent, /重启服务/);
+  byId("trade-buy").handlers.click[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts.length, 0);
+  assert.match(byId("trade-msg").textContent, /重启服务/);
 });
 
 test("图上划线: 拖止盈线松手才提交(另一项沿用), 成功后按新价位重画; 双击取消", async () => {
@@ -743,6 +832,45 @@ test("两张图的眼睛按钮各管各的: 点 10s 图的 FlowWave带 不动 30
   assert.equal(legendRow(context, 1, "band").classList.contains("off"), true, "30s 图的图例行保持关闭");
 });
 
+test("截止标记: HTTP/WS 共用合约时段, 配置单独补到也更新, 换周期清空, 加密不画", async () => {
+  const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+    colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
+  const bar = { time: Date.parse("2026-10-13T10:14:30Z") / 1000,
+    open: 3000, high: 3002, low: 2999, close: 3001, volume: 100,
+    buy: 60, sell: 40, delta: 20, cvd: 20, coverage: "complete" };
+  const sockets = [];
+  const context = runBrowser({ fetch: (url) => {
+    const request = new URL(String(url), "http://local/");
+    if (request.pathname !== "/api/history") return stubFetch(url);
+    return Promise.resolve(jsonResponse({ cfg, bars: [bar], ltf: 0 }));
+  } });
+  context.WebSocket = class {
+    constructor(url) { this.url = url; sockets.push(this); }
+    close() {}
+  };
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sockets.length, 2);
+  const primitives = () => stubCharts.map((chart) => chart.primitives.filter(
+    (p) => p.constructor.name === "SessionEndPrimitive"));
+  assert.ok(primitives().every((list) => list.length === 2 && list.every((p) => !p._markers.length)));
+  for (const socket of sockets) {
+    const tf = Number(new URL(socket.url).searchParams.get("tf"));
+    const base = { symbol: "KQ.m@SHFE.fu", tf, ltf: 0 };
+    socket.onmessage({ data: JSON.stringify({ ...base, type: "snapshot", revision: 1, cfg, bars: [bar] }) });
+    socket.onmessage({ data: JSON.stringify({ ...base, type: "bars", revision: 2, bars: [],
+      cfg: { ...cfg, tradingTime: { day: [["09:00:00", "10:15:00"]], night: [] } } }) });
+  }
+  assert.ok(primitives().every((list) => list.every((p) => p._markers[0]?.label === "10:15 截止")));
+  viewSetter(context)("footprint");
+  assert.ok(primitives().every((list) => list.every((p) => p._markers.length === 1)));
+  vm.runInContext("charts[0].setTf(60)", context);
+  assert.ok(primitives()[0].every((p) => !p._markers.length), "新周期数据未到时清掉旧标记");
+  await new Promise((resolve) => setImmediate(resolve));
+  runBrowser({ search: "?symbol=BINANCE.BTCUSDT.P" });
+  assert.ok(primitives().every((list) => list.length === 0));
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
 test("WaveTrend 已删除: 图例只有 EMA 与 FlowWave带, 工具栏没有 WT信号, K 线上没有交叉箭头和背离连线", () => {
   const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
   assert.ok(!html.includes('id="wt-signal"'), "工具栏不该再有 WT信号");
@@ -765,8 +893,9 @@ test("WaveTrend 已删除: 图例只有 EMA 与 FlowWave带, 工具栏没有 WT�
   })()`, context);
   assert.equal(vm.runInContext("'wt' in charts[1].derived", context), false, "不再计算 WaveTrend");
   assert.ok(stubCharts[1].markers.every((list) => list.length === 0), "没有成交时 K 线上一个标记都没有");
-  assert.deepEqual(stubCharts[1].primitives.map((p) => p.constructor.name), ["MeasurePrimitive", "VolumeProfilePrimitive"],
-                   "K 线上只挂测量工具与成交量分布");
+  assert.deepEqual(stubCharts[1].primitives.map((p) => p.constructor.name),
+    ["SessionEndPrimitive", "SessionEndPrimitive", "MeasurePrimitive", "VolumeProfilePrimitive"],
+    "截止标记、测量工具与成交量分布, 没有 WaveTrend 标记");
 
   setView("footprint");
   assert.equal(legendOf(context, 1).hidden, true, "足迹图下主图指标全部隐藏, 图例收起");

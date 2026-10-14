@@ -96,4 +96,7 @@ test("委托带的止盈止损: 只列填了的, 都没填是空串", () => {
   assert.equal(stopsText({ tp: 3100, sl: 2950 }, 0), "止盈 3100 · 止损 2950");
   assert.equal(stopsText({ tp: null, sl: 84000.5 }, 1), "止损 84000.5");
   assert.equal(stopsText({}, 0), "");
+  assert.equal(stopsText({ autoStopLoss: 100, status: "open" }, 0), "自动止损 100.00 元 · 止盈 150.00 元");
+  assert.equal(stopsText({ autoStopLoss: 200, status: "filled", autoStopApplied: true }, 0), "自动止损 200.00 元 · 止盈 300.00 元");
+  assert.equal(stopsText({ autoStopLoss: 100, status: "filled", autoStopApplied: false }, 0), "");
 });

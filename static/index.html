@@ -140,7 +140,15 @@
         </select></label>
         <label id="trade-price-row" hidden>价格<input id="trade-price" type="number" min="0" step="any"></label>
         <label id="trade-leverage-row" hidden title="加密合约每个合约一个杠杆(全仓); 降杠杆后保证金不够会被拒">杠杆<select id="trade-leverage"></select></label>
-        <div class="trade-order-stops" title="可选, 留空表示不设。成交后挂到持仓上(只覆盖填了的那一项), 按最新价触发后市价平掉全部持仓。市价单按最新价校验, 限价单按委托价校验; 只减仓、平仓的委托不能带。下单成功后清空">
+        <div id="trade-auto-stops" class="trade-auto-stops" title="开仓成交后按整份持仓的均价和手数换算价格, 加仓、部分平仓后重算。只影响后续成交, 不修改已有持仓; 手动改价后退出金额模式。触发后按市价平仓, 实际盈亏会受跳动价位、价差和手续费影响">
+          <label class="trade-auto-toggle"><input id="trade-auto-enabled" type="checkbox" checked>自动止盈止损</label>
+          <div id="trade-auto-fields" class="trade-auto-fields">
+            <label>止损(元)<input id="trade-auto-loss" type="number" min="0.01" step="any" value="100"></label>
+            <span id="trade-auto-profit">止盈 150 元 · 1:1.5</span>
+          </div>
+          <div id="trade-auto-note" class="trade-auto-note">整份持仓 · 不含手续费 · 价位取整</div>
+        </div>
+        <div id="trade-order-stops" class="trade-order-stops" hidden title="可选, 留空表示不设。成交后挂到持仓上(只覆盖填了的那一项), 按最新价触发后市价平掉全部持仓。市价单按最新价校验, 限价单按委托价校验; 只减仓、平仓的委托不能带。下单成功后清空">
           <label>止盈<input id="trade-order-tp" type="number" min="0" step="any" placeholder="不设"></label>
           <label>止损<input id="trade-order-sl" type="number" min="0" step="any" placeholder="不设"></label>
         </div>
@@ -229,6 +237,7 @@
 <script src="ai-panel.js"></script>
 <script src="ai-history.js"></script>
 <script src="trade-review.js"></script>
+<script src="session-markers.js"></script>
 <script src="chart-view.js"></script>
 <script src="app.js"></script>
 </body>

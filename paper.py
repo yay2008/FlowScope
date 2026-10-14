@@ -30,6 +30,8 @@
 - 下单时也能带止盈止损: 成交后挂到持仓上(只覆盖填了的那一项), 只减仓或平仓的委托不能带。
   市价单按最新价校验; 限价单按委托价校验, 当场成交的再按最新价校验。挂着的限价单成交时价格若已经
   越过止损/止盈价, 成交后紧接着就会触发 —— 和交易所的"成交后生效"一样。
+- 金额模式: 开仓委托可带 autoStopLoss(元), 按成交后整份持仓的均价、手数与乘数换算止损和 1.5 倍止盈。
+  加减仓后重算, 手动设置价格后退出金额模式。价格向达到目标金额的方向取整, 不含手续费与滑点。
 """
 from __future__ import annotations
 
@@ -53,6 +55,7 @@ DEFAULT_CASH = 1_000_000.0
 MIN_CASH, MAX_CASH = 10_000.0, 1e10
 MARGIN_RATE = 0.15        # 保证金率估算值: 交易所 5%~12% 再加期货公司上浮, 实际按品种不同
 MAX_ORDER_QTY = 500
+AUTO_STOP_RATIO = 1.5
 # 开盘前集合竞价(8:55、20:55)的报价也算本时段的新报价。
 AUCTION_LEAD = timedelta(minutes=15)
 # 页面不再请求后, 这个合约的报价还跟踪多久(持仓与挂单合约一直跟踪)。
@@ -282,6 +285,7 @@ def normalize_request(raw) -> dict:
             raise OrderError("限价单要填价格")
     return {"symbol": symbol, "side": side, "type": kind, "qty": int(qty), "price": price,
             "tp": normalize_stop(raw.get("tp"), "tp"), "sl": normalize_stop(raw.get("sl"), "sl"),
+            "autoStopLoss": normalize_auto_stop_loss(raw.get("autoStopLoss")),
             "clientId": str(raw.get("clientId") or "")[:64]}
 
 
@@ -294,6 +298,43 @@ def snap_to_tick(price: float, tick: float) -> float:
 
 
 STOP_LABELS = {"tp": "止盈", "sl": "止损"}
+
+
+def normalize_auto_stop_loss(value) -> float | None:
+    """未传/null 表示不用金额模式; 显式传入时必须是有限正金额。"""
+    if value is None:
+        return None
+    loss = None if isinstance(value, bool) else _price(value)
+    if loss is None or not math.isfinite(loss * AUTO_STOP_RATIO):
+        raise OrderError("自动止损金额要是有限正数")
+    return loss
+
+
+def automatic_stops(position: dict, loss: float, tick: float) -> dict:
+    """整份持仓的税费前目标盈亏 -> 触发价格; 到达金额后的第一个合法价位。
+
+    均价可能不在价位格上(多次成交的加权均价), 所以对最终价格取整而不是对价差取整。
+    跳动金额较大时不能保证正好 100/150 元, 界面按实际生成的价位显示预估盈亏。
+    """
+    value = abs(position["qty"]) * position["multiplier"]
+    direction = 1 if position["qty"] > 0 else -1
+    targets = {"sl": position["avgPrice"] - direction * loss / value,
+               "tp": position["avgPrice"] + direction * loss * AUTO_STOP_RATIO / value}
+    result = {}
+    for kind, target in targets.items():
+        up = (kind == "tp") == (direction > 0)
+        steps = target / tick
+        if not math.isfinite(steps):
+            raise OrderError("自动止盈止损金额过大, 无法生成有效价格")
+        # 容忍十进制价格转 float 后在整数边界上的微小误差。
+        nearest = round(steps)
+        if abs(steps - nearest) < 1e-8:
+            steps = nearest
+        price = round((math.ceil(steps) if up else math.floor(steps)) * tick, 10)
+        if price <= 0:
+            raise OrderError("自动止盈止损价格不大于 0, 请调小止损金额")
+        result[kind] = price
+    return result
 
 
 def normalize_stop(value, kind: str) -> float | None:
@@ -420,7 +461,6 @@ class PaperBook:
             if not open_now:
                 raise OrderError(reason)
             price = self._taker_price(side, qty, quote)
-            self._check_funds(quote["contract"], side, qty, price, quote, now)
         else:
             price = self._check_limit_price(order["price"], quote)
             order["price"] = price
@@ -429,9 +469,14 @@ class PaperBook:
             crosses = opposite is not None and (opposite <= price if side == "buy" else opposite >= price)
             # 够得着对手价就按对手价成交(可能比限价更好); 否则挂着等价格穿过限价。
             price = opposite if open_now and crosses and (volume or 0) >= qty else None
-            self._check_funds(quote["contract"], side, qty, order["price"] if price is None else price, quote, now)
         held = (self.positions.get(quote["contract"]) or {}).get("qty", 0)
+        auto_loss = normalize_auto_stop_loss(request.get("autoStopLoss"))
+        if auto_loss is not None:
+            if any(request.get(key) is not None for key in STOP_LABELS):
+                raise OrderError("自动止盈止损与手动价格不能同时设置")
+            order["autoStopLoss"] = auto_loss
         order.update(order_stops(request, held, quote, order["price"], price is not None))
+        self._check_funds(order, order["price"] if price is None else price, quote, now)
         order["id"] = self._next_id("O")
         self.orders.append(order)
         if price is not None:
@@ -468,7 +513,7 @@ class PaperBook:
             if quote is None or not market_status(quote, now)[0] or not self._trades_through(order, quote):
                 continue
             try:
-                self._check_funds(order["contract"], order["side"], order["qty"], order["price"], quote, now)
+                self._check_funds(order, order["price"], quote, now)
             except OrderError as exc:
                 order.update(status="rejected", reason=str(exc), updatedAt=_stamp(now))
             else:
@@ -500,6 +545,7 @@ class PaperBook:
                 position.pop(key, None)
             else:
                 position[key] = value
+        position.pop("autoStopLoss", None)   # 手动改价/取消后, 加减仓不再覆盖用户设置
         self.stop_errors.pop(contract, None)
         return position
 
@@ -592,15 +638,32 @@ class PaperBook:
         position = {"qty": new_qty, "avgPrice": new_avg, "multiplier": multiplier,
                     "todayQty": today, "tradingDay": day.isoformat()}
         keep_stops(old, position)
+        if new_qty and qty and (new_qty > 0) == (qty > 0) and old.get("autoStopLoss") is not None:
+            position["autoStopLoss"] = old["autoStopLoss"]
         return position, realized, fee, opening, closing
 
-    def _check_funds(self, contract: str, side: str, qty: int, price: float, quote: dict, now: datetime):
+    def _fill_preview(self, order: dict, price: float, quote: dict, now: datetime):
+        """成交前完整校验(含自动价位), 还没改委托、持仓或资金, 拒单不会留下半笔成交。"""
+        signed = order["qty"] if order["side"] == "buy" else -order["qty"]
+        day = trading_day(parse_quote_time(quote.get("datetime")) or now)
+        position, realized, fee, opening, closing = self._preview(
+            order["contract"], signed, price, quote["multiplier"], day)
+        if opening:
+            if order.get("autoStopLoss") is not None:
+                position["autoStopLoss"] = order["autoStopLoss"]
+            elif any(order.get(key) is not None for key in STOP_LABELS):
+                position.pop("autoStopLoss", None)
+        attach_stops(order, position)
+        if position.get("autoStopLoss") is not None:
+            position.update(automatic_stops(position, position["autoStopLoss"], quote["priceTick"]))
+        return position, realized, fee, opening, closing
+
+    def _check_funds(self, order: dict, price: float, quote: dict, now: datetime):
         """开仓(含反手的开仓部分)要求成交后权益仍够付全部保证金; 只减仓不查。"""
-        signed = qty if side == "buy" else -qty
-        position, realized, fee, opening, _ = self._preview(
-            contract, signed, price, quote["multiplier"], trading_day(now))
+        position, realized, fee, opening, _ = self._fill_preview(order, price, quote, now)
         if not opening:
             return
+        contract = order["contract"]
         others = [(key, pos) for key, pos in self.positions.items() if key != contract]
         mark = quote.get("last") or price  # 与 _fill 之后的账户估值保持一致。
         equity = self.cash + realized - fee + sum(self._float_pnl(key, pos) for key, pos in others)
@@ -613,10 +676,7 @@ class PaperBook:
     def _fill(self, order: dict, price: float, quote: dict, now: datetime):
         moment = parse_quote_time(quote.get("datetime")) or now
         day = trading_day(moment)
-        signed = order["qty"] if order["side"] == "buy" else -order["qty"]
-        position, realized, fee, opening, closing = self._preview(
-            order["contract"], signed, price, quote["multiplier"], day)
-        attach_stops(order, position)
+        position, realized, fee, opening, closing = self._fill_preview(order, price, quote, now)
         if position["qty"]:
             self.positions[order["contract"]] = position
         else:
@@ -632,6 +692,8 @@ class PaperBook:
                             "time": chart_time(moment), "at": _stamp(moment),
                             "tradingDay": day.isoformat()})
         order.update(status="filled", fillPrice=price, filledAt=_stamp(moment), updatedAt=_stamp(now))
+        if order.get("autoStopLoss") is not None:
+            order["autoStopApplied"] = bool(opening)
 
     def _trim(self):
         """挂单全留; 已结束的委托和成交只留最近的, 账户文件不会无限长大。"""
@@ -666,6 +728,7 @@ class PaperBook:
                               "last": self.marks.get(contract), "floatPnl": round(float_pnl, 2),
                               "margin": round(margin, 2), "multiplier": position["multiplier"],
                               "tp": position.get("tp"), "sl": position.get("sl"),
+                              "autoStopLoss": position.get("autoStopLoss"),
                               "stopError": self.stop_errors.get(contract)})
         equity = self.cash + float_total
         return {"account": {"initialCash": self.initial_cash, "cash": round(self.cash, 2),
@@ -794,7 +857,8 @@ class PaperService:
             contract = self._aliases.get(value, value)
             position = book.set_stops(contract, tp, sl, self._quotes.get(contract))
             self._save(book)
-            return {"contract": contract, "qty": position["qty"], "tp": position.get("tp"), "sl": position.get("sl")}
+            return {"contract": contract, "qty": position["qty"], "tp": position.get("tp"), "sl": position.get("sl"),
+                    "autoStopLoss": position.get("autoStopLoss")}
 
     # ---------- 采集线程里执行的部分 ----------
 
@@ -959,6 +1023,7 @@ class PaperService:
             finished = [order for order in book.orders if order["status"] != "open"][-10:]
             return {**book.summary(),
                     "symbol": value, "contract": contract, "quote": quote,
+                    "autoStopRatio": AUTO_STOP_RATIO,
                     "fee": book.fees.spec(contract) if contract else None,
                     "feeSource": book.fees.source,
                     "orders": open_orders + finished[::-1],

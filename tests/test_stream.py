@@ -162,6 +162,39 @@ class FeedTests(unittest.TestCase):
         self.feed.quote = None
         self.assertNotIn("priceDigits", self.feed.cfg())
 
+    def test_trading_times_are_copied_and_late_metadata_is_broadcast_without_new_bars(self):
+        messages = []
+        self.feed.recompute(messages.append)
+        self.assertNotIn("tradingTime", self.feed.snapshots[0]["cfg"])
+        messages.clear()
+        day = [["09:00:00", "10:15:00"], ["10:30:00", "11:30:00"], ["13:30:00", "15:00:00"]]
+        self.feed.quote.trading_time = SimpleNamespace(day=day, night=[["21:00:00", "25:00:00"]])
+        self.feed.recompute(messages.append)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["type"], "bars")
+        self.assertEqual(messages[0]["bars"], [])
+        self.assertEqual(messages[0]["cfg"]["tradingTime"]["day"], day)
+        previous = self.feed.snapshots[0]
+        self.feed.quote.trading_time.night[0][1] = "26:30:00"
+        self.assertEqual(previous["cfg"]["tradingTime"]["night"][0][1], "25:00:00")
+        messages.clear()
+        self.feed.recompute(messages.append)
+        self.assertEqual(messages[0]["cfg"]["tradingTime"]["night"][0][1], "26:30:00")
+        messages.clear()
+        self.feed.recompute(messages.append)
+        self.assertEqual(messages, [], "时段不变时不用重复下发配置")
+
+    def test_trading_time_dict_and_rollup_use_the_same_contract_schedule(self):
+        periods = {"day": [["09:00:00", "15:00:00"]], "night": []}
+        self.feed.quote.trading_time = periods
+        rolled = ingest.FuturesRollupFeed(self.feed.symbol, 3600, lambda: self.feed)
+        self.assertEqual(rolled.cfg()["tradingTime"], periods)
+        self.assertEqual(rolled.cfg()["tf"], 3600)
+        from unittest.mock import Mock
+        api = Mock()
+        api.is_changing.side_effect = lambda obj, *keys: obj is self.feed.quote and "trading_time" in keys[0]
+        self.assertTrue(self.feed.data_changing(api))
+
     def test_lower_candles_subscribe_on_demand_and_reuse_main_period(self):
         from unittest.mock import Mock
         api = Mock()

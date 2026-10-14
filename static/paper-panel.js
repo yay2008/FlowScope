@@ -25,6 +25,8 @@
   const POLL_MS = 1000;
   const POLL_COLLAPSED_MS = 5000;
   const COLLAPSED_KEY = "flowscope.tradeCollapsed";
+  const AUTO_STOPS_KEY = "flowscope.futuresAutoStops";
+  const AUTO_STOP_RATIO = 1.5;
   const STATUS_LABELS = { open: "挂单中", filled: "已成交", cancelled: "已撤", rejected: "已拒" };
   const LEVERAGES = [1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125];
   const STOP_NAMES = { tp: "止盈", sl: "止损" };
@@ -135,6 +137,10 @@
 
   // 委托带的止盈止损(成交后挂到持仓上), 没带回空串
   function stopsText(order, decimals) {
+    if (order.autoStopLoss != null) {
+      if (order.status === "filled" && order.autoStopApplied === false) return "";
+      return `自动止损 ${formatMoney(order.autoStopLoss, 2)} 元 · 止盈 ${formatMoney(order.autoStopLoss * AUTO_STOP_RATIO, 2)} 元`;
+    }
     const parts = [];
     if (order.tp != null) parts.push(`止盈 ${FlowDataRef.formatPrice(order.tp, decimals)}`);
     if (order.sl != null) parts.push(`止损 ${FlowDataRef.formatPrice(order.sl, decimals)}`);
@@ -162,6 +168,9 @@
       qtyLabel: byId("trade-qty-label"), leverageRow: byId("trade-leverage-row"), leverage: byId("trade-leverage"),
       stops: byId("trade-stops"), tp: byId("trade-tp"), sl: byId("trade-sl"), stopsSet: byId("trade-stops-set"),
       stopsNote: byId("trade-stops-note"), orderTp: byId("trade-order-tp"), orderSl: byId("trade-order-sl"),
+      orderStops: byId("trade-order-stops"), autoStops: byId("trade-auto-stops"),
+      autoEnabled: byId("trade-auto-enabled"), autoFields: byId("trade-auto-fields"),
+      autoLoss: byId("trade-auto-loss"), autoProfit: byId("trade-auto-profit"), autoNote: byId("trade-auto-note"),
     };
     let state = null;
     let timer = null;
@@ -184,6 +193,39 @@
     const unit = () => (isCrypto() ? (state.quote && state.quote.unit) || "" : "手");
     const currentPosition = () => currentPositionOf(state);
     const readPrice = (input) => (input.value === "" ? null : Number(input.value));   // 空 = 不设
+
+    function loadAutoStops() {
+      if (!els.autoEnabled) return;
+      let saved;
+      try { saved = JSON.parse(root.localStorage.getItem(AUTO_STOPS_KEY)); } catch (error) { /* 用默认值 */ }
+      els.autoEnabled.checked = !saved || saved.enabled !== false;
+      const loss = saved && saved.loss;
+      els.autoLoss.value = Number.isFinite(loss * AUTO_STOP_RATIO) && loss > 0 ? String(loss) : "100";
+    }
+
+    function renderAutoStops() {
+      if (!els.autoEnabled) return;
+      const enabled = !isCrypto() && els.autoEnabled.checked;
+      els.autoStops.hidden = isCrypto();
+      els.autoFields.hidden = !enabled;
+      els.autoNote.hidden = !enabled;
+      els.orderStops.hidden = enabled;
+      const unavailable = enabled && state && state.autoStopRatio !== AUTO_STOP_RATIO;
+      els.autoNote.textContent = unavailable ? "请先重启服务，再使用自动止盈止损" : "整份持仓 · 不含手续费 · 价位取整";
+      els.autoNote.classList.toggle("error", !!unavailable);
+      const loss = Number(els.autoLoss.value);
+      els.autoProfit.textContent = loss > 0 && Number.isFinite(loss * AUTO_STOP_RATIO)
+        ? `止盈 ${formatMoney(loss * AUTO_STOP_RATIO, 2)} 元 · 1:1.5` : "请输入有效止损金额";
+    }
+
+    function changeAutoStops() {
+      renderAutoStops();
+      const loss = Number(els.autoLoss.value);
+      if (!(loss > 0) || !Number.isFinite(loss * AUTO_STOP_RATIO)) return;
+      try {
+        root.localStorage.setItem(AUTO_STOPS_KEY, JSON.stringify({ enabled: els.autoEnabled.checked, loss }));
+      } catch (error) { /* 存储不可用不影响下单 */ }
+    }
 
     function setCollapsed(value) {
       try {
@@ -298,6 +340,7 @@
       if (isCrypto() && els.leverage && root.document.activeElement !== els.leverage) {
         els.leverage.value = String(state.leverage);
       }
+      renderAutoStops();
     }
 
     function renderButtons() {
@@ -351,6 +394,11 @@
         ["保证金", money(position.margin)],
         ["止盈 / 止损", `${position.tp != null ? price(position.tp) : "—"} / ${position.sl != null ? price(position.sl) : "—"}`],
       ] : [["当前合约", "无持仓"]];
+      if (position && position.autoStopLoss != null) {
+        rows.push(["目标止损 / 止盈(元)", `${money(position.autoStopLoss)} / ${money(position.autoStopLoss * AUTO_STOP_RATIO)}`]);
+        const pnl = (value) => value == null ? "—" : signed((value - position.avgPrice) * position.qty * position.multiplier);
+        rows.push(["价位预估盈亏(元)", `${pnl(position.sl)} / ${pnl(position.tp)}`]);
+      }
       if (position && isCrypto()) {
         rows.push(["杠杆", `${position.leverage}x 全仓`]);
         rows.push(["强平价(估)", position.liqPrice != null ? price(position.liqPrice) : "—"]);
@@ -523,14 +571,27 @@
           return;
         }
       }
-      const tp = readPrice(els.orderTp);
-      const sl = readPrice(els.orderSl);
-      if ([tp, sl].some((value) => value != null && !(value > 0))) {
-        showMessage("止盈止损价要是正数", "error");
-        return;
+      if (!isCrypto() && els.autoEnabled && els.autoEnabled.checked) {
+        if (!state || state.autoStopRatio !== AUTO_STOP_RATIO) {
+          showMessage("请先重启服务，再使用自动止盈止损", "error");
+          return;
+        }
+        const loss = Number(els.autoLoss.value);
+        if (!(loss > 0) || !Number.isFinite(loss * AUTO_STOP_RATIO)) {
+          showMessage("自动止损金额要是有限正数", "error");
+          return;
+        }
+        body.autoStopLoss = loss;
+      } else {
+        const tp = readPrice(els.orderTp);
+        const sl = readPrice(els.orderSl);
+        if ([tp, sl].some((value) => value != null && !(value > 0))) {
+          showMessage("止盈止损价要是正数", "error");
+          return;
+        }
+        if (tp != null) body.tp = tp;
+        if (sl != null) body.sl = sl;
       }
-      if (tp != null) body.tp = tp;
-      if (sl != null) body.sl = sl;
       send("/api/paper/orders", { method: "POST", headers: { "Content-Type": "application/json" },
                                   body: JSON.stringify(body) },
            (order) => {
@@ -562,6 +623,7 @@
                     if (position && position.contract === result.contract) {
                       position.tp = result.tp;
                       position.sl = result.sl;
+                      position.autoStopLoss = result.autoStopLoss;
                       render();
                       onState(state);
                     }
@@ -621,6 +683,12 @@
     }
     els.reset.addEventListener("click", reset);
     if (els.leverage) els.leverage.addEventListener("change", changeLeverage);
+    if (els.autoEnabled) {
+      loadAutoStops();
+      renderAutoStops();
+      els.autoEnabled.addEventListener("change", changeAutoStops);
+      els.autoLoss.addEventListener("input", changeAutoStops);
+    }
     els.type.addEventListener("change", () => {
       // 切到限价时用最新价预填, 省得从空白开始敲
       if (orderType() === "limit" && !els.price.value && state && state.quote && state.quote.last != null) {

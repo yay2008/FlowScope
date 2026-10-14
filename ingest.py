@@ -208,7 +208,7 @@ class Feed:
         """本轮 wait_update 有没有带来它关心的新数据。"""
         return (api.is_changing(self.ticks) or api.is_changing(self.klines) or
                 any(api.is_changing(lower) for lower in self.lower_klines.values()) or
-                api.is_changing(self.quote, "price_tick"))
+                api.is_changing(self.quote, ["price_tick", "price_decs", "trading_time"]))
 
     def ensure_ltf_subscriptions(self, api):
         """只在 ingest 线程订阅当前被请求的小周期 K 线。"""
@@ -376,7 +376,7 @@ class Feed:
             broadcast(message)
 
     def cfg(self) -> dict:
-        """快照里下发前端的配置: 周期参数 + 合约价格的显示位数(加密合约另按自己的步长覆盖)。
+        """快照里下发前端的配置: 周期参数、价格位数和合约交易时段。
 
         报价还没到时(price_tick 还是 NaN) price_decs 是默认的 0, 不可信: 这时不下发 priceDigits,
         前端按「位数未知」处理, 不拿 0 位去取整(国债期货 107.85 会被取成 108)。
@@ -387,6 +387,14 @@ class Feed:
         if (isinstance(tick, (int, float)) and math.isfinite(tick) and tick > 0
                 and isinstance(decs, (int, float)) and decs >= 0):
             cfg["priceDigits"] = int(decs)
+        trading_time = getattr(self.quote, "trading_time", None)
+        if trading_time is not None:
+            # TradingTime 是实时对象, 必须复制成普通列表, 避免旧快照也随 SDK 就地更新。
+            cfg["tradingTime"] = {}
+            for key in ("day", "night"):
+                periods = (trading_time.get(key) if isinstance(trading_time, Mapping)
+                           else getattr(trading_time, key, None))
+                cfg["tradingTime"][key] = [list(period) for period in (periods or [])]
         return cfg
 
     def _publish(self, ltf, bars, previous, revision):
@@ -411,10 +419,13 @@ class Feed:
                     "bars": recs}
         old = {b["time"]: b for b in previous.get(ltf, {}).get("bars", [])}
         changed = [bar for bar in recs if old.get(bar["time"]) != bar]
+        cfg_changed = previous.get(ltf, {}).get("cfg") != snapshot["cfg"]
         message = None
-        if changed:
+        if changed or cfg_changed:
             message = {"type": "bars", "symbol": self.symbol, "ltf": ltf,
                        "tf": self.tf, "revision": revision, "bars": changed}
+            if cfg_changed:
+                message["cfg"] = snapshot["cfg"]
         return snapshot, message
 
 
