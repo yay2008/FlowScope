@@ -63,7 +63,7 @@
       els.error.textContent = "";
       els.foot.textContent = "";
     }
-    function renderSnapshot(value) {
+    function renderSnapshot(value, historical = false) {
       snapshot = value;
       els.summary.replaceChildren();
       els.contracts.replaceChildren();
@@ -89,7 +89,9 @@
         tile.append(name, data);
         els.summary.appendChild(tile);
       }
-      els.basis.textContent = `${value.date || ""} ${value.dateBasis || ""} · ${currency} · ${
+      const naturalDay = value.dateBasis === "北京时间自然日";
+      const legacyTradingDay = historical && value.account === "futures" && value.dateBasis === "交易日";
+      els.basis.textContent = `${value.date || ""} ${value.dateBasis || ""}${naturalDay ? " · 00:00–24:00（北京时间）" : ""} · ${currency} · ${
         (value.contracts || []).length} 个合约${value.snapshotAt ? ` · 快照 ${value.snapshotAt.replace("T", " ").replace(/\+08:00$/, " 北京时间")}` : ""}`;
       for (const item of value.contracts || []) {
         const row = doc.createElement("div");
@@ -97,7 +99,8 @@
         row.textContent = `${item.contract} · ${item.tradeCount ?? 0} 笔 · 净收益 ${amount(item.netPnl, currency)}`;
         els.contracts.appendChild(row);
       }
-      els.warnings.textContent = warningText(value) || (!canReview(value) ? "这一天没有成交或资金费记录。" : "");
+      const warnings = [legacyTradingDay ? "旧交易日口径（含前一晚夜盘），请重新生成自然日复盘。" : "", warningText(value)].filter(Boolean);
+      els.warnings.textContent = warnings.join("\n") || (!canReview(value) ? "这一天没有成交或资金费记录。" : "");
       els.start.disabled = !canReview(value) || !!runController;
       els.again.disabled = els.start.disabled;
     }
@@ -305,7 +308,7 @@
         if (value) {
           els.account.value = value.account || record.account || els.account.value;
           els.date.value = value.date || record.reviewDate || "";
-          renderSnapshot(value);
+          renderSnapshot(value, true);
         }
         els.thinking.hidden = !record.reasoning;
         els["thinking-text"].textContent = record.reasoning || "";

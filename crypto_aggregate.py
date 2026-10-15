@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 import ingest
-from crypto_feed import IDLE_RECOMPUTE_SEC, VENUE_NAMES, rollup_bases, venue_of
+from crypto_feed import IDLE_RECOMPUTE_SEC, VENUE_NAMES, large_trade_source, rollup_bases, venue_of
 from indicator import BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, VOLUME_ROUND, finalize_bars, ltf_options
 from ingest import feed_key
 
@@ -44,6 +44,17 @@ class AggregateFeed(ingest.Feed):
         self.last_sync = 0.0
         self.last_compute = 0.0
         self.pending = False      # 成分合约有变动、还没重算
+        self._large_sources = []
+        # 成分合约还没采集时的占位: 只提供参数说明, 没有记录, 汇总里该所按未覆盖算。
+        self._large_missing = {part: ingest.LargeTradeDetector(part, large_trade_source(part))
+                               for part in components}
+
+    def _new_large_detector(self):
+        """大额事件来自各成分合约自己的检测器(见 recompute), 汇总不自建。"""
+        return None
+
+    def large_sources(self):
+        return self._large_sources
 
     def cfg(self) -> dict:
         return {**super().cfg(), "priceDigits": self.price_digits, "volumeDigits": self.qty_digits}
@@ -115,6 +126,9 @@ class AggregateFeed(ingest.Feed):
         return df[BAR_COLUMNS]
 
     def recompute(self, manager, broadcast):
+        self._large_sources = [detector for symbol in self.components
+                               for detector in (manager.feeds[feed_key(symbol, self.tf)].large_sources()
+                                   if feed_key(symbol, self.tf) in manager.feeds else [self._large_missing[symbol]])]
         with self._state_lock:
             now = time.monotonic()
             ltfs = [ltf for ltf, expires in self._requested.items() if expires >= now]

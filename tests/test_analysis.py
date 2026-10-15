@@ -34,7 +34,7 @@ def chart(tf=30, ltf=0, **overrides):
         "tf": tf, "image": data_url(),
         "columns": ["time", "open", "close", "buy", "ema21"],
         "rows": [[T0, 3000, 3001.0, None, 3000.25], [T0 + tf, 3001, 2999.5, 12, 3000.21]],
-        "meta": {"view": "candle", "ltf": ltf, "shown": {"ema": True, "band": False},
+        "meta": {"view": "candle", "ltf": ltf, "shown": {"ema": True, "band": False, "large": True, "ob": False},
                  "range": {"from": T0, "to": T0 + tf}, "loaded": {"count": 800, "from": T0 - 3600,
                                                                   "high": 3050, "low": 2950},
                  "coverage": {"complete": 1, "missing": 1}},
@@ -154,7 +154,7 @@ class RequestTest(unittest.TestCase):
         self.assertIn("10-08 08:00,3000,3001,,3000.25", text)
         self.assertIn("10-08 08:00:00,3000,3001,,3000.25", text)
         self.assertIn("数值表里买卖量的覆盖: 完整 1 根、缺失 1 根", text)
-        self.assertIn("主图叠加: EMA 开、FlowWave带 关\n", text)
+        self.assertIn("主图叠加: EMA 开、FlowWave带 关、大额成交 开、OB Zones 关\n", text)
         self.assertIn("FlowWave带 宽度: ±2σ", text)
         self.assertNotIn("WaveTrend", text + analysis.SYSTEM_PROMPT, "WaveTrend 已删除, 提示词里不能再提")
         self.assertIn("买卖量: tick 口径", text)

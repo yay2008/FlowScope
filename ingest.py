@@ -33,6 +33,7 @@ from indicator import (CFG, DEFAULT_TF_SEC, ROLLUP_BASE_TF, TF_OPTIONS, bar_ns_f
 from history_store import HistoryStore
 from rollup import RollupMixin, candles_from_klines
 from tick_analytics import TickAnalytics
+from large_trades import LargeTradeDetector, decorate_bars
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -177,6 +178,13 @@ class Feed:
         self.latest = {}
         self.analytics = TickAnalytics(self.bar_ns)
         self.lower_klines = {}
+        self.large_trades = self._new_large_detector()
+        self._large_synced = None   # (TickAnalytics, version): 快照没变就不再喂检测器
+        self._large_cache = None    # (输入签名, 各根汇总): 各拆分粒度共用, 见 _decorate_large
+
+    def _new_large_detector(self):
+        """原生周期自带大额检测器; 合成周期与多所汇总没有自己的原始成交, 覆盖为 None。"""
+        return LargeTradeDetector(self.symbol)
 
     def subscribe(self, api: TqApi):
         ensure_listed(api, self.symbol)   # 不存在的代码会让 get_quote 弄坏整条连接
@@ -322,6 +330,11 @@ class Feed:
         self.analytics.update(self.ticks)
         self.analytics.retain([0], want_fp)
         classified = self.analytics.frame
+        # 同合约的 10s/30s 共用一个检测器, 各自的 tick 窗口没变时不必重复比对。
+        synced = (self.analytics, self.analytics.version)
+        if synced != self._large_synced:
+            self.large_trades.sync_futures(classified, self.analytics.changed_ns, self.analytics.version == 1)
+            self._large_synced = synced
         valid_klines = self.klines.dropna(subset=["datetime", "close"])
         if valid_klines.empty:
             return
@@ -395,7 +408,24 @@ class Feed:
                 periods = (trading_time.get(key) if isinstance(trading_time, Mapping)
                            else getattr(trading_time, key, None))
                 cfg["tradingTime"][key] = [list(period) for period in (periods or [])]
+        cfg["largeTrades"] = [detector.config() for detector in self.large_sources()]
         return cfg
+
+    def large_sources(self):
+        return [self.large_trades]
+
+    def _decorate_large(self, recs):
+        """大额统计只取决于检测器状态和各根时间、成交量, 与拆分粒度无关:
+        同一轮各粒度输入相同时复用上一份汇总(只读共享, 有变化时整份重建, 不会就地改旧快照)。"""
+        sources = self.large_sources()
+        key = (tuple(sources), tuple(d.version for d in sources),
+               tuple((r["time"], r.get("volume")) for r in recs))
+        if self._large_cache is not None and self._large_cache[0] == key:
+            for rec, summary in zip(recs, self._large_cache[1]):
+                rec["large"] = summary
+            return
+        decorate_bars(recs, sources, self.tf)
+        self._large_cache = (key, [rec.get("large") for rec in recs])
 
     def _publish(self, ltf, bars, previous, revision):
         """合并历史、落盘、算 CVD, 返回 (该粒度的快照, 有变化时的增量消息或 None)。"""
@@ -412,7 +442,8 @@ class Feed:
     def _snapshot_message(self, ltf, bars, previous, revision, cvd_base):
         """算好的 bars -> (该粒度的快照, 与上一份快照相比有变化时的增量消息或 None)。"""
         recs = bars_to_records(bars.tail(SNAPSHOT_BARS))
-        snapshot = {"symbol": self.symbol, "cfg": self.cfg(), "ltf": ltf,
+        self._decorate_large(recs)
+        snapshot ={"symbol": self.symbol, "cfg": self.cfg(), "ltf": ltf,
                     "tf": self.tf,
                     "source": "tick" if ltf == 0 else "kline",
                     "revision": revision, "cvdBase": cvd_base,
@@ -711,7 +742,11 @@ class FeedManager:
 
     def _new_feed(self, key: tuple[str, int]) -> Feed:
         if not is_rollup(key[1]):
-            return Feed(*key)
+            feed = Feed(*key)
+            peer = next((f for f in self.feeds.values() if f.symbol == key[0] and not is_rollup(f.tf)), None)
+            if peer is not None:
+                feed.large_trades = peer.large_trades
+            return feed
         base_key = (key[0], ROLLUP_BASE_TF)
         return FuturesRollupFeed(key[0], key[1], lambda: self.feeds.get(base_key))
 
@@ -742,7 +777,7 @@ class FeedManager:
         with self._lock:
             for key in self.pinned:
                 if key not in self.feeds and len(self.feeds) < MAX_FEEDS:
-                    self.feeds[key] = Feed(*key)
+                    self.feeds[key] = self._new_feed(key)
 
     def fail_feed(self, feed: Feed, message: str, now=None):
         """登记订阅冷却；采集循环自行检查截止时间，不跨线程操作 asyncio 定时器。"""

@@ -356,6 +356,60 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
 .ml-slash { display: none; }
 .ml-item.off .ml-slash { display: inline; }
 
+.main-legend .large-read { flex: 0 1 auto; font-size: 11px; color: #b8c4d6; }
+.large-read[hidden], .large-tooltip[hidden] { display: none; }
+.large-tooltip {
+  position: absolute;
+  z-index: 8;
+  pointer-events: none;
+  max-width: min(380px, calc(100% - 32px));
+  padding: 11px 13px;
+  border: 1px solid #465268;
+  border-radius: 6px;
+  background: rgba(19, 23, 34, 0.97);
+  box-shadow: 0 5px 20px #0006;
+  color: #d1d4dc;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+/* OB 参数只展开在本图图例下, 不挤动价格图。 */
+.ml-item[data-key="ob"] { position: relative; }
+.main-legend .ob-read { flex: 0 1 auto; font-size: 11px; color: #9598a1; }
+.ob-read[hidden], .ob-settings[hidden] { display: none; }
+.ob-settings {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 5;
+  width: 246px;
+  max-width: calc(100vw - 80px);
+  padding: 12px;
+  border: 1px solid #434651;
+  border-radius: 6px;
+  background: #1e222d;
+  box-shadow: 0 4px 16px #0006;
+  color: #d1d4dc;
+  white-space: normal;
+}
+.ob-settings label { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.ob-settings input, .ob-actions button {
+  background: #131722;
+  color: #d1d4dc;
+  border: 1px solid #434651;
+  border-radius: 3px;
+  padding: 3px 6px;
+  font: inherit;
+}
+.ob-actions button { cursor: pointer; }
+.ob-actions button:hover { background: #2a2e39; }
+.ob-settings input[type="number"] { width: 76px; min-width: 0; }
+.ob-settings input[type="color"] { width: 40px; height: 24px; padding: 1px; cursor: pointer; }
+.ob-settings p { margin: 8px 0; color: #9598a1; line-height: 1.5; }
+.ob-actions { display: flex; justify-content: space-between; gap: 12px; }
+
 /* ---------- 自选面板 ---------- */
 #workspace { display: flex; flex: 1; min-height: 0; min-width: 0; }
 

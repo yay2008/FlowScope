@@ -97,7 +97,7 @@
       meta: {
         view: input.view === "footprint" ? "footprint" : "candle",
         ltf: input.ltf,          // 本图买卖量实际的拆分粒度: 0 = tick 口径, 正数 = 按这么多秒的小周期 K 线归类
-        shown: { ema: !!shown.ema, band: !!shown.band },
+        shown: { ema: !!shown.ema, band: !!shown.band, large: !!shown.large, ob: !!shown.ob },
         range: { from: bars[from].time, to: bars[to - 1].time },
         loaded: { count: bars.length, from: bars[0].time, high: px(high), low: px(low) },
         coverage,

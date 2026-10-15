@@ -46,7 +46,7 @@
   <span class="ai-group">
     <button id="ai-run" type="button" title="把图表截图连同这段行情的数值交给 DeepSeek 分析，结果显示在图表上方的浮层里，并存到 data/analysis/。默认只发鼠标所在的那张图。">AI 分析</button>
     <button id="ai-history-open" type="button" aria-controls="ai-history" aria-expanded="false" title="查看已保存的分析结论与当时的截图">历史分析</button>
-    <button id="trade-review-open" type="button" aria-controls="trade-review-panel" aria-expanded="false" title="按日期复盘模拟账户的全部成交与资金费">AI 复盘</button>
+    <button id="trade-review-open" type="button" aria-controls="trade-review-panel" aria-expanded="false" title="按北京时间自然日复盘模拟账户的成交与资金费">AI 复盘</button>
     <label title="勾上后两张图一起发给 AI（大周期在前：先定方向再找位置）；两张图周期相同时只发鼠标所在的那张"><input id="ai-both" type="checkbox">双图</label>
   </span>
   <!-- 状态点: 两张图的连接状态 + 合约目录/自选的提示, 细节在悬停提示里(app.js 的 showStatus) -->
@@ -94,7 +94,7 @@
       <div id="trade-review-body" class="ai-body">
         <div class="trade-review-controls">
           <label>模拟账户<select id="trade-review-account"><option value="futures">期货模拟</option><option value="crypto">加密模拟</option></select></label>
-          <label>复盘日期<input id="trade-review-date" type="date"></label>
+          <label>复盘日期（北京时间）<input id="trade-review-date" type="date"></label>
           <button id="trade-review-refresh" type="button" title="重新读取当前账户和日期的交易记录">刷新记录</button>
           <button id="trade-review-start" type="button" disabled>开始复盘</button>
         </div>
@@ -238,6 +238,7 @@
 <script src="ai-history.js"></script>
 <script src="trade-review.js"></script>
 <script src="session-markers.js"></script>
+<script src="large-trades.js"></script>
 <script src="chart-view.js"></script>
 <script src="app.js"></script>
 </body>

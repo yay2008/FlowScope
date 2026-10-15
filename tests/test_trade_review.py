@@ -6,7 +6,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -62,7 +62,7 @@ def collect(service, request):
 
 
 class SnapshotTest(unittest.TestCase):
-    def test_futures_trading_day_includes_previous_night_and_all_fills(self):
+    def test_futures_natural_day_excludes_previous_night_and_includes_same_night(self):
         fills = [trade(1, "2026-10-13 21:01:00", trading_day="2026-10-14")]
         fills += [trade(i, f"2026-10-14 10:{i - 2:02d}:00") for i in range(2, 62)]
         fills += [trade(62, "2026-10-14 21:01:00", trading_day="2026-10-15")]
@@ -73,12 +73,68 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(result["currency"], "CNY")
         self.assertEqual(result["summary"]["tradeCount"], 61)
         self.assertEqual(len(result["trades"]), 61, "不能沿用 /api/paper 最近 50 笔的限制")
-        self.assertEqual(result["summary"]["firstAt"], "2026-10-13 21:01:00")
+        self.assertEqual(result["summary"]["firstAt"], "2026-10-14 10:00:00")
+        self.assertEqual(result["summary"]["lastAt"], "2026-10-14 21:01:00")
+        self.assertNotIn("T1", {item["id"] for item in result["trades"]})
+        self.assertIn("T62", {item["id"] for item in result["trades"]})
+        self.assertEqual(result["dateBasis"], "北京时间自然日")
         self.assertEqual(source, before, "构造复盘快照不能修改模拟账户")
 
-    def test_futures_default_date_uses_trading_day(self):
-        result = build_snapshot("futures", "", book(), NOW)
-        self.assertEqual((result["date"], result["defaultDate"]), ("2026-10-15", "2026-10-15"))
+    def test_default_date_uses_beijing_today_even_at_night_or_on_weekend(self):
+        for account in ("futures", "crypto"):
+            for moment in (NOW, datetime(2026, 10, 17, 21, 30, tzinfo=CST)):
+                with self.subTest(account=account, moment=moment):
+                    result = build_snapshot(account, "", book(), moment)
+                    self.assertEqual((result["date"], result["defaultDate"]),
+                                     (moment.date().isoformat(), moment.date().isoformat()))
+
+    def test_natural_day_midnight_boundaries_and_cash_flow(self):
+        fills = [trade(1, "2026-10-13 23:59:59.999999", pnl=1000, fee=9, close=1),
+                 trade(2, "2026-10-14 00:00:00", pnl=4, fee=1, close=1),
+                 trade(3, "2026-10-14 23:59:59.999999", pnl=-2, fee=1, close=1,
+                       trading_day="2026-10-15"),
+                 trade(4, "2026-10-15 00:00:00", pnl=1000, fee=9, close=1)]
+        for account in ("futures", "crypto"):
+            with self.subTest(account=account):
+                result = build_snapshot(account, "2026-10-14", book(fills), NOW)
+                self.assertEqual([item["id"] for item in result["trades"]], ["T2", "T3"])
+                self.assertEqual(result["summary"]["tradeCount"], 2)
+                self.assertEqual((result["summary"]["realizedPnl"], result["summary"]["fees"],
+                                  result["summary"]["netPnl"]), (2, 2, 0))
+                self.assertEqual(result["range"], {"from": "2026-10-14T00:00:00+08:00",
+                                                   "to": "2026-10-15T00:00:00+08:00"})
+
+    def test_date_selection_uses_beijing_time_before_filtering(self):
+        fills = [trade(1, "2026-10-13T15:59:59.999999+00:00"),
+                 trade(2, "2026-10-13T16:00:00+00:00"),
+                 trade(3, "2026-10-14T15:59:59.999999+00:00"),
+                 trade(4, "2026-10-14T16:00:00+00:00")]
+        for account in ("futures", "crypto"):
+            with self.subTest(account=account):
+                result = build_snapshot(account, "2026-10-14", book(fills), NOW)
+                self.assertEqual([item["id"] for item in result["trades"]], ["T2", "T3"])
+                result = build_snapshot(account, "", book(), datetime(2026, 10, 13, 16, tzinfo=timezone.utc))
+                self.assertEqual(result["defaultDate"], "2026-10-14")
+
+    def test_trading_day_metadata_does_not_control_natural_day_selection(self):
+        fills = [trade(1, "2026-10-13 21:01:00", trading_day="2026-10-14"),
+                 trade(2, "2026-10-14 21:01:00", trading_day="2026-10-15"),
+                 trade(3, "2026-10-14 22:01:00", trading_day=None),
+                 trade(4, "2026-10-14 23:01:00", trading_day="not-a-date")]
+        result = build_snapshot("futures", "2026-10-14", book(fills), NOW)
+        self.assertEqual([item["id"] for item in result["trades"]], ["T2", "T3", "T4"])
+        self.assertFalse(any("交易日规则" in item for item in result["warnings"]))
+        self.assertNotIn("tradingDay", result["trades"][0])
+
+    def test_funding_uses_the_same_exclusive_midnight_boundary(self):
+        funding = [{"contract": "BINANCE.BTCUSDT.P", "at": at, "amount": amount}
+                   for at, amount in (("2026-10-13T15:59:59+00:00", 1000),
+                                      ("2026-10-13T16:00:00+00:00", -2),
+                                      ("2026-10-14 23:59:59.999999", 3),
+                                      ("2026-10-14T16:00:00+00:00", 1000))]
+        result = build_snapshot("crypto", "2026-10-14", book(fundings=funding), NOW)
+        self.assertEqual(len(result["fundings"]), 2)
+        self.assertEqual((result["summary"]["funding"], result["summary"]["netPnl"]), (1, 1))
 
     def test_crypto_uses_beijing_calendar_and_funding(self):
         fills = [trade(1, "2026-10-14 00:01:00", contract="BINANCE.BTCUSDT.P",
@@ -117,7 +173,7 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(summary["netPnl"], 4)
 
     def test_invalid_date_is_rejected(self):
-        for day in ("2026-02-30", "2026/10/14", "../2026-10-14", "2026-10-14x"):
+        for day in ("2026-02-30", "2026/10/14", "../2026-10-14", "2026-10-14x", "9999-12-31"):
             with self.subTest(day=day), self.assertRaises(ValueError):
                 build_snapshot("futures", day, book(), NOW)
 
@@ -327,6 +383,32 @@ class ServiceTest(unittest.TestCase):
         result = service.snapshot("futures", "2026-10-14")
         self.assertEqual(result["summary"]["netPnl"], 10)
         self.assertEqual(self.actual, before)
+
+    def test_model_and_saved_report_only_receive_selected_natural_day(self):
+        self.actual = book([trade(1, "2026-10-13 21:00:00", pnl=1000, close=1),
+                            trade(2, "2026-10-14 09:00:00", pnl=5, fee=1, close=1),
+                            trade(3, "2026-10-14 21:00:00", pnl=7, fee=1, close=1,
+                                  trading_day="2026-10-15"),
+                            trade(4, "2026-10-15 00:00:00", pnl=1000, close=1)])
+        sent = []
+
+        def transport(settings, payload, cancelled):
+            sent.append(payload)
+            yield from chunk()
+
+        events = collect(self.service(transport), {"account": "futures", "date": "2026-10-14"})
+        system, user = sent[0]["messages"]
+        self.assertIn("北京时间自然日", system["content"])
+        self.assertNotIn("包含前一晚夜盘", system["content"])
+        model_snapshot = json.loads(user["content"].split("\n", 2)[2])
+        self.assertEqual([item["id"] for item in model_snapshot["trades"]], ["T2", "T3"])
+        self.assertEqual(model_snapshot["summary"]["netPnl"], 10)
+        self.assertEqual(model_snapshot["range"]["to"], "2026-10-15T00:00:00+08:00")
+        self.assertEqual(events[-1][0], "done")
+        history = ReviewHistory(lambda: self.root)
+        detail = history.detail(history.list(symbol="futures")["items"][0]["id"])
+        self.assertEqual([item["id"] for item in detail["snapshot"]["trades"]], ["T2", "T3"])
+        self.assertEqual(detail["snapshot"]["dateBasis"], "北京时间自然日")
 
     def test_upstream_error_after_partial_output_is_saved(self):
         def failing(settings, payload, cancelled):

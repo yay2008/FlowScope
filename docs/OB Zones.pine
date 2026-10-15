@@ -1,0 +1,227 @@
+//@version=6
+indicator("OB Zones", shorttitle = "OB Zones", overlay = true, behind_chart = false, max_boxes_count = 500, max_lines_count = 500)
+import TradingView/ta/12
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+preventOverlap = input.bool(true, title = "Prevent Overlap", group = "Calculation", tooltip = "When enabled, new orderblocks will not be created if their price range overlaps any existing active orderblock.\n\nDisable this only if you intentionally want stacked/overlapping zones.")
+zLen = input.int(100, title = "Z-Score Window (bars)", minval = 1, group = "Calculation", tooltip = "Lookback window used to normalize the impulse distance into a z-score.\n\nHigher values = smoother/less reactive; lower values = faster/more signals.")
+maxAge = input.int(500, title = "Max Box Age (bars)", minval = 1, group = "Calculation", tooltip = "Maximum lifetime (in bars) of an orderblock that has not been mitigated.\n\nAfter this many bars the zone is removed to reduce clutter and object usage.")
+
+// ============================================================================
+// APPEARANCE
+// ============================================================================
+bullCol = input.color(#00ffbb, title = "Bullish Colour", group = "Appearance", tooltip = "Primary bullish color used for bullish UI elements.\n\nUsed by: bullish orderblock volume bar.")
+bearCol = input.color(#ff1100, title = "Bearish Colour", group = "Appearance", tooltip = "Primary bearish color used for bearish UI elements.\n\nUsed by: bearish orderblock volume bar.")
+
+ltf = input.timeframe("5", title = "Volume Lower Timeframe", group = "Calculation", tooltip = "Lower timeframe used to split each bar's volume into buy/sell volume for the orderblock volume bars.\n\nMust be lower than the chart timeframe for finer resolution; if it is equal to or higher than the chart timeframe, the split degrades to chart-timeframe precision. Lower values = more precise buy/sell split, but less historical data depth.")
+[upv, downv, deltav] = ta.requestUpAndDownVolume(ltf)
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+var updist = 0.0
+var downdist = 0.0
+
+updist   := close > open ? nz(updist[1]) + (close - open) : 0.0
+downdist := close < open ? nz(downdist[1]) + (open - close) : 0.0
+
+upMean  = ta.sma(updist, zLen)
+upStdev = ta.stdev(updist, zLen)
+dnMean  = ta.sma(downdist, zLen)
+dnStdev = ta.stdev(downdist, zLen)
+
+zUp = (updist - upMean) / (upStdev == 0.0 ? na : upStdev)
+zDn = (downdist - dnMean) / (dnStdev == 0.0 ? na : dnStdev)
+
+bullish = ta.crossover(zUp, 4) and nz(zUp[1]) != 0
+bearish = ta.crossunder(-zDn, -4) and nz((-zDn)[1]) != 0
+
+var box[] bullBoxes = array.new<box>()
+var box[] bearBoxes = array.new<box>()
+var int[] bullStarts = array.new_int()
+var int[] bearStarts = array.new_int()
+
+var box[] bullVolUpBoxes = array.new<box>()
+var box[] bullVolDnBoxes = array.new<box>()
+var float[] bullVolUpData = array.new<float>()
+var float[] bullVolDnData = array.new<float>()
+
+var box[] bearVolUpBoxes = array.new<box>()
+var box[] bearVolDnBoxes = array.new<box>()
+var float[] bearVolUpData = array.new<float>()
+var float[] bearVolDnData = array.new<float>()
+
+bullCreate = false
+bearCreate = false
+
+f_can_create(float tNew, float bNew) =>
+    bool ok = true
+    if bullBoxes.size() > 0
+        for j = 0 to array.size(bullBoxes) - 1
+            exB = array.get(bullBoxes, j)
+            float exTop = box.get_top(exB)
+            float exBot = box.get_bottom(exB)
+            if (tNew > exBot) and (bNew < exTop)
+                ok := false
+                break
+    if ok and bearBoxes.size() > 0
+        for j = 0 to array.size(bearBoxes) - 1
+            exS = array.get(bearBoxes, j)
+            float exTop2 = box.get_top(exS)
+            float exBot2 = box.get_bottom(exS)
+            if (tNew > exBot2) and (bNew < exTop2)
+                ok := false
+                break
+    ok
+
+lastDownIdx = ta.valuewhen(close < open, bar_index, 0)
+lastDownHigh = ta.valuewhen(close < open, high, 0)
+lastDownLow = ta.valuewhen(close < open, low, 0)
+if bullish and not na(lastDownIdx) and not na(lastDownHigh) and not na(lastDownLow)
+    if not preventOverlap or f_can_create(lastDownHigh, lastDownLow)
+        int ago = bar_index - lastDownIdx
+        float upV = nz(upv[ago])
+        float dnV = math.abs(nz(downv[ago]))
+        float midYB = (lastDownHigh + lastDownLow) / 2.0
+
+        bx = box.new(
+             lastDownIdx, lastDownHigh, lastDownIdx + 1, lastDownLow,
+             border_color = color.new(chart.fg_color, 95),
+             bgcolor = color.new(chart.fg_color, 92),
+             text = "▲: " + str.tostring(upV, format.volume) + " | ▼: " + str.tostring(dnV, format.volume),
+             text_size = size.tiny, text_color = chart.fg_color,
+             text_halign = text.align_right, text_valign = text.align_bottom
+        )
+        array.unshift(bullBoxes, bx)
+        array.unshift(bullStarts, lastDownIdx)
+
+        box upBox = box.new(lastDownIdx, lastDownHigh, lastDownIdx + 1, midYB, border_color = color.new(bullCol, 90), bgcolor = color.new(bullCol, 70))
+        box dnBox = box.new(lastDownIdx, midYB, lastDownIdx + 1, lastDownLow, border_color = color.new(bearCol, 90), bgcolor = color.new(bearCol, 70))
+        array.unshift(bullVolUpBoxes, upBox)
+        array.unshift(bullVolDnBoxes, dnBox)
+        array.unshift(bullVolUpData, upV)
+        array.unshift(bullVolDnData, dnV)
+        bullCreate := true
+
+lastUpIdx = ta.valuewhen(close > open, bar_index, 0)
+lastUpHigh = ta.valuewhen(close > open, high, 0)
+lastUpLow = ta.valuewhen(close > open, low, 0)
+if bearish and not na(lastUpIdx) and not na(lastUpHigh) and not na(lastUpLow)
+    if not preventOverlap or f_can_create(lastUpHigh, lastUpLow)
+        int ago = bar_index - lastUpIdx
+        float upV = nz(upv[ago])
+        float dnV = math.abs(nz(downv[ago]))
+        float midYS = (lastUpHigh + lastUpLow) / 2.0
+
+        bx2 = box.new(
+             lastUpIdx, lastUpHigh, lastUpIdx + 1, lastUpLow,
+             border_color = color.new(chart.fg_color, 95),
+             bgcolor = color.new(chart.fg_color, 92),
+             text = "▲: " + str.tostring(upV, format.volume) + " | ▼: " + str.tostring(dnV, format.volume),
+             text_size = size.tiny, text_color = chart.fg_color,
+             text_halign = text.align_right, text_valign = text.align_bottom
+        )
+        array.unshift(bearBoxes, bx2)
+        array.unshift(bearStarts, lastUpIdx)
+
+        box upBox = box.new(lastUpIdx, lastUpHigh, lastUpIdx + 1, midYS, border_color = color.new(bullCol, 90), bgcolor = color.new(bullCol, 70))
+        box dnBox = box.new(lastUpIdx, midYS, lastUpIdx + 1, lastUpLow, border_color = color.new(bearCol, 90), bgcolor = color.new(bearCol, 70))
+        array.unshift(bearVolUpBoxes, upBox)
+        array.unshift(bearVolDnBoxes, dnBox)
+        array.unshift(bearVolUpData, upV)
+        array.unshift(bearVolDnData, dnV)
+        bearCreate := true
+
+if bullBoxes.size() > 0
+    for i = array.size(bullBoxes) - 1 to 0
+        if array.size(bullBoxes) <= i or array.size(bullStarts) <= i
+            continue
+        b = array.get(bullBoxes, i)
+        box.set_right(b, bar_index)
+
+        if array.size(bullVolUpBoxes) > i and array.size(bullVolDnBoxes) > i and array.size(bullVolUpData) > i and array.size(bullVolDnData) > i
+            int l = box.get_left(b)
+            float t = box.get_top(b)
+            float bt = box.get_bottom(b)
+            float midY = (t + bt) / 2.0
+            int midX = int(math.avg(l, bar_index))
+            float upV = array.get(bullVolUpData, i)
+            float dnV = math.max(array.get(bullVolDnData, i), 0.0000001)
+            float ratio = upV / dnV
+            box upBox = array.get(bullVolUpBoxes, i)
+            box dnBox = array.get(bullVolDnBoxes, i)
+            box.set_top(upBox, t), box.set_bottom(upBox, midY), box.set_left(upBox, l)
+            box.set_top(dnBox, midY), box.set_bottom(dnBox, bt), box.set_left(dnBox, l)
+            if ratio > 1
+                box.set_right(upBox, midX)
+                box.set_right(dnBox, int(l + (midX - l) / ratio))
+            else
+                box.set_right(upBox, int(l + (midX - l) * ratio))
+                box.set_right(dnBox, midX)
+        float topB = box.get_top(b)
+        float botB = box.get_bottom(b)
+        bool mitigatedB = close < botB and close[1] < botB
+        int startB = array.get(bullStarts, i)
+        bool expiredB = (bar_index - startB) >= maxAge
+        if mitigatedB or expiredB
+            array.remove(bullBoxes, i)
+            array.remove(bullStarts, i)
+            if array.size(bullVolUpBoxes) > i
+                array.remove(bullVolUpBoxes, i)
+            if array.size(bullVolDnBoxes) > i
+                array.remove(bullVolDnBoxes, i)
+            if array.size(bullVolUpData) > i
+                array.remove(bullVolUpData, i)
+            if array.size(bullVolDnData) > i
+                array.remove(bullVolDnData, i)
+
+if bearBoxes.size() > 0
+    for i = array.size(bearBoxes) - 1 to 0
+        if array.size(bearBoxes) <= i or array.size(bearStarts) <= i
+            continue
+        b = array.get(bearBoxes, i)
+        box.set_right(b, bar_index)
+
+        if array.size(bearVolUpBoxes) > i and array.size(bearVolDnBoxes) > i and array.size(bearVolUpData) > i and array.size(bearVolDnData) > i
+            int l = box.get_left(b)
+            float t = box.get_top(b)
+            float bt = box.get_bottom(b)
+            float midY = (t + bt) / 2.0
+            int midX = int(math.avg(l, bar_index))
+            float upV = array.get(bearVolUpData, i)
+            float dnV = math.max(array.get(bearVolDnData, i), 0.0000001)
+            float ratio = upV / dnV
+            box upBox = array.get(bearVolUpBoxes, i)
+            box dnBox = array.get(bearVolDnBoxes, i)
+            box.set_top(upBox, t), box.set_bottom(upBox, midY), box.set_left(upBox, l)
+            box.set_top(dnBox, midY), box.set_bottom(dnBox, bt), box.set_left(dnBox, l)
+            if ratio > 1
+                box.set_right(upBox, midX)
+                box.set_right(dnBox, int(l + (midX - l) / ratio))
+            else
+                box.set_right(upBox, int(l + (midX - l) * ratio))
+                box.set_right(dnBox, midX)
+        float topS = box.get_top(b)
+        float botS = box.get_bottom(b)
+        bool mitigatedS = close > topS and close[1] > topS
+        int startS = array.get(bearStarts, i)
+        bool expiredS = (bar_index - startS) >= maxAge
+        if mitigatedS or expiredS
+            array.remove(bearBoxes, i)
+            array.remove(bearStarts, i)
+            if array.size(bearVolUpBoxes) > i
+                array.remove(bearVolUpBoxes, i)
+            if array.size(bearVolDnBoxes) > i
+                array.remove(bearVolDnBoxes, i)
+            if array.size(bearVolUpData) > i
+                array.remove(bearVolUpData, i)
+            if array.size(bearVolDnData) > i
+                array.remove(bearVolDnData, i)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(bullCreate, "Bullish Zone Created", "Bullish OrderBlock Created")
+alertcondition(bearCreate, "Bearish Zone Created", "Bearish OrderBlock Created")

@@ -1,4 +1,4 @@
-/* 指标计算: 滚动统计、Volume Suite 阈值分档、LSMA × CRVOL 共振、FlowWave 回归通道、固定范围成交量分布。
+/* 指标计算: 滚动统计、Volume Suite 阈值分档、LSMA × CRVOL 共振、FlowWave 回归通道、OB Zones、固定范围成交量分布。
  *
  * 纯函数, 不碰 DOM 与图表, 浏览器与 Node 回归测试共用(与 data-sync.js 同样的写法)。
  * 状态(bars / cfg / threshtype / 带宽 k)全部由调用方传入, 模块内不留全局状态。
@@ -18,6 +18,19 @@
 
   // 主图 EMA 周期
   const EMA_PERIODS = [21, 55, 100, 200];
+
+  // OB Zones.pine 默认值。阈值固定为 4; 一组区域对应 Pine 的三个 box, 最多显示 166 组完整区域。
+  const OB = { zLen: 100, maxAge: 500, preventOverlap: true,
+               bullColor: "#00ffbb", bearColor: "#ff1100", maxDrawZones: 166 };
+
+  function normalizeObOptions(value = {}) {
+    const v = value && typeof value === "object" ? value : {};
+    const integer = (key) => Number.isSafeInteger(v[key]) && v[key] >= 1 ? v[key] : OB[key];
+    const color = (key) => typeof v[key] === "string" && /^#[\da-f]{6}$/i.test(v[key]) ? v[key] : OB[key];
+    return { zLen: integer("zLen"), maxAge: integer("maxAge"),
+             preventOverlap: typeof v.preventOverlap === "boolean" ? v.preventOverlap : OB.preventOverlap,
+             bullColor: color("bullColor"), bearColor: color("bearColor") };
+  }
 
   // ---------- 判向口径 ----------
   // 后端对同一根 bar 并列输出两套量: buy/sell/unknown 是新算法(Lee-Ready),
@@ -203,6 +216,85 @@
       state[i] = wt2[i] == null ? 0 : wt2[i] > LW.ob ? 1 : wt2[i] < LW.os ? -1 : 0;
     }
     return { mid, up, dn, state };
+  }
+
+  // ---------- OB Zones (TradingView Pine v6 移植) ----------
+
+  // 只用截至当前 bar 的 OHLC 产生信号。区域回画到最近一根反向 K 线, created 才是真正触发的 bar。
+  // 成交量改用本项目 buy/sell(跟随顶部拆分粒度), 缺失保留 null, 不按整根阴阳伪造买卖量。
+  // 全量重建避免实时末根回撤、历史补齐或窗口裁剪后留下旧区域, 与 Pine 的实时 rollback 行为一致。
+  function deriveObZones(bars, options = {}) {
+    const { zLen, maxAge, preventOverlap } = normalizeObOptions(options);
+    const n = bars.length;
+    const up = new Array(n), down = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const body = bars[i].close - bars[i].open;
+      up[i] = body > 0 ? (i ? up[i - 1] : 0) + body : 0;
+      down[i] = body < 0 ? (i ? down[i - 1] : 0) - body : 0;
+    }
+    // Pine ta.stdev 默认总体标准差(除以 n); 标准差为零时 Z 为 na。
+    const zUp = obZ(up, zLen), zDn = obZ(down, zLen);
+    const bullCreate = new Array(n).fill(false), bearCreate = new Array(n).fill(false);
+    const zones = [];
+    let active = [], lastDown = null, lastUp = null;
+    const crossed = (z, i) => i > 0 && z[i] != null && z[i - 1] != null &&
+      z[i] > 4 && z[i - 1] <= 4 && z[i - 1] !== 0;
+    const create = (start, i, side) => {
+      if (start == null) return false;
+      const b = bars[start], top = b.high, bottom = b.low;
+      if (!Number.isFinite(top) || !Number.isFinite(bottom) || top < bottom) return false;
+      // 严格相交才挡住, 边界相接允许; 多空区域互相检查。
+      if (preventOverlap && active.some((z) => top > z.bottom && bottom < z.top)) return false;
+      const volume = (v) => Number.isFinite(v) && v >= 0 ? v : null;
+      const zone = { side, start, created: i, end: i, top, bottom, status: "active",
+                     buy: volume(buyOf(b)), sell: volume(sellOf(b)), unknown: volume(b.unknown),
+                     coverage: b.coverage ?? null };
+      zones.push(zone);
+      active.push(zone);
+      return true;
+    };
+    for (let i = 0; i < n; i++) {
+      const b = bars[i];
+      if (b.close < b.open) lastDown = i;
+      if (b.close > b.open) lastUp = i;
+      // 原脚本先创建再失效: 在本根到期/突破的旧区域仍会阻止本根的重叠新区域。
+      if (crossed(zUp, i)) bullCreate[i] = create(lastDown, i, "bull");
+      if (crossed(zDn, i)) bearCreate[i] = create(lastUp, i, "bear");
+      active = active.filter((z) => {
+        z.end = i;
+        const previous = i ? bars[i - 1].close : null;
+        const mitigated = previous != null && (z.side === "bull"
+          ? b.close < z.bottom && previous < z.bottom : b.close > z.top && previous > z.top);
+        const expired = i - z.start >= maxAge;   // 从反向 K 线起算, 不是从信号根起算
+        if (mitigated || expired) z.status = mitigated ? "mitigated" : "expired";
+        return z.status === "active";
+      });
+    }
+    // Pine 只 array.remove, 没有 box.delete: 失效区域留在历史上, 右端停在失效的 bar。
+    return { zones, zUp, zDn, bullCreate, bearCreate };
+  }
+
+  // rollingZ 用累加再减的滚动和: 一段连续阴线(距离全为 0)之后浮点残差会让标准差略大于 0,
+  // 前一根 Z 成了极小的非零数而不是 na, 下一根阳线就被误判为上穿。窗口内各值完全相同时
+  // 真实标准差恰为 0, 按 Pine 记为 na。
+  function obZ(values, n) {
+    const z = rollingZ(values, n);
+    let same = 0;   // 截至本根, 连续与前一根相等的根数
+    for (let i = 0; i < values.length; i++) {
+      same = i > 0 && values[i] === values[i - 1] ? same + 1 : 0;
+      if (same >= n - 1) z[i] = null;
+    }
+    return z;
+  }
+
+  // 成交量条与 Pine 一样: 较长的一条到区域中点, 另一条按买卖比例缩短, 端点按 bar 下标向下取整。
+  function obVolumeEnds(zone) {
+    if (zone.buy == null || zone.sell == null) return null;
+    const mid = Math.floor((zone.start + zone.end) / 2);
+    const ratio = zone.buy / Math.max(zone.sell, 1e-7);
+    return ratio > 1
+      ? { buy: mid, sell: Math.floor(zone.start + (mid - zone.start) / ratio) }
+      : { buy: Math.floor(zone.start + (mid - zone.start) * ratio), sell: mid };
   }
 
   // ---------- Volume Suite 派生序列与分档 ----------
@@ -412,9 +504,9 @@
   }
 
   const api = {
-    LW, BAND, EMA_PERIODS, VP, buyOf, sellOf, deltaOf,
+    LW, BAND, EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf,
     rollingSma, rollingZ, ema, rma, rsi, linreg, smaStrict, channelIndex,
-    deriveLw, deriveBand, derive, levelOf, volumeProfile,
+    deriveLw, deriveBand, deriveObZones, normalizeObOptions, obVolumeEnds, derive, levelOf, volumeProfile,
   };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.FlowIndicators = api;

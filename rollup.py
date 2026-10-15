@@ -291,6 +291,14 @@ class RollupMixin:
         """大周期不做足迹图。"""
         return self._empty_footprint(demand)
 
+    def _new_large_detector(self):
+        """大额事件由底层 30s 的检测器提供, 大周期不自建。"""
+        return None
+
+    def large_sources(self):
+        base = self.base()
+        return base.large_sources() if base is not None else []
+
     def ensure_ltf_subscriptions(self, api):
         """小周期 K 线归底层 Feed 订阅。"""
 

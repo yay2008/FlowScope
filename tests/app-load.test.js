@@ -18,7 +18,7 @@ const vm = require("node:vm");
 const ROOT = path.join(__dirname, "..");
 const STATIC = path.join(ROOT, "static");
 const SCRIPTS = ["data-sync.js", "indicators.js", "picker-core.js", "contract-picker.js", "paper-panel.js",
-                 "ai-panel.js", "ai-history.js", "trade-review.js", "session-markers.js", "chart-view.js", "app.js"];
+                 "ai-panel.js", "ai-history.js", "trade-review.js", "session-markers.js", "large-trades.js", "chart-view.js", "app.js"];
 
 // ---------- 最小 DOM ----------
 
@@ -801,6 +801,223 @@ const bandKOf = (context, index) => findByClass(legendRow(context, index, "band"
 const viewSetter = (context) => (value) =>
   context.document.getElementById("view").handlers.change[0]({ target: { value } });
 
+const obPrimitiveOf = (index) => stubCharts[index].primitives.find((p) => p.constructor.name === "ObZonesPrimitive");
+const obInput = (ctx, index, key) => findByClass(legendRow(ctx, index, "ob"), `ob-${key}`);
+
+function obBars() {
+  return Array.from({ length: 110 }, (_, i) => {
+    const open = i < 100 ? (i % 2 ? 101 : 100) : i === 100 ? 100 : 110;
+    const close = i < 100 ? (i % 2 ? 100 : 101) : i === 100 ? 120 : 110;
+    return { time: 1700000000 + i * 30, open, close, high: Math.max(open, close) + 1,
+      low: Math.min(open, close) - 1, volume: 100, buy: 80, sell: 20, delta: 60, cvd: i * 60,
+      unknown: 0, coverage: "complete" };
+  });
+}
+function feedObBars(ctx, bars = obBars()) {
+  ctx.obTestBars = bars;
+  vm.runInContext(`charts.forEach((c) => {
+    c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+      colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
+    c.bars = obTestBars;
+    c.renderAll();
+  })`, ctx);
+}
+
+test("OB Zones: 主图显隐独立持久化, 数量和量条正确, 切足迹隐藏并恢复, 切周期清空", () => {
+  const storage = createLocalStorage();
+  const context = runBrowser({ localStorage: storage });
+  feedObBars(context);
+  assert.equal(obPrimitiveOf(1)._geometry().length, 0);
+  assert.equal(vm.runInContext("charts[1].derived.ob", context), null, "默认隐藏时不随行情重算");
+  clickEye(context, 1, "ob");
+  const [g] = obPrimitiveOf(1)._geometry();
+  assert.deepEqual([g.x1, g.x2, g.buyX, g.sellX], [99 * 6, 109 * 6, 104 * 6, 100 * 6]);
+  assert.match(g.label, /多 · ▲: 80 \| ▼: 20/);
+  assert.equal(findByClass(legendRow(context, 1, "ob"), "readout ob-read").textContent, "多 1 / 空 0");
+  assert.equal(obPrimitiveOf(0)._geometry().length, 0);
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")).map((s) => s.ob), [false, true]);
+  viewSetter(context)("footprint");
+  assert.equal(obPrimitiveOf(1)._geometry().length, 0);
+  viewSetter(context)("candle");
+  assert.equal(obPrimitiveOf(1)._geometry().length, 1);
+  const again = runBrowser({ localStorage: storage });
+  feedObBars(again);
+  assert.equal(obPrimitiveOf(1)._geometry().length, 1);
+  vm.runInContext("charts[1].setTf(60)", again);
+  assert.equal(obPrimitiveOf(1)._geometry().length, 0);
+});
+
+test("OB Zones: 设置即时重算、校验输入、独立保存和恢复默认, 坏存储安全回落", () => {
+  const storage = createLocalStorage();
+  const context = runBrowser({ localStorage: storage });
+  feedObBars(context);
+  clickEye(context, 1, "ob");
+  const row = legendRow(context, 1, "ob");
+  const panel = findByClass(row, "ob-settings");
+  const params = findByClass(row, "ml-params");
+  params.handlers.click[0]();
+  assert.equal(panel.hidden, false);
+  const age = obInput(context, 1, "maxAge");
+  age.value = "3";
+  age.handlers.change[0]();
+  assert.equal(vm.runInContext("charts[1].derived.ob.zones[0].end", context), 102);
+  assert.equal(params.textContent, "100 / 3");
+  age.value = "-1";
+  age.handlers.change[0]();
+  assert.equal(age.value, "3");
+  const overlap = obInput(context, 1, "preventOverlap");
+  overlap.checked = false;
+  overlap.handlers.change[0]();
+  const color = obInput(context, 1, "bullColor");
+  color.value = "#123456";
+  color.handlers.change[0]();
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartObOptions")).map((o) => o.maxAge), [500, 3]);
+  panel.handlers.keydown[0]({ key: "Escape" });
+  assert.equal(panel.hidden, true);
+  const again = runBrowser({ localStorage: storage });
+  assert.equal(obInput(again, 1, "maxAge").value, "3");
+  assert.equal(obInput(again, 1, "preventOverlap").checked, false);
+  assert.equal(obInput(again, 1, "bullColor").value, "#123456");
+  findByClass(legendRow(again, 1, "ob"), "ob-actions").children[0].handlers.click[0]();
+  assert.equal(obInput(again, 1, "maxAge").value, "500");
+  storage.setItem("flowscope.chartObOptions", "broken");
+  const broken = runBrowser({ localStorage: storage });
+  assert.equal(obInput(broken, 1, "zLen").value, "100");
+});
+
+test("OB Zones: 实时 WS 末根回撤会撤销区域与新建提示, 恢复突破再创建; 缺买卖量照样出区域", async () => {
+  const bars = obBars().slice(0, 101);
+  bars[99] = { ...bars[99], buy: null, sell: null, coverage: "missing" };
+  const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+    colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
+  const sockets = [];
+  const context = runBrowser({ fetch: (url) => String(url).startsWith("/api/history")
+    ? Promise.resolve(jsonResponse({ cfg, bars, ltf: 0 })) : stubFetch(url) });
+  context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
+  await new Promise((resolve) => setImmediate(resolve));
+  clickEye(context, 1, "ob");
+  const socket = sockets.find((s) => new URL(s.url).searchParams.get("tf") === "30");
+  socket.onmessage({ data: JSON.stringify({ type: "snapshot", symbol: "KQ.m@SHFE.fu", tf: 30,
+    ltf: 0, revision: 0, cfg, bars }) });
+  const readout = findByClass(legendRow(context, 1, "ob"), "readout ob-read");
+  assert.match(readout.textContent, /新多区/);
+  assert.match(obPrimitiveOf(1)._geometry()[0].label, /买卖量缺失/);
+  const send = (revision, close) => socket.onmessage({ data: JSON.stringify({
+    type: "bars", symbol: "KQ.m@SHFE.fu", tf: 30, ltf: 0, revision,
+    bars: [{ ...bars[100], close }],
+  }) });
+  send(1, 101);
+  assert.equal(obPrimitiveOf(1)._geometry().length, 0);
+  assert.doesNotMatch(readout.textContent, /新多区/);
+  send(2, 120);
+  assert.equal(obPrimitiveOf(1)._geometry().length, 1);
+  assert.match(readout.textContent, /新多区/);
+});
+
+test("OB Zones: 图元按实际价格坐标绘制、裁掉画外区域, 两条量柱比例及可见文字正确", () => {
+  const context = runBrowser();
+  feedObBars(context);
+  clickEye(context, 1, "ob");
+  const primitive = obPrimitiveOf(1);
+  primitive._geometry = () => [{ x1: 10, x2: 300, yTop: 20, yBottom: 60, buyX: 150, sellX: 45, label: "多 · ▲: 80 | ▼: 20" },
+    { x1: -100, x2: -50, yTop: 20, yBottom: 60, label: "不应显示" }];
+  const fills = [], texts = [];
+  const ctx = { save() {}, restore() {}, setLineDash() {}, strokeRect() {}, beginPath() {}, rect() {}, clip() {},
+    measureText: (s) => ({ width: s.length * 6 }),
+    fillRect(...args) { fills.push([this.fillStyle, ...args]); }, fillText(...args) { texts.push(args); } };
+  primitive.paneViews()[0].renderer().draw({ useMediaCoordinateSpace: (fn) => fn({ context: ctx, mediaSize: { width: 500, height: 200 } }) });
+  assert.deepEqual(fills.slice(1), [["#00ffbb4d", 10, 20, 140, 20], ["#ff11004d", 10, 40, 35, 20]]);
+  assert.deepEqual(texts, [["多 · ▲: 80 | ▼: 20", 297, 58]]);
+});
+
+test("大额成交: 每根只画一个净方向点, 同净量同大小, 零净量不画, 悬停保留买卖明细", () => {
+  const storage = createLocalStorage();
+  const context = runBrowser({ localStorage: storage });
+  const bars = obBars();
+  bars[99].large = { buy: 80, sell: 40, unknown: 25, buyScale: 4, sellScale: 2, count: 2,
+    delta: 40, cvd: 60, maxQty: 80, maxRatio: 12, maxZ: 4, share: .6, coverage: "complete" };
+  bars[100].large = { ...bars[99].large, buy: 120, sell: 80, buyScale: 6, sellScale: 4 };
+  bars[101].large = { ...bars[99].large, buy: 40, sell: 80, delta: -40 };
+  bars[102].large = { ...bars[99].large, buy: 80, sell: 80, delta: 0 };
+  bars[103].large = { ...bars[99].large, buy: 0, sell: 0, unknown: 100, delta: 0 };
+  feedObBars(context, bars);
+  stubCharts[1].timeScale.setVisibleLogicalRange({ from: 90, to: 110 });
+  const p = stubCharts[1].primitives.find((item) => item.constructor.name === "Primitive");
+  const marks = p.geometry();
+  assert.deepEqual(Array.from(marks, (m) => m.side), ["buy", "buy", "sell"]);
+  assert.equal(new Set(marks.map((m) => m.bar.time)).size, marks.length, "一根 K 线最多一个点");
+  assert.equal(marks[0].r, marks[1].r, "买卖总量不同而净量相同, 点大小必须相同");
+  assert.equal(marks[0].r, marks[2].r, "正负方向不影响大小");
+  assert.ok(marks[0].y > 0 && marks[2].y < 0, "净买方在低点下、净卖方在高点上");
+  const ctx = { save() {}, restore() {}, beginPath() {}, arc() {}, stroke() {}, fill() {}, fillText() {} };
+  p.draw({ useMediaCoordinateSpace: (fn) => fn({ context: ctx, mediaSize: { width: 1000, height: 400 } }) });
+  stubCharts[1].crosshairHandlers.forEach((fn) => fn({ time: bars[99].time, paneIndex: 0, point: marks[0] }));
+  assert.equal(findByClass(legendRow(context, 1, "large"), "readout large-read").textContent, "Δ +40 · CVD +60");
+  const tooltip = findByClass(chartEl(context, 1), "large-tooltip");
+  assert.equal(tooltip.hidden, false);
+  assert.match(tooltip.textContent, /2 次事件 · 最大事件 80/);
+  assert.match(tooltip.textContent, /买 80 \/ 卖 40 \/ 未知 25 手/);
+  vm.runInContext("charts[1].renderAll()", context);
+  p.draw({ useMediaCoordinateSpace: (fn) => fn({ context: ctx, mediaSize: { width: 1000, height: 400 } }) });
+  assert.equal(tooltip.hidden, false, "实时重绘后光标未动, 悬停明细仍保留");
+  clickEye(context, 1, "large");
+  assert.equal(p.geometry().length, 0);
+  assert.equal(tooltip.hidden, true);
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")).map((s) => s.large), [true, false]);
+  const again = runBrowser({ localStorage: storage });
+  feedObBars(again, bars);
+  stubCharts[0].timeScale.setVisibleLogicalRange({ from: 90, to: 110 });
+  const a = stubCharts[0].primitives.find((item) => item.constructor.name === "Primitive");
+  const b = stubCharts[1].primitives.find((item) => item.constructor.name === "Primitive");
+  assert.equal(a.geometry().length, 3);
+  assert.equal(b.geometry().length, 0);
+  viewSetter(again)("footprint");
+  assert.equal(a.geometry().length, 0);
+  viewSetter(again)("candle");
+  assert.equal(a.geometry().length, 3);
+});
+
+test("大额成交: WebSocket 净量翻转会换色移位, 相抵后移除圆点, 旧历史显示未采集", async () => {
+  const bars = obBars();
+  const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+    colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
+  const sockets = [];
+  const context = runBrowser({ fetch: (url) => String(url).startsWith("/api/history")
+    ? Promise.resolve(jsonResponse({ cfg, bars, ltf: 0 })) : stubFetch(url) });
+  context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
+  await new Promise((resolve) => setImmediate(resolve));
+  const socket = sockets.find((s) => new URL(s.url).searchParams.get("tf") === "30");
+  socket.onmessage({ data: JSON.stringify({ type: "snapshot", symbol: "KQ.m@SHFE.fu", tf: 30,
+    ltf: 0, revision: 0, cfg, bars }) });
+  const read = findByClass(legendRow(context, 1, "large"), "readout large-read");
+  assert.equal(read.textContent, "未采集");
+  stubCharts[1].timeScale.setVisibleLogicalRange({ from: 90, to: 110 });
+  const p = stubCharts[1].primitives.find((item) => item.constructor.name === "Primitive");
+  const send = (revision, buy, sell) => socket.onmessage({ data: JSON.stringify({ type: "bars", symbol: "KQ.m@SHFE.fu",
+    tf: 30, ltf: 0, revision, bars: [{ ...bars[109], large: { buy, sell, unknown: 0, count: 2,
+      buyScale: buy / 20, sellScale: sell / 20, delta: buy - sell, cvd: buy - sell, coverage: "partial" } }] }) });
+  send(1, 120, 80);
+  assert.equal(p.geometry().length, 1);
+  const initial = p.geometry()[0];
+  assert.equal(initial.side, "buy");
+  assert.match(read.textContent, /CVD \+40/);
+  send(2, 40, 80);
+  assert.equal(p.geometry().length, 1);
+  const flipped = p.geometry()[0];
+  assert.equal(flipped.side, "sell");
+  assert.equal(flipped.r, initial.r);
+  assert.ok(flipped.y < 0 && initial.y > 0);
+  assert.match(read.textContent, /CVD -40/);
+  const tooltip = findByClass(chartEl(context, 1), "large-tooltip");
+  stubCharts[1].crosshairHandlers.forEach((fn) => fn({ time: bars[109].time, paneIndex: 0, point: flipped }));
+  assert.equal(tooltip.hidden, false);
+  assert.match(tooltip.textContent, /买 40 \/ 卖 80/);
+  send(3, 80, 80);
+  assert.equal(p.geometry().length, 0);
+  assert.match(read.textContent, /CVD 0/);
+  assert.equal(tooltip.hidden, true, "光标没动、圆点随行情消失: 不等重绘就收起明细");
+});
+
 test("FlowWave带 眼睛按钮: 打开后带可见, 切足迹图强制隐藏, 切回来按开关恢复", () => {
   const context = runBrowser();
   const applied = stubCharts[1].applied;
@@ -871,14 +1088,14 @@ test("截止标记: HTTP/WS 共用合约时段, 配置单独补到也更新, 换
   await new Promise((resolve) => setImmediate(resolve));
 });
 
-test("WaveTrend 已删除: 图例只有 EMA 与 FlowWave带, 工具栏没有 WT信号, K 线上没有交叉箭头和背离连线", () => {
+test("WaveTrend 已删除: 图例有大额成交、OB Zones、EMA 与 FlowWave带, 工具栏没有 WT信号, K 线上没有交叉箭头和背离连线", () => {
   const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
   assert.ok(!html.includes('id="wt-signal"'), "工具栏不该再有 WT信号");
   const context = runBrowser();
   const setView = viewSetter(context);
   const keys = (index) => findAll(chartEl(context, index), (node) => node.className === "ml-item")
     .map((node) => node.getAttribute("data-key"));
-  assert.deepEqual([keys(0), keys(1)], [["ema", "band"], ["ema", "band"]]);
+  assert.deepEqual([keys(0), keys(1)], [["large", "ob", "ema", "band"], ["large", "ob", "ema", "band"]]);
   vm.runInContext(`(() => {
     const c = charts[1];
     c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
@@ -894,8 +1111,8 @@ test("WaveTrend 已删除: 图例只有 EMA 与 FlowWave带, 工具栏没有 WT�
   assert.equal(vm.runInContext("'wt' in charts[1].derived", context), false, "不再计算 WaveTrend");
   assert.ok(stubCharts[1].markers.every((list) => list.length === 0), "没有成交时 K 线上一个标记都没有");
   assert.deepEqual(stubCharts[1].primitives.map((p) => p.constructor.name),
-    ["SessionEndPrimitive", "SessionEndPrimitive", "MeasurePrimitive", "VolumeProfilePrimitive"],
-    "截止标记、测量工具与成交量分布, 没有 WaveTrend 标记");
+    ["ObZonesPrimitive", "Primitive", "SessionEndPrimitive", "SessionEndPrimitive", "MeasurePrimitive", "VolumeProfilePrimitive"],
+    "订单块、大额成交、截止标记、测量工具与成交量分布, 没有 WaveTrend 标记");
 
   setView("footprint");
   assert.equal(legendOf(context, 1).hidden, true, "足迹图下主图指标全部隐藏, 图例收起");
@@ -942,8 +1159,8 @@ test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各
   assert.deepEqual(applied.slice(-4).map((o) => o.visible), [false, false, false, false]);
   assert.equal(eyeOf(context, 1, "ema").title, "显示");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")),
-                   [{ ema: true, emaAll: false, band: false, bandMid: false },
-                    { ema: false, emaAll: false, band: false, bandMid: false }]);
+                   [{ ema: true, emaAll: false, band: false, bandMid: false, ob: false, large: true },
+                    { ema: false, emaAll: false, band: false, bandMid: false, ob: false, large: true }]);
 
   // 切合约是整页重载: 新页面的两张图各按记下的状态画(删掉 WaveTrend 之前记的 wt 忽略掉)
   storage.setItem("flowscope.chartShown", JSON.stringify([
@@ -989,7 +1206,7 @@ test("两张图选同一个周期时开关各管各的, 重载后不串; 切周�
   select.handlers.change[0]();
   assert.deepEqual(offFlags(again, 0), [true, true], "切周期后本图开关不变");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0],
-                   { ema: false, emaAll: false, band: false, bandMid: false });
+                   { ema: false, emaAll: false, band: false, bandMid: false, ob: false, large: true });
 });
 
 test("图例里的带宽只在本图打开 FlowWave带 时能点", () => {
@@ -1585,7 +1802,7 @@ test("测量交互: 尺子按钮 → 点起点 → 终点跟鼠标 → 点终点
     pressChart(context, 1, options);
   };
   const measurement = () => vm.runInContext("charts[1].measurement()", context);
-  const measureGeometry = () => chart30.primitives.find((p) => p._geometry)._geometry();
+  const measureGeometry = () => chart30.primitives.find((p) => p.constructor.name === "MeasurePrimitive")._geometry();
   const plain = (value) => JSON.parse(JSON.stringify(value));
 
   assert.equal(measurement().phase, "off");

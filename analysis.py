@@ -78,6 +78,8 @@ SYSTEM_PROMPT = """你是期货与加密永续合约的盘面分析助手。用�
 - K 线涨为灰白色、跌为深灰色(不是红绿)。
 - EMA21 黄、EMA55 蓝、EMA100 青绿、EMA200 紫。默认只画最近 200 根 K 线(用户可切成画全部), 更左边没有 EMA 线是显示裁掉了, 不是没有数据。
 - FlowWave带(若显示): 收盘价 21 根线性回归通道, 两条淡线是上下轨; 中线到上轨染红、上轨加粗 = FlowWave 超买(fw_sig 大于 80), 中线到下轨染绿、下轨加粗 = 超卖(fw_sig 小于 20)。
+- 大额成交(若显示): 每根 K 线最多一个半透明圆点。标「+」的绿点在 K 线下方 = 这根里大额主动买量多于大额主动卖量, 标「−」的红点在上方 = 大额卖量更多, 面积按两者之差缩放(有大小上下限)。只统计本次程序运行后采集到的成交, 更早的 K 线没有圆点不代表没有大单; 期货是按 tick 快照区间量估算的, 不是单个订单。颜色约定与下面模拟交易的成交箭头相反, 不要混淆。
+- OB Zones(若显示): 浅灰半透明矩形是订单块。连续上涨(下跌)实体累计长度的 Z 分数上穿 4 时, 在最近一根反向 K 线的最高价到最低价之间建区并向右延伸, 收盘连续两根突破远端或超过最大年龄后停止延伸(旧区域仍留在图上)。框内上半的绿条、下半的红条按那根反向 K 线的主动买量、卖量比例画, 文字「多 · ▲: 买量 | ▼: 卖量」里「多」是看涨区(下方支撑)、「空」是看跌区(上方压力)。区域价格不在数值表里, 只作位置参考。
 - 模拟交易(若有): 带「买N」字样的红色上箭头、「卖N」字样的绿色下箭头是成交, 水平实线是持仓均价, 虚线是挂单。
 - 半透明矩形加读数框(若有)是用户手工测量的区间, 读数是涨跌、K 线根数和时长。
 - 足迹图视图(顶部写「足迹图」时): 每根 bar 按价位分格, 左半格卖、右半格买, 暖色越深量越大; 白框是成交最多的价位(POC), 绿框 / 红框是买方 / 卖方对角失衡(3:1 以上); 紫色是判不出方向的量。
@@ -196,7 +198,7 @@ def parse_chart(chart, index) -> dict:
         "meta": {
             "view": "footprint" if meta.get("view") == "footprint" else "candle",
             "ltf": ltf,
-            "shown": {key: shown[key] for key in ("ema", "band") if isinstance(shown.get(key), bool)},
+            "shown": {key: shown[key] for key in ("ema", "band", "large", "ob") if isinstance(shown.get(key), bool)},
             "range": {key: _number(span.get(key)) for key in ("from", "to")},
             "loaded": {key: _number(loaded.get(key)) for key in ("count", "from", "high", "low")},
             "coverage": _counts(meta.get("coverage"), ("complete", "partial", "missing", "legacy")),
@@ -269,7 +271,7 @@ def chart_text(chart, index) -> str:
     on_off = lambda key: {True: "开", False: "关"}.get(meta["shown"].get(key), "-")
     lines = [f"=== 图 {index}: {tf_label(tf)} 周期 ===",
              f"视图: {'足迹图' if meta['view'] == 'footprint' else 'K 线'}; 主图叠加: EMA {on_off('ema')}、"
-             f"FlowWave带 {on_off('band')}",
+             f"FlowWave带 {on_off('band')}、大额成交 {on_off('large')}、OB Zones {on_off('ob')}",
              f"买卖量: {split_text(meta['ltf'])}",
              f"截图可视范围: {bar_time(meta['range']['from'], with_seconds)} → "
              f"{bar_time(meta['range']['to'], with_seconds)}"]

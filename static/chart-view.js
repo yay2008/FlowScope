@@ -16,7 +16,7 @@
  */
 (function (root) {
   "use strict";
-  const { LW, BAND, EMA_PERIODS, VP, buyOf, sellOf, deltaOf } = FlowIndicators;
+  const { LW, BAND, EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf } = FlowIndicators;
 
   // 可选主周期(秒), 与后端 indicator.TF_OPTIONS 一致(tests/test_rollup.py 核对两边相同)
   const TF_CHOICES = [10, 30, 60, 300, 900, 3600, 14400];
@@ -292,6 +292,59 @@
 
   // ---------- 主图叠加的配色与图例 ----------
 
+  // OB Zones 的三个 box 合成一个图元: 中性底框、上下两条量柱、右下角买卖量。
+  // 与 Pine behind_chart=false 一致画在 K 线上方; 使用半透明填充, 不参与价格轴自动缩放。
+  class ObZonesPrimitive {
+    constructor(geometry, options) {
+      this._geometry = geometry;
+      this._options = options;
+      this._requestUpdate = null;
+      this._view = { zOrder: () => "top", renderer: () => ({ draw: (target) => this._draw(target) }) };
+    }
+    attached({ requestUpdate }) { this._requestUpdate = requestUpdate; }
+    detached() { this._requestUpdate = null; }
+    refresh() { if (this._requestUpdate) this._requestUpdate(); }
+    updateAllViews() {}
+    paneViews() { return [this._view]; }
+    _draw(target) {
+      const items = this._geometry();
+      if (!items.length) return;
+      const options = this._options();
+      target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
+        ctx.save();
+        ctx.font = "10px Consolas, monospace";
+        ctx.textAlign = "right";
+        ctx.textBaseline = "bottom";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([]);
+        for (const g of items) {
+          if (g.x2 < 0 || g.x1 > mediaSize.width || g.yBottom < 0 || g.yTop > mediaSize.height) continue;
+          const width = g.x2 - g.x1, height = Math.max(g.yBottom - g.yTop, 1);
+          ctx.fillStyle = "rgba(209, 212, 220, 0.08)";
+          ctx.fillRect(g.x1, g.yTop, width, height);
+          ctx.strokeStyle = "rgba(209, 212, 220, 0.15)";
+          ctx.strokeRect(g.x1, g.yTop, width, height);
+          if (g.buyX != null && g.sellX != null) {
+            ctx.fillStyle = options.bullColor + "4d";
+            ctx.fillRect(g.x1, g.yTop, g.buyX - g.x1, height / 2);
+            ctx.fillStyle = options.bearColor + "4d";
+            ctx.fillRect(g.x1, g.yTop + height / 2, g.sellX - g.x1, height / 2);
+          }
+          const right = Math.min(g.x2, mediaSize.width) - 3;
+          if (height < 12 || right - Math.max(g.x1, 0) < ctx.measureText(g.label).width + 6) continue;
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(g.x1, g.yTop, width, height);
+          ctx.clip();
+          ctx.fillStyle = "#d1d4dc";
+          ctx.fillText(g.label, right, Math.min(g.yBottom, mediaSize.height) - 2);
+          ctx.restore();
+        }
+        ctx.restore();
+      });
+    }
+  }
+
   // 主图 EMA 21/55/100/200(金/蓝/青/紫); 图例里的周期数字也按这个上色, 兼当色标
   const EMA_COLORS = ["#f0b90d", "#2962ff", "#009688", "#ab47bc"];
   // EMA 默认只画最右边这么多根(图例里 EMA 后面的「近200 / 全部」切换, 记在显示开关 emaAll):
@@ -299,8 +352,12 @@
   // 新 bar 进来走 renderAll 整体重设, 窗口随之右移; updateLast 只改末根, 不会越出窗口。
   const EMA_DRAW_BARS = 200;
 
-  // 主图左上角图例的两行: 名称(悬停看说明) + 参数 + 眼睛按钮
+  // 主图左上角图例: 名称(悬停看说明) + 参数 + 眼睛按钮
   const LEGEND_ITEMS = [
+    { key: "large", name: "大额成交", params: false,
+      title: "每根 K 线最多一个大额净方向点：Δ = 大额买量 − 大额卖量，正值绿点、负值红点，净值为零不画。圆点面积按 |大额 Δ| 缩放，有大小上下限；买卖量与未知方向量在悬停明细中。期货为快照区间估算，并非单个订单。" },
+    { key: "ob", name: "OB Zones", params: true,
+      title: "订单块: 连续涨/跌实体累计的 Z 分数上穿 4, 在最近一根反向 K 线的高低范围建区。连续两根收盘突破远端或达到最大年龄后停止延伸, 保留历史区域。量条使用本项目买卖量, 跟随顶部买卖口径, 与 TV 默认 5 分钟估算量不同; 缺失时不画量条。末根信号随实时价格变化。" },
     { key: "ema", name: "EMA", params: true,
       title: "主图指数移动平均线, 周期 21 / 55 / 100 / 200, 按收盘价计算(数值按全部历史算, 画多长由后面的「近200 / 全部」切换)" },
     { key: "band", name: "FlowWave带", params: true,
@@ -601,10 +658,11 @@
    *   tf        初始主周期(秒), 之后由左上角的下拉框切换(setTf)
    *   symbol    合约代码(切合约是整页重载, 所以也不变)
    *   settings  页面的工具栏状态, 按引用共用, 组件只读
-   *   shown     本图主图指标的初始显示开关 {ema, emaAll, band, bandMid}, 之后由本图图例的眼睛按钮切换
+   *   shown     本图主图指标的初始显示开关 {ema, emaAll, band, bandMid, ob}, 之后由本图图例的眼睛按钮切换
    *             (emaAll 是 EMA 画全部历史还是只画最近 EMA_DRAW_BARS 根, 由那一行的「近200 / 全部」按钮切换;
    *             bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换)
    *   profiles  本图已画的成交量分布 [{from, to, rows, extend, visible}](页面记下来的, 不合法的条目丢掉)
+   *   obOptions 本图 OB Zones 参数, 由 onObOptionsChange 通知页面保存
    * 回调(都可省略):
    *   onStatus(ok, text)        连接状态变了
    *   onSuiteSetting(key, value) 用户在本图 FlowMeter 窗格选了模式(key = "mode")或阈值(key = "threshtype");
@@ -622,7 +680,8 @@
   function create({ host, tf, symbol, settings, shown: initialShown, onStatus = noop, onSuiteSetting = noop,
                     onConfig = noop, onShownChange = noop, onBandK = noop, onCrosshair = noop,
                     onRangeChange = noop, onTfChange = noop, onPaperStops = noop,
-                    profiles: initialProfiles = [], onProfilesChange = noop }) {
+                    profiles: initialProfiles = [], onProfilesChange = noop,
+                    obOptions: initialObOptions = {}, onObOptionsChange = noop }) {
     let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
     let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
     let derived = null;   // 派生数组(rolling sma/zscore 等)
@@ -641,7 +700,8 @@
     let loadController = null;
     let retryTimer = null;
     let retryAttempts = 0;
-    const shown = { ema: true, emaAll: false, band: false, bandMid: false, ...initialShown };   // 本图主图指标的显示开关
+    const shown = { ema: true, emaAll: false, band: false, bandMid: false, ob: false, large: true, ...initialShown };
+    let obOptions = FlowIndicators.normalizeObOptions(initialObOptions);
 
     // ---------- 容器: 图表本身 + 左上角的周期下拉框和主图指标图例 ----------
 
@@ -740,7 +800,7 @@
       row.appendChild(name);
       let params = null, mid = null, range = null;
       if (item.params) {
-        params = document.createElement(item.key === "band" ? "button" : "span");
+        params = document.createElement(item.key === "ema" ? "span" : "button");
         params.className = "ml-params";
         row.appendChild(params);
       }
@@ -782,6 +842,76 @@
       span.style.color = EMA_COLORS[j];
       legendRows.ema.params.appendChild(span);
     });
+    const largeReadout = document.createElement("span");
+    largeReadout.className = "readout large-read";
+    largeReadout.textContent = "等待行情";
+    largeReadout.hidden = !shown.large;
+    legendRows.large.row.appendChild(largeReadout);
+    const largeTooltip = document.createElement("div");
+    largeTooltip.className = "large-tooltip";
+    largeTooltip.hidden = true;
+    largeTooltip.setAttribute("role", "tooltip");
+    el.appendChild(largeTooltip);
+    let largeHoverParam = null;
+    let largeMarkerUnit = null;
+    const obReadout = document.createElement("span");
+    obReadout.className = "readout ob-read";
+    obReadout.title = "当前有效的多/空区域数量。新建信号对应最新一根 K 线, 未收盘时可能撤回。";
+    legendRows.ob.row.appendChild(obReadout);
+    const obPanel = document.createElement("div");
+    obPanel.className = "ob-settings";
+    obPanel.hidden = true;
+    obPanel.setAttribute("role", "group");
+    obPanel.setAttribute("aria-label", "OB Zones 参数");
+    const obInputs = {};
+    for (const [key, label, type] of [["zLen", "Z 分数窗口（根）", "number"],
+      ["maxAge", "最大年龄（根）", "number"], ["preventOverlap", "阻止区域重叠", "checkbox"],
+      ["bullColor", "买量颜色", "color"], ["bearColor", "卖量颜色", "color"]]) {
+      const row = document.createElement("label");
+      const name = document.createElement("span");
+      name.textContent = label;
+      const input = document.createElement("input");
+      input.type = type;
+      input.className = `ob-${key}`;
+      if (type === "number") { input.min = "1"; input.step = "1"; }
+      input.addEventListener("change", () => {
+        const value = type === "checkbox" ? input.checked : type === "number" ? Number(input.value) : input.value;
+        if (type === "number" && (!Number.isSafeInteger(value) || value < 1)) {
+          input.value = String(obOptions[key]);
+          return;
+        }
+        changeObOptions({ ...obOptions, [key]: value });
+      });
+      obInputs[key] = input;
+      row.append(name, input);
+      obPanel.appendChild(row);
+    }
+    const obNote = document.createElement("p");
+    obNote.textContent = "阈值固定 4σ；年龄从反向 K 线起算。买卖量跟随顶部买卖口径，缺失时保留区域、隐藏量条。";
+    obPanel.appendChild(obNote);
+    const obActions = document.createElement("div");
+    obActions.className = "ob-actions";
+    for (const [label, action] of [["恢复默认", () => changeObOptions({})], ["完成", () => setObPanel(false)]]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.addEventListener("click", action);
+      obActions.appendChild(button);
+    }
+    obPanel.appendChild(obActions);
+    legendRows.ob.row.appendChild(obPanel);
+    legendRows.ob.params.type = "button";
+    legendRows.ob.params.title = "设置 OB Zones 的窗口、最大年龄、防重叠和买卖量颜色, 只作用于本图";
+    legendRows.ob.params.setAttribute("aria-label", "设置 OB Zones");
+    legendRows.ob.params.addEventListener("click", () => setObPanel(obPanel.hidden));
+    function setObPanel(open) {
+      obPanel.hidden = !open;
+      legendRows.ob.params.setAttribute("aria-expanded", String(open));
+    }
+    setObPanel(false);
+    obPanel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") { setObPanel(false); legendRows.ob.params.focus(); }
+    });
     corner.appendChild(legendEl);
     renderLegend();
 
@@ -820,6 +950,11 @@
     const bandSeries = chart.addCustomSeries(new BandSeries(), { visible: false }, 0);
     // 初始可见性由状态变量决定(而不是只靠 series 创建时的 visible:false), 否则默认值一改就会状态与画面不一致
     applyBandVisibility();
+
+    const obPrimitive = new ObZonesPrimitive(obGeometry, () => obOptions);
+    candleSeries.attachPrimitive(obPrimitive);
+    const largePrimitive = new FlowLargeTrades.Primitive(largeGeometry);
+    candleSeries.attachPrimitive(largePrimitive);
 
     // 足迹图 series (pane 0, 默认隐藏; 视图切到足迹图时显示, tickSize 由 /api/footprint 下发)
     const fpSeries = chart.addCustomSeries(new FootprintSeries(), { visible: false, tickSize: 1 }, 0);
@@ -935,6 +1070,7 @@
 
     function derive() {
       derived = FlowIndicators.derive(bars, cfg, settings.bandK);
+      derived.ob = obVisible() ? FlowIndicators.deriveObZones(bars, obOptions) : null;
     }
 
     function levelOf(kind, i) {
@@ -1067,6 +1203,8 @@
       renderSuite();
       renderLw();
       renderBand();
+      renderObZones();
+      renderLargeTrades();
       renderPaperOverlays();   // bar 集合变了(补历史/修订), 成交标记要重新对齐到 bar
       applyCandleMarkers(true);   // 所有 series 都设完了, 标记按最终时间轴重算序号(见 applyCandleMarkers)
       refreshReadout();
@@ -1101,8 +1239,114 @@
       renderPulse();         // 整体 setData(数据量小)
       renderLw();            // 同上
       renderBand();          // 同上: 回归通道只影响末尾若干根, 但一样整体重建最省心
+      renderObZones();
       refreshReadout();
       refreshProfiles();     // 区间含最新一根的分布跟着变
+      renderLargeTrades();
+    }
+
+    // 每根 K 线只画大额净方向：正值在下方画绿点，负值在上方画红点；净值为零不画。
+    function largeGeometry() {
+      if (!shown.large || settings.view === "footprint") return [];
+      const ts = chart.timeScale();
+      const range = ts.getVisibleLogicalRange();
+      if (!range) return [];
+      const marks = [];
+      for (let i = Math.max(0, Math.floor(range.from) - 1); i <= Math.min(bars.length - 1, Math.ceil(range.to) + 1); i++) {
+        const b = bars[i], s = b.large;
+        if (!s?.count || !Number.isFinite(s.delta) || s.delta === 0) continue;
+        const x = ts.logicalToCoordinate(i);
+        if (x == null) continue;
+        const side = s.delta > 0 ? "buy" : "sell";
+        const r = FlowLargeTrades.radius(s.delta, largeMarkerUnit);
+        const y = candleSeries.priceToCoordinate(side === "buy" ? b.low : b.high);
+        if (y == null) continue;
+        marks.push({ x, y: y + (side === "buy" ? 1 : -1) * (r + 6), r, side, bar: b });
+      }
+      return marks;
+    }
+    function renderLargeTrades() {
+      if (largeMarkerUnit == null) largeMarkerUnit = FlowLargeTrades.sizeUnit(cfg?.largeTrades, bars.at(-1)?.close);
+      largePrimitive.refresh();
+      // 数据变了而光标没动: 在这里按新数据重新命中, 不在图表库的绘制回调里读写 DOM。
+      showLargeTooltip(largeHoverParam);
+      largeReadout.hidden = !shown.large;
+      refreshReadout();
+    }
+    let largeTooltipSize = null;   // 文字没变就沿用上次量的尺寸, 不必每次强制排版
+    function showLargeTooltip(param) {
+      const mark = param && shown.large && settings.view !== "footprint" && param.paneIndex === 0
+        ? largePrimitive.hit(param.point) : null;
+      largeTooltip.hidden = !mark;
+      if (!mark) return;
+      const text = FlowLargeTrades.details(mark.bar, cfg?.largeTrades, cfg?.volumeDigits ?? 0);
+      if (text !== largeTooltip.textContent || !largeTooltipSize) {
+        largeTooltip.textContent = text;
+        largeTooltipSize = [largeTooltip.offsetWidth, largeTooltip.offsetHeight];
+      }
+      // 对齐主图坐标, 靠边时收进图内。先读完尺寸再写位置, 免得写后再读触发重排。
+      const maxLeft = el.clientWidth - largeTooltipSize[0] - 8, maxTop = el.clientHeight - largeTooltipSize[1] - 8;
+      largeTooltip.style.left = `${Math.max(4, Math.min(param.point.x + 16, maxLeft))}px`;
+      largeTooltip.style.top = `${Math.max(4, Math.min(param.point.y + 16, maxTop))}px`;
+    }
+
+    // ---------- OB Zones 主图叠加 ----------
+
+    function changeObOptions(next) {
+      obOptions = FlowIndicators.normalizeObOptions(next);
+      refreshOb();
+      renderLegend();
+      onObOptionsChange();
+    }
+
+    // OB 默认关闭: 只在显示时随行情重算(见 derive); 开关、视图或参数变了在这里现算, 隐藏时丢掉结果。
+    function obVisible() {
+      return shown.ob && settings.view !== "footprint";
+    }
+    function refreshOb() {
+      if (derived) derived.ob = obVisible() ? FlowIndicators.deriveObZones(bars, obOptions) : null;
+      renderObZones();
+    }
+
+    function renderObZones() {
+      obPrimitive.refresh();
+      const result = derived?.ob;
+      obReadout.hidden = !shown.ob;
+      if (!result || !bars.length) { obReadout.textContent = ""; return; }
+      const active = result.zones.filter((z) => z.status === "active");
+      const bull = active.filter((z) => z.side === "bull").length;
+      const last = bars.length - 1;
+      const signal = result.bullCreate[last] ? " · 新多区" : result.bearCreate[last] ? " · 新空区" : "";
+      obReadout.textContent = bars.length <= obOptions.zLen ? "预热中" : `多 ${bull} / 空 ${active.length - bull}${signal}`;
+    }
+
+    // 区域文字和量条端点只随 OB 结果变; 每帧(拖动、十字光标)只换算坐标, 不重复格式化。
+    let obItemCache = { result: null, items: [] };
+    function obItems(result) {
+      if (obItemCache.result !== result) {
+        const volumeText = (v) => v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(2)}M`
+          : v >= 1e3 ? `${(v / 1e3).toFixed(2)}K` : fmt(v, v % 1 ? 2 : 0);
+        obItemCache = { result, items: result.zones.slice(-OB.maxDrawZones).map((z) => {
+          const ends = FlowIndicators.obVolumeEnds(z);
+          const partial = z.coverage === "partial" ? "（部分）" : z.coverage === "legacy" ? "（旧历史）" : "";
+          const unknown = z.unknown > 0 ? ` | 未知: ${volumeText(z.unknown)}` : "";
+          const label = `${z.side === "bull" ? "多" : "空"} · ` + (ends
+            ? `▲: ${volumeText(z.buy)} | ▼: ${volumeText(z.sell)}${unknown}${partial}` : "买卖量缺失");
+          return { z, ends, label };
+        }) };
+      }
+      return obItemCache.items;
+    }
+
+    function obGeometry() {
+      if (!obVisible() || !derived?.ob) return [];
+      const ts = chart.timeScale();
+      const x = (i) => ts.logicalToCoordinate(i);
+      const y = (price) => candleSeries.priceToCoordinate(price);
+      return obItems(derived.ob).map(({ z, ends, label }) => ({
+        x1: x(z.start), x2: x(z.end), yTop: y(z.top), yBottom: y(z.bottom),
+        buyX: ends ? x(ends.buy) : null, sellX: ends ? x(ends.sell) : null, label,
+      })).filter((g) => [g.x1, g.x2, g.yTop, g.yBottom].every(Number.isFinite));
     }
 
     // ---------- FlowWave 主图叠加: 数据与开关 ----------
@@ -1152,7 +1396,8 @@
     }
 
     const APPLY_SHOWN = { ema: applyEmaVisibility, emaAll: renderEma,
-                          band: applyBandVisibility, bandMid: applyBandVisibility };
+                          band: applyBandVisibility, bandMid: applyBandVisibility, ob: refreshOb,
+                          large: renderLargeTrades };
 
     // ---------- 读数 ----------
     // 主图左上角: OHLC 与涨跌; FlowMeter 窗格左上角: 模式主值、Δ、CVD、买卖量、RVOL 等与覆盖标记。
@@ -1183,6 +1428,9 @@
       if (i < 0 || i >= bars.length) {   // 没有数据(换周期、加载中): 清空, 不留上一个周期的数
         priceReadout.replaceChildren();
         meterReadout.replaceChildren();
+        largeReadout.textContent = "等待行情";
+        largeReadout.title = "";
+        largeTooltip.hidden = true;
         return;
       }
       const mode = settings.mode;
@@ -1193,6 +1441,9 @@
       const digits = cfg?.priceDigits ?? 0;
       const px = (v) => fmt(v, digits);
       const vol = (v) => fmt(v, cfg?.volumeDigits ?? 0);
+      largeReadout.textContent = (cfg?.largeTrades?.some((c) => c.source === "snapshot") ? "估算 · " : "") +
+        FlowLargeTrades.readout(b.large, cfg?.volumeDigits ?? 0);
+      largeReadout.title = FlowLargeTrades.details(b, cfg?.largeTrades, cfg?.volumeDigits ?? 0);
       // 涨跌对上一根收盘(第一根对本根开盘), 红涨绿跌
       const base = i > 0 ? bars[i - 1].close : b.open;
       const change = b.close - base;
@@ -1326,6 +1577,8 @@
     // setCrosshairPosition 本身不触发。
     chart.subscribeCrosshairMove((param) => {
       lastPointer = param.point ? param : null;
+      largeHoverParam = param.point && param.paneIndex === 0 ? param : null;
+      showLargeTooltip(param);
       if (measurePhase === "drawing") {
         const point = measurePoint(param, measureB.price);
         if (point) {
@@ -1340,7 +1593,11 @@
       hoverTime = param.time ?? null;
       refreshReadout();
     });
-    chart.timeScale().subscribeVisibleLogicalRangeChange(() => onRangeChange());
+    chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+      largeTooltip.hidden = true;
+      largeHoverParam = null;
+      onRangeChange();
+    });
 
     // ---------- 固定范围成交量分布(交互与画法见文件上部) ----------
 
@@ -1567,6 +1824,11 @@
 
     function renderLegend() {
       legendEl.hidden = settings.view === "footprint";   // 足迹图下主图指标都强制隐藏, 图例也收起
+      legendRows.ob.params.textContent = `${obOptions.zLen} / ${obOptions.maxAge}`;
+      for (const [key, input] of Object.entries(obInputs)) {
+        if (input.type === "checkbox") input.checked = obOptions[key];
+        else input.value = String(obOptions[key]);
+      }
       legendRows.band.params.textContent = `${settings.bandK}σ`;
       legendRows.band.params.disabled = !shown.band;   // 带关着时调宽度看不到效果; 足迹图下图例整个收起, 不用另管
       const mid = legendRows.band.mid;                 // 中线开关同理, 开关状态本身照旧保留
@@ -1759,6 +2021,9 @@
       applyEmaVisibility();
       fpSeries.applyOptions({ visible: isFp });
       applyBandVisibility();   // 足迹图下强制隐藏叠加带, 切回 K 线按开关恢复
+      refreshOb();             // 足迹图下不算 OB, 切回 K 线现算
+      setObPanel(false);
+      renderLargeTrades();
       renderLegend();          // 足迹图下主图指标全部隐藏, 图例跟着收起
       if (isFp) setProfilePhase("off");
       profileBtn.disabled = isFp;   // 成交量分布同样只在 K 线视图画, 足迹图下按钮置灰
@@ -2051,6 +2316,7 @@
       setTf,
       el,
       shown: () => ({ ...shown }),
+      obOptions: () => ({ ...obOptions }),
       load: () => loadHistory(),       // 重新加载(CVD口径/拆分粒度变了), 作废进行中的请求与重试
       setView,                         // 视图(K线/足迹图)变了
       renderSuite,                     // 模式/阈值变了

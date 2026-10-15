@@ -34,9 +34,11 @@ class Element {
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const json = (body) => ({ ok: true, status: 200, json: async () => body });
+const nextDate = (date) => new Date(Date.parse(`${date}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
 const snapshot = (account = "futures", date = "2026-10-14", count = 2, funding = []) => ({
   account, date, defaultDate: date, currency: account === "crypto" ? "USDT" : "CNY",
-  dateBasis: account === "crypto" ? "北京时间自然日" : "交易日", snapshotAt: "2026-10-14 16:00:00",
+  dateBasis: "北京时间自然日", range: { from: `${date}T00:00:00+08:00`, to: `${nextDate(date)}T00:00:00+08:00` },
+  snapshotAt: "2026-10-14 16:00:00",
   summary: { tradeCount: count, closeCount: 1, winRate: 100, netPnl: 120, realizedPnl: 128, fees: 8, funding: 0, maxDrawdown: 20 },
   contracts: [{ contract: "SHFE.fu2611", tradeCount: count, netPnl: 120 }], trades: [], fundings: funding, warnings: [],
 });
@@ -81,6 +83,18 @@ test("账户识别、空快照与中断提示", () => {
   assert.equal(canReview(snapshot("futures", "2026-10-14", 0)), false);
   assert.equal(canReview(snapshot("crypto", "2026-10-14", 0, [{}])), true);
   assert.match(warningText({ warnings: ["缺少部分旧成交"], status: "stopped", finish: "length" }), /缺少部分旧成交.*停止.*截断/s);
+});
+
+test("日期控件及新快照显示北京时间自然日范围", async () => {
+  const html = fs.readFileSync(path.join(__dirname, "..", "static", "index.html"), "utf8");
+  assert.match(html, /复盘日期（北京时间）<input id="trade-review-date"/);
+  const { review, byId } = harness((url) => String(url).startsWith("/api/review/history?")
+    ? Promise.resolve(json({ items: [], total: 0 })) : Promise.resolve(json(snapshot())));
+  review.open();
+  await tick();
+  assert.match(byId("trade-review-basis").textContent, /2026-10-14 北京时间自然日 · 00:00–24:00（北京时间）/);
+  assert.doesNotMatch(byId("trade-review-warnings").textContent, /旧交易日口径/);
+  review.close();
 });
 
 test("首次打开只读快照，按账户和日期切换时清掉旧统计及报告", async () => {
@@ -164,6 +178,32 @@ test("显式开始后流式显示报告，更新 meta 快照并可从历史打�
   await review.showHistory("saved");
   assert.equal(byId("trade-review-answer").textContent, "已保存报告");
   assert.equal(byId("trade-review-thinking-text").textContent, "旧思考");
+  review.close();
+});
+
+test("旧期货交易日报告保留原口径并提示重新生成自然日复盘", async () => {
+  const oldSnapshot = { ...snapshot(), dateBasis: "交易日" };
+  delete oldSnapshot.range;
+  const calls = [];
+  const { review, byId } = harness((url, init) => {
+    calls.push({ url: String(url), method: init?.method || "GET" });
+    if (String(url).endsWith("/old-futures")) return Promise.resolve(json({
+      snapshot: oldSnapshot, account: "futures", reviewDate: "2026-10-14", answer: "旧口径结论", status: "done",
+    }));
+    if (String(url).startsWith("/api/review/history?")) return Promise.resolve(json({ items: [], total: 0 }));
+    return Promise.resolve(json(snapshot()));
+  });
+  review.open();
+  await tick();
+  await review.showHistory("old-futures");
+  assert.equal(byId("trade-review-answer").textContent, "旧口径结论");
+  assert.match(byId("trade-review-basis").textContent, /交易日/);
+  assert.doesNotMatch(byId("trade-review-basis").textContent, /00:00–24:00/);
+  assert.match(byId("trade-review-warnings").textContent, /旧交易日口径（含前一晚夜盘），请重新生成自然日复盘/);
+  assert.equal(calls.filter((call) => call.method === "POST").length, 0);
+  await review.refreshSnapshot();
+  assert.match(byId("trade-review-basis").textContent, /北京时间自然日 · 00:00–24:00/);
+  assert.doesNotMatch(byId("trade-review-warnings").textContent, /旧交易日口径/);
   review.close();
 });
 

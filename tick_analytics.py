@@ -78,6 +78,8 @@ class TickAnalytics:
         keep = np.flatnonzero(self._buckets() >= cutoff)
         if len(keep):
             self.frame = self.frame.iloc[max(0, int(keep[0]) - 1):].reset_index(drop=True)
+        # 下游只能对真实 SDK 序号检查连续性, 时间戳回退键没有这个语义。
+        self.frame.attrs["key_column"] = key_column
 
     def _buckets(self):
         return tick_bar_start(self.frame.datetime, self.bar_ns).to_numpy()

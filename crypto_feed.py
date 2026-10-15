@@ -74,6 +74,11 @@ def venue_of(symbol) -> str | None:
     return head if head in VENUE_NAMES and "." in symbol else None
 
 
+def large_trade_source(symbol) -> str:
+    """大额检测的原始成交口径: 币安推的是归集成交(同价同向合并), 其余交易所是逐笔。"""
+    return "aggregate" if venue_of(symbol) == "BINANCE" else "trade"
+
+
 def is_crypto(symbol) -> bool:
     return venue_of(symbol) is not None
 
@@ -139,6 +144,7 @@ class TradeBars:
         self.last_ms: int | None = None
         self.live_start: int | None = None  # 最新一笔实时成交所在 bar 的起点
         self.gaps = 0                        # 本次运行编号接不上的次数(断线重连)
+        self.large_trades = None
 
     def bar_of(self, t_ms: int) -> int:
         return t_ms // self.tf_ms * self.tf_ms
@@ -169,6 +175,8 @@ class TradeBars:
         elif self.live_start is not None and start > self.live_start + self.tf_ms:
             self._fill_quiet(self.live_start, start)
         self._apply(trade_id, price, qty, t_ms, sell)
+        if self.large_trades is not None:
+            self.large_trades.trade(trade_id, price, qty, t_ms, sell)
         self.last_id, self.last_ms, self.live_start = trade_id, t_ms, start
         if len(self.bars) > self.max_bars + TRIM_SLACK:
             self._trim()
@@ -517,10 +525,14 @@ class CryptoFeed(ingest.Feed):
         super().__init__(instrument.symbol, tf)
         self.instrument = instrument
         self.trades = TradeBars(self.tf)
+        self.trades.large_trades = self.large_trades
         self.candles: CandleStore | None = None
         self.loaded = False
         self.last_compute = 0.0
         self.computed_start = None   # 上次重算时最新 bar 的起点: 变了说明有 bar 走完, 要落盘
+
+    def _new_large_detector(self):
+        return ingest.LargeTradeDetector(self.symbol, large_trade_source(self.symbol))
 
     def cfg(self) -> dict:
         return {**super().cfg(), "priceDigits": self.instrument.price_digits,
@@ -876,9 +888,20 @@ class CryptoManager:
             for period in NATIVE_TFS:
                 other = feed_key(instrument.symbol, period)
                 if other not in self.feeds:
-                    self.feeds[other] = CryptoFeed(instrument, period)
+                    self.feeds[other] = self._new_feed(instrument, period)
             feed = self.feeds[key]
         feed.request(demand=True)
+        return feed
+
+    def _new_feed(self, instrument: Instrument, tf: int) -> CryptoFeed:
+        """同合约各原生周期是同一串成交, 共用一个大额检测器(新开的周期不另起预热),
+        只由其中一个 Feed 的 TradeBars 喂成交。各周期总是一起建、一起回收(见 ensure / _sync)。"""
+        feed = CryptoFeed(instrument, tf)
+        peers = [other for (symbol, _), other in self.feeds.items() if symbol == instrument.symbol]
+        if peers:
+            feed.large_trades = peers[0].large_trades
+            fed = any(peer.trades.large_trades is not None for peer in peers)
+            feed.trades.large_trades = None if fed else feed.large_trades
         return feed
 
     def feed_retry_error(self, feed) -> str | None:
@@ -1107,7 +1130,7 @@ class CryptoManager:
             for symbol in trade_symbols:
                 for tf in NATIVE_TFS:
                     if (symbol, tf) not in self.feeds:
-                        self.feeds[(symbol, tf)] = CryptoFeed(self.instruments[symbol], tf)
+                        self.feeds[(symbol, tf)] = self._new_feed(self.instruments[symbol], tf)
             feeds = list(self.feeds.values())
         topics: dict[str, set] = {channel.key: set() for channel in self.channels}
         for symbol, kind in kinds:

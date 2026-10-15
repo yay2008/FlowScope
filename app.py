@@ -444,7 +444,7 @@ def analysis_history_image(identity: str, index: int):
 
 @app.get("/api/review/snapshot")
 def review_snapshot(account: str = "futures", date: str = ""):
-    """指定账户和日期的全量留存成交统计；不依赖行情或模型配置。"""
+    """指定账户北京时间自然日 00:00 至次日 00:00 的留存成交统计；不依赖行情或模型配置。"""
     try:
         return JSONResponse(trade_review.snapshot(account, date), headers={"Cache-Control": "no-store"})
     except ValueError as exc:
@@ -469,7 +469,7 @@ def review_history_detail(identity: str):
 
 @app.post("/api/review")
 async def review(body: dict = Body(...)):
-    """只接受账户与日期；复盘原料始终从服务端模拟账本读取。返回与 AI 分析相同的 SSE。"""
+    """只接受账户与北京时间自然日日期；原料从服务端账本按成交时间筛选。返回与 AI 分析相同的 SSE。"""
     try:
         job = trade_review.start(body, asyncio.get_running_loop())
     except NotConfigured as exc:

@@ -65,7 +65,7 @@ function saveChartTfs() {
 
 const chartTfs = loadChartTfs();
 
-// 各图主图指标的显示开关记在 localStorage, 按左右图各记一份 [{ema, emaAll, band, bandMid}, {...}]: 切合约是整页重载,
+// 各图主图指标的显示开关记在 localStorage, 按左右图各记一份 [{ema, emaAll, band, bandMid, ob}, {...}]: 切合约是整页重载,
 // 不记的话每切一次都被打回默认(emaAll 是 EMA 画全部历史, bandMid 是 FlowWave带 的中线, 都是后来才加的,
 // 旧值里没有就按默认: EMA 只画最近 200 根、不画中线)。
 // 开关跟着图走, 不跟周期走(两张图可以选同一个周期, 切周期也不换开关)。
@@ -75,7 +75,7 @@ const CHART_SHOWN_KEY = "flowscope.chartShown";
 const MAIN_SHOWN_KEY = "flowscope.mainShown";
 
 function loadShown(index, tf) {
-  const shown = { ema: true, emaAll: false, band: false, bandMid: false };
+  const shown = { ema: true, emaAll: false, band: false, bandMid: false, ob: false, large: true };
   try {
     const perChart = JSON.parse(localStorage.getItem(CHART_SHOWN_KEY) || "null");
     let mine = Array.isArray(perChart) ? perChart[index] : null;
@@ -93,6 +93,24 @@ function loadShown(index, tf) {
 function saveShown() {
   try {
     localStorage.setItem(CHART_SHOWN_KEY, JSON.stringify(charts.map((c) => c.shown())));
+  } catch (error) { /* 记不住不影响使用 */ }
+}
+
+// OB Zones 的参数按左右图保存, 与显示开关一样跨合约、跨周期保留。
+const CHART_OB_KEY = "flowscope.chartObOptions";
+
+function loadObOptions(index) {
+  try {
+    const all = JSON.parse(localStorage.getItem(CHART_OB_KEY) || "null");
+    return FlowIndicators.normalizeObOptions(Array.isArray(all) ? all[index] : null);
+  } catch (error) {
+    return FlowIndicators.normalizeObOptions();
+  }
+}
+
+function saveObOptions() {
+  try {
+    localStorage.setItem(CHART_OB_KEY, JSON.stringify(charts.map((c) => c.obOptions())));
   } catch (error) { /* 记不住不影响使用 */ }
 }
 
@@ -135,11 +153,13 @@ function makeChart(tf, index) {
     symbol,
     settings,
     shown: loadShown(index, tf),
+    obOptions: loadObOptions(index),
     profiles: loadProfiles(index),
     onStatus: (ok, text) => setChartStatus(index, ok, text),
     onSuiteSetting: setSuiteSetting,
     onConfig: refreshLtfOptions,
     onShownChange: saveShown,
+    onObOptionsChange: saveObOptions,
     onProfilesChange: saveProfiles,
     onBandK: setBandK,
     onCrosshair: (time, price) => syncCrosshair(chartView, time, price),

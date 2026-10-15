@@ -32,7 +32,7 @@ function walkBars(n, seed = 7) {
 }
 
 function input(bars, range, extra = {}) {
-  return { tf: 30, view: "candle", shown: { ema: true, band: false, bandMid: true }, bars,
+  return { tf: 30, view: "candle", shown: { ema: true, band: false, bandMid: true, large: true, ob: false }, bars,
            derived: derive(bars, CFG, BAND.kDefault), cfg: CFG, ltf: 0, stale: false, range, ...extra };
 }
 
@@ -69,7 +69,7 @@ test("一张图的数据: 每行与列对齐, 价格按显示位数取整, 空�
   assert.equal(data.meta.range.to, bars[399].time);
   assert.equal(data.meta.loaded.count, 400);
   assert.equal(data.meta.loaded.from, bars[0].time);
-  assert.deepEqual(data.meta.shown, { ema: true, band: false });
+  assert.deepEqual(data.meta.shown, { ema: true, band: false, large: true, ob: false });
   assert.equal(data.meta.view, "candle");
   assert.equal(data.meta.ltf, 0);
   assert.equal(buildChartData(input(bars, null, { ltf: 15 })).meta.ltf, 15, "口径照图上数据的实际粒度报");
