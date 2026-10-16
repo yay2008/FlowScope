@@ -67,7 +67,7 @@ const chartTfs = loadChartTfs();
 
 // 各图主图指标的显示开关记在 localStorage, 按左右图各记一份 [{ema, emaAll, band, bandMid, ob}, {...}]: 切合约是整页重载,
 // 不记的话每切一次都被打回默认(emaAll 是 EMA 画全部历史, bandMid 是 FlowWave带 的中线, 都是后来才加的,
-// 旧值里没有就按默认: EMA 只画最近 200 根、不画中线)。
+// 旧值里没有就按默认: EMA 只画最近 50 根、不画中线)。
 // 开关跟着图走, 不跟周期走(两张图可以选同一个周期, 切周期也不换开关)。
 // 旧版按周期记 flowscope.mainShown = {"10": {...}, "30": {...}}(更早只记一份 {ema, band, wt}),
 // 新键还没有时按旧值初始化; 读不到(隐私模式、旧值不合法)就用默认值。旧值里 WaveTrend 的 wt 已经没用, 读的时候忽略。
