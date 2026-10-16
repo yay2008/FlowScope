@@ -1,11 +1,14 @@
 /* 模拟交易面板(右侧): 下单、持仓、账户、委托与成交; 以及图表上的成交标记和价格线的数据。
  *
- * 后端撮合在 paper.py: 市价单按对手价整笔成交, 限价单要价格穿过才成交(看不到排队)。
+ * 后端撮合在 paper.py: 市价单按对手价整笔成交, 限价单要价格穿过才成交(看不到排队), 条件单(突破单)
+ * 最新价碰到触发价后按市价成交。
  * 加密合约是另一个账户(paper_crypto.py, state.mode === "crypto"): 数量是小数的币、USDT 记账、
  * 每个合约一个杠杆、计资金费; 面板据此换单位、显示杠杆选择与强平价。
  * 止盈止损挂在持仓上(每个合约一对价格, 按最新价触发后市价全平, 由服务端每轮检查), 在「持仓」下方设置;
  * 下单表单里也能填, 跟着委托走, 成交后由服务端挂到持仓上。K 线上还能划线设置(拖动在 chart-view.js,
- * 这里出拖动时线的价位、标题与预估盈亏, 松手后由 setStops 提交)。
+ * 这里出拖动时线的价位、标题与预估盈亏, 松手后由 setStops 提交)。挂单线也能拖(改价, amendOrder)、双击撤单
+ * (cancelOrder); 右键 K 线按点到的价位挂限价单或条件单(menuItems, 手数与止盈止损用下单表单里的)。
+ * 这几个图上操作的结果回 {ok, text}, 图上就地提示 —— 面板折叠着也看得到。
  * 面板轮询 GET /api/paper(展开时 1 秒一次, 折叠时 5 秒一次, 页面在后台时停止),
  * 每次拿到新数据回调 onState, 由 app.js 重画成交标记与价格线。
  * 纯函数(buildMarkers / priceLines / 格式化)在 Node 测试里直接加载。
@@ -30,6 +33,7 @@
   const STATUS_LABELS = { open: "挂单中", filled: "已成交", cancelled: "已撤", rejected: "已拒" };
   const LEVERAGES = [1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125];
   const STOP_NAMES = { tp: "止盈", sl: "止损" };
+  const ORDER_KEY = "order:";   // 图上划线认挂单线: "order:" + 委托编号
 
   // 成交时间 -> 所在 bar 的时间: 标记只能打在已有的 bar 上, 落在休市缺口里的挂到前一根。
   function snapTime(bars, time) {
@@ -61,7 +65,17 @@
     return contract ? (state.positions || []).find((item) => item.contract === contract) || null : null;
   }
 
-  // 当前合约的持仓均价(实线)、止盈止损价(点线)与挂单价(虚线); kind 给图上划线认线用
+  function openOrdersOf(state) {
+    const contract = state && state.contract;
+    return contract ? (state.orders || []).filter((order) => order.status === "open" && order.contract === contract) : [];
+  }
+
+  // 挂单线的标题: 限价单「买2 限价」, 条件单「买2 条件」(价格在价格轴标签上)
+  function orderLineTitle(order) {
+    return `${order.side === "buy" ? "买" : "卖"}${order.qty} ${order.type === "stop" ? "条件" : "限价"}`;
+  }
+
+  // 当前合约的持仓均价(实线)、止盈止损价(点线)与挂单价(限价虚线、条件长虚线); kind/id 给图上划线认线用
   function priceLines(state) {
     if (!state || !state.contract) return [];
     const lines = [];
@@ -73,25 +87,53 @@
       if (position.tp != null) lines.push({ kind: "tp", price: position.tp, color: TP_COLOR, style: "dotted", title: "止盈" });
       if (position.sl != null) lines.push({ kind: "sl", price: position.sl, color: SL_COLOR, style: "dotted", title: "止损" });
     }
-    for (const order of state.orders || []) {
-      if (order.status !== "open" || order.contract !== state.contract) continue;
-      const buy = order.side === "buy";
-      lines.push({ kind: "order", price: order.price, color: buy ? BUY_COLOR : SELL_COLOR, style: "dashed",
-                   title: `${buy ? "买" : "卖"}${order.qty} 挂单` });
+    for (const order of openOrdersOf(state)) {
+      lines.push({ kind: "order", id: order.id, price: order.price, color: order.side === "buy" ? BUY_COLOR : SELL_COLOR,
+                   style: order.type === "stop" ? "largeDashed" : "dashed", title: orderLineTitle(order) });
     }
     return lines;
   }
 
-  // ---------- 划线止盈止损(图上的拖动交互在 chart-view.js) ----------
+  // 价格线在划线里的名字: 止盈止损、均价按 kind, 挂单按 "order:" + 编号(dragTargets 的 from 与它对应)
+  function lineKey(line) {
+    return line.kind === "order" ? ORDER_KEY + line.id : line.kind;
+  }
 
-  // 图上能拖的线: 止盈、止损(改价), 持仓均价(从它拖出来新设); 止盈止损排在前面, 和均价线叠在一起时先拖它们
+  // ---------- 划线止盈止损与挂单改价(图上的拖动交互在 chart-view.js) ----------
+
+  // 图上能拖的线: 止盈、止损(改价), 挂单(改价), 持仓均价(从它拖出来新设止盈止损);
+  // 均价线排最后, 和别的线叠在一起时先拖别的
   function dragTargets(state) {
     const position = currentPositionOf(state);
-    if (!position) return [];
-    const targets = ["tp", "sl"].filter((kind) => position[kind] != null)
-      .map((kind) => ({ from: kind, price: position[kind] }));
-    targets.push({ from: "avg", price: position.avgPrice });
+    const targets = position ? ["tp", "sl"].filter((kind) => position[kind] != null)
+      .map((kind) => ({ from: kind, price: position[kind] })) : [];
+    for (const order of openOrdersOf(state)) targets.push({ from: ORDER_KEY + order.id, price: order.price });
+    if (position) targets.push({ from: "avg", price: position.avgPrice });
     return targets;
+  }
+
+  // 挂单改到 price 会怎样: 会当场成交(限价单够到对手价或越过最新价)、条件单触发价不在突破一侧时回原因,
+  // 否则回空串。和服务端的改价校验一致, 拖线时先在标题上提示, 松手就不提交了。
+  function amendProblem(state, order, price) {
+    const quote = (state && state.quote) || {};
+    const buy = order.side === "buy";
+    const last = quote.last;
+    if (order.type === "stop") {
+      if (last == null) return "";
+      return (buy ? price <= last : price >= last) ? `触发价要${buy ? "高" : "低"}于最新价` : "";
+    }
+    const opposite = buy ? quote.ask : quote.bid;
+    const crosses = buy ? (opposite != null && price >= opposite) || (last != null && price > last)
+      : (opposite != null && price <= opposite) || (last != null && price < last);
+    return crosses ? "会立即成交" : "";
+  }
+
+  // 右键 K 线点到 price 时能挂的单: 最新价下方是买入限价和卖出条件, 上方是卖出限价和买入条件,
+  // 正好在最新价上(或还没有最新价)只给两个限价。
+  function menuChoices(last, price) {
+    if (last != null && price < last) return [{ side: "buy", type: "limit" }, { side: "sell", type: "stop" }];
+    if (last != null && price > last) return [{ side: "sell", type: "limit" }, { side: "buy", type: "stop" }];
+    return [{ side: "buy", type: "limit" }, { side: "sell", type: "limit" }];
   }
 
   function snapPrice(price, tick, decimals) {
@@ -102,10 +144,20 @@
   // 拖到 rawPrice 时的那条线: 价位对齐最小变动价位; 从均价线拖出的按落点定止盈还是止损 ——
   // 在最新价的盈利一侧(多单在上、空单在下)是止盈, 另一侧是止损, 和服务端的校验一致。
   // 标题带上到这个价位平仓的预估盈亏(不含手续费; 期货乘合约乘数, 加密按币)。没有持仓返回 null。
+  // 拖挂单线: 回 {kind: "order", id, price, problem}, 改不了(会当场成交等)时 problem 是原因, 标题上也写着。
   function dragLine(state, from, rawPrice) {
+    if (!Number.isFinite(rawPrice)) return null;
+    const quote = (state && state.quote) || {};
+    if (from.startsWith(ORDER_KEY)) {
+      const order = openOrdersOf(state).find((item) => item.id === from.slice(ORDER_KEY.length));
+      if (!order) return null;
+      const price = snapPrice(rawPrice, quote.priceTick, quote.priceDecs);
+      const problem = amendProblem(state, order, price);
+      return { kind: "order", id: order.id, price, problem, color: order.side === "buy" ? BUY_COLOR : SELL_COLOR,
+               title: orderLineTitle(order) + (problem ? ` · ${problem}` : "") };
+    }
     const position = currentPositionOf(state);
-    if (!position || !Number.isFinite(rawPrice)) return null;
-    const quote = state.quote || {};
+    if (!position) return null;
     const price = snapPrice(rawPrice, quote.priceTick, quote.priceDecs);
     const last = quote.last != null ? quote.last : position.last != null ? position.last : position.avgPrice;
     const kind = from !== "avg" ? from : (position.qty > 0 ? price > last : price < last) ? "tp" : "sl";
@@ -131,6 +183,7 @@
   function orderLabel(order, decimals) {
     const side = order.side === "buy" ? "买" : "卖";
     const price = order.type === "limit" ? `限 ${FlowDataRef.formatPrice(order.price, decimals)}`
+      : order.type === "stop" ? `条件 ${order.side === "buy" ? "≥" : "≤"}${FlowDataRef.formatPrice(order.price, decimals)}`
       : TRIGGER_REASONS.has(order.reason) ? order.reason : "市价";
     return `${side} ${order.qty} ${price}`;
   }
@@ -161,6 +214,7 @@
       panel: byId("trade"), toggle: byId("trade-toggle"), contract: byId("trade-contract"),
       ask: byId("trade-ask"), askVol: byId("trade-ask-vol"), bid: byId("trade-bid"), bidVol: byId("trade-bid-vol"),
       qty: byId("trade-qty"), type: byId("trade-type"), priceRow: byId("trade-price-row"), price: byId("trade-price"),
+      priceLabel: byId("trade-price-label"),
       buy: byId("trade-buy"), sell: byId("trade-sell"), flatten: byId("trade-flatten"), msg: byId("trade-msg"),
       position: byId("trade-position"), account: byId("trade-account"), orders: byId("trade-orders"),
       trades: byId("trade-trades"), note: byId("trade-note"), reset: byId("trade-reset"),
@@ -181,7 +235,7 @@
     let stopsKey = null;     // 止盈止损输入框上次按哪份服务端数据回填(变了才回填, 不冲掉正在敲的数字)
 
     const collapsed = () => els.panel.classList.contains("collapsed");
-    const orderType = () => (els.type.value === "limit" ? "limit" : "market");
+    const orderType = () => (els.type.value === "limit" || els.type.value === "stop" ? els.type.value : "market");
     const decimals = () => (state && state.quote ? state.quote.priceDecs : 0);
     const price = (value) => FlowDataRef.formatPrice(value, decimals());
     const isCrypto = () => !!state && state.mode === "crypto";
@@ -345,11 +399,14 @@
 
     function renderButtons() {
       const quote = state && state.quote;
-      const market = orderType() === "market";
+      const type = orderType();
+      const market = type === "market";
       els.priceRow.hidden = market;
-      els.buy.textContent = market ? `买入 ${price(quote && quote.ask)}` : "限价买入";
-      els.sell.textContent = market ? `卖出 ${price(quote && quote.bid)}` : "限价卖出";
-      // 市价单只在交易中可点(否则必然被拒); 限价单休市也能挂
+      if (els.priceLabel) els.priceLabel.textContent = type === "stop" ? "触发价" : "价格";
+      const prefix = type === "stop" ? "条件" : "限价";
+      els.buy.textContent = market ? `买入 ${price(quote && quote.ask)}` : `${prefix}买入`;
+      els.sell.textContent = market ? `卖出 ${price(quote && quote.bid)}` : `${prefix}卖出`;
+      // 市价单只在交易中可点(否则必然被拒); 限价单、条件单休市也能挂
       const blocked = submitting || !quote || (market && !quote.open);
       els.buy.disabled = blocked;
       els.sell.disabled = blocked;
@@ -450,13 +507,15 @@
           cancel.title = "撤单";
           cancel.addEventListener("click", () => cancelOrder(order.id));
           item.append(cancel);
-          // 挂单带的止盈止损另起一行: 成交后才挂到持仓上
-          const stops = stopsText(order, decimals());
-          if (stops) {
+          // 挂单带的止盈止损另起一行(成交后才挂到持仓上); 条件单触发了却没成交的原因也另起一行
+          const notes = [[stopsText(order, decimals()), "", "成交后挂到持仓上"],
+                         [order.reason, " error", "价格仍在触发一侧时每轮重试"]];
+          for (const [note, extra, title] of notes) {
+            if (!note) continue;
             const line = root.document.createElement("span");
-            line.className = "trade-order-stops-line";
-            line.textContent = stops;
-            line.title = "成交后挂到持仓上";
+            line.className = "trade-order-stops-line" + extra;
+            line.textContent = note;
+            line.title = title;
             item.classList.add("with-stops");
             item.append(line);
           }
@@ -527,19 +586,20 @@
       renderNote();
     }
 
-    // 返回成没成功(失败的原因已经显示在面板上)
+    // 返回 {ok, text}: 成没成功和显示在面板上的那句话(图上操作拿去就地提示)
     async function send(url, init, describe) {
       submitting = true;
       renderButtons();
       try {
         const result = await fetchJson(url, init);
         pollError = false;
-        showMessage(describe(result), "ok");
-        return true;
+        const text = describe(result);
+        showMessage(text, "ok");
+        return { ok: true, text };
       } catch (error) {
         pollError = false;
         showMessage(error.message, "error");
-        return false;
+        return { ok: false, text: error.message };
       } finally {
         submitting = false;
         if (state) renderButtons();
@@ -553,46 +613,47 @@
       if (order.status === "filled") {
         return `已成交: ${side} ${order.qty} @${price(order.fillPrice)}` + (stops ? `，${stops} 已挂到持仓` : "");
       }
-      if (order.status === "open") return `已挂单: ${side} ${order.qty} @${price(order.price)}` + (stops ? `，成交后挂 ${stops}` : "");
+      if (order.status === "open") {
+        const placed = order.type === "stop"
+          ? `已挂条件单: ${side} ${order.qty}，最新价${order.side === "buy" ? "涨到" : "跌到"} ${price(order.price)} 时按市价成交`
+          : `已挂单: ${side} ${order.qty} @${price(order.price)}`;
+        return placed + (stops ? `，成交后挂 ${stops}` : "");
+      }
       return `${STATUS_LABELS[order.status] || order.status}: ${order.reason || ""}`;
     }
 
-    function submit(side) {
+    // 表单没填对: 面板上提示, 也回 {ok: false, text} 给图上的右键下单
+    function refuse(text) {
+      showMessage(text, "error");
+      return { ok: false, text };
+    }
+
+    // 按表单下单; 右键 K 线下单时 override 给出类型和价格({type, price}), 手数与止盈止损仍取表单里的
+    async function submit(side, override) {
+      if (submitting) return null;
       const qty = Number(els.qty.value);
       if (isCrypto() ? !(qty > 0) : !Number.isInteger(qty) || qty < 1) {
-        showMessage(isCrypto() ? "数量要是正数" : "手数要是正整数", "error");
-        return;
+        return refuse(isCrypto() ? "数量要是正数" : "手数要是正整数");
       }
-      const body = { symbol: options.getSymbol(), side, qty, type: orderType(), clientId: newClientId() };
-      if (body.type === "limit") {
-        body.price = Number(els.price.value);
-        if (!(body.price > 0)) {
-          showMessage("限价单要填价格", "error");
-          return;
-        }
+      const body = { symbol: options.getSymbol(), side, qty, type: override ? override.type : orderType(),
+                     clientId: newClientId() };
+      if (body.type !== "market") {
+        body.price = override ? override.price : Number(els.price.value);
+        if (!(body.price > 0)) return refuse(body.type === "stop" ? "条件单要填触发价" : "限价单要填价格");
       }
       if (!isCrypto() && els.autoEnabled && els.autoEnabled.checked) {
-        if (!state || state.autoStopRatio !== AUTO_STOP_RATIO) {
-          showMessage("请先重启服务，再使用自动止盈止损", "error");
-          return;
-        }
+        if (!state || state.autoStopRatio !== AUTO_STOP_RATIO) return refuse("请先重启服务，再使用自动止盈止损");
         const loss = Number(els.autoLoss.value);
-        if (!(loss > 0) || !Number.isFinite(loss * AUTO_STOP_RATIO)) {
-          showMessage("自动止损金额要是有限正数", "error");
-          return;
-        }
+        if (!(loss > 0) || !Number.isFinite(loss * AUTO_STOP_RATIO)) return refuse("自动止损金额要是有限正数");
         body.autoStopLoss = loss;
       } else {
         const tp = readPrice(els.orderTp);
         const sl = readPrice(els.orderSl);
-        if ([tp, sl].some((value) => value != null && !(value > 0))) {
-          showMessage("止盈止损价要是正数", "error");
-          return;
-        }
+        if ([tp, sl].some((value) => value != null && !(value > 0))) return refuse("止盈止损价要是正数");
         if (tp != null) body.tp = tp;
         if (sl != null) body.sl = sl;
       }
-      send("/api/paper/orders", { method: "POST", headers: { "Content-Type": "application/json" },
+      return send("/api/paper/orders", { method: "POST", headers: { "Content-Type": "application/json" },
                                   body: JSON.stringify(body) },
            (order) => {
              // 价格是绝对值, 下一笔多半不再适用: 下单成功就清空, 免得带到下一笔
@@ -635,13 +696,53 @@
     // 图上划线: change 只含改动的那一项({tp: 价格} / {sl: null} 是取消), 另一项沿用持仓现在的值
     async function setStops(change) {
       const position = currentPosition();
-      if (!position || submitting) return false;
+      if (!position || submitting) return null;
       const value = (kind) => (kind in change ? change[kind] : position[kind] != null ? position[kind] : null);
       return postStops(value("tp"), value("sl"));
     }
 
+    // 改价、撤单成功后先把服务端回的委托换进本地数据并重画, 不等下一次轮询(图上的线不会先跳回去)
+    function replaceOrder(result) {
+      const index = state ? (state.orders || []).findIndex((order) => order.id === result.id) : -1;
+      if (index < 0) return;
+      state.orders[index] = result;
+      render();
+      onState(state);
+    }
+
+    // 图上拖挂单线改价: 会当场成交等改不了的价位不提交(拖的时候线的标题上已经提示过), 原委托不动
+    async function amendOrder(id, value) {
+      const order = state && (state.orders || []).find((item) => item.id === id && item.status === "open");
+      if (!order || submitting) return null;
+      if (value === order.price) return null;
+      const problem = amendProblem(state, order, value);
+      if (problem) return refuse(`改价未提交: ${problem}，已保留原价`);
+      return send(`/api/paper/orders/${encodeURIComponent(id)}`,
+                  { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ price: value }) },
+                  (result) => {
+                    replaceOrder(result);
+                    return `已改价: ${orderLabel(result, decimals())}`;
+                  });
+    }
+
     function cancelOrder(id) {
-      send(`/api/paper/orders/${encodeURIComponent(id)}`, { method: "DELETE" }, () => "已撤单");
+      if (submitting) return Promise.resolve(null);
+      return send(`/api/paper/orders/${encodeURIComponent(id)}`, { method: "DELETE" }, (result) => {
+        replaceOrder(result);
+        return `已撤单: ${orderLabel(result, decimals())}`;
+      });
+    }
+
+    // 右键 K 线的菜单项: 按点到的价位(对齐最小变动价位)挂限价单或条件单; 没有可交易的合约时没有菜单
+    function menuItems(rawPrice) {
+      const quote = state && state.contract && state.quote;
+      if (!quote || !Number.isFinite(rawPrice)) return [];
+      const at = snapPrice(rawPrice, quote.priceTick, quote.priceDecs);
+      return menuChoices(quote.last, at).map(({ side, type }) => ({
+        side,
+        label: `${side === "buy" ? "买入" : "卖出"}${type === "stop" ? "条件" : "限价"} ${els.qty.value} ${unit()} @ ${price(at)}`,
+        run: () => submit(side, { type, price: at }),
+      }));
     }
 
     function flatten() {
@@ -690,8 +791,8 @@
       els.autoLoss.addEventListener("input", changeAutoStops);
     }
     els.type.addEventListener("change", () => {
-      // 切到限价时用最新价预填, 省得从空白开始敲
-      if (orderType() === "limit" && !els.price.value && state && state.quote && state.quote.last != null) {
+      // 切到限价、条件时用最新价预填, 省得从空白开始敲
+      if (orderType() !== "market" && !els.price.value && state && state.quote && state.quote.last != null) {
         els.price.value = String(state.quote.last);
       }
       renderButtons();
@@ -715,12 +816,15 @@
       },
       refresh: poll,
       setStops,
+      amendOrder,
+      cancelOrder,
+      menuItems,
       state: () => state,
     };
   }
 
-  const api = { snapTime, buildMarkers, priceLines, dragTargets, dragLine, snapPrice, formatMoney, formatSigned,
-                pnlClass, orderLabel, stopsText, create,
+  const api = { snapTime, buildMarkers, priceLines, lineKey, dragTargets, dragLine, amendProblem, menuChoices, snapPrice,
+                formatMoney, formatSigned, pnlClass, orderLabel, stopsText, create,
                 BUY_COLOR, SELL_COLOR, TP_COLOR, SL_COLOR };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PaperPanel = api;

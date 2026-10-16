@@ -2,8 +2,9 @@
 /* 模拟交易面板的纯函数: 成交标记对齐到 bar、价格线、金额格式。 */
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { snapTime, buildMarkers, priceLines, dragTargets, dragLine, snapPrice, formatMoney, formatSigned, pnlClass,
-        orderLabel, stopsText, BUY_COLOR, SELL_COLOR, TP_COLOR, SL_COLOR } = require("../static/paper-panel.js");
+const { snapTime, buildMarkers, priceLines, lineKey, dragTargets, dragLine, amendProblem, menuChoices, snapPrice,
+        formatMoney, formatSigned, pnlClass, orderLabel, stopsText,
+        BUY_COLOR, SELL_COLOR, TP_COLOR, SL_COLOR } = require("../static/paper-panel.js");
 
 const bars = [{ time: 1000 }, { time: 1030 }, { time: 1060 }, { time: 1200 }];
 
@@ -30,31 +31,70 @@ test("成交标记: 买在下方红色 B, 卖在上方绿色 S, 不画箭头, �
   assert.deepEqual(buildMarkers(undefined, bars), []);
 });
 
-test("价格线只画当前合约的持仓均价、止盈止损与挂单", () => {
+test("价格线只画当前合约的持仓均价、止盈止损与挂单(限价虚线、条件长虚线)", () => {
   const state = {
     contract: "SHFE.fu2611",
     positions: [{ contract: "SHFE.fu2611", qty: -2, avgPrice: 3000, tp: 2900, sl: 3050 },
                 { contract: "SHFE.fu2609", qty: 1, avgPrice: 2900, tp: 3000, sl: 2800 }],
-    orders: [{ contract: "SHFE.fu2611", status: "open", side: "buy", qty: 2, price: 2980 },
-             { contract: "SHFE.fu2611", status: "filled", side: "sell", qty: 1, price: 3010 },
-             { contract: "SHFE.fu2609", status: "open", side: "sell", qty: 1, price: 2950 }],
+    orders: [{ id: "O5", contract: "SHFE.fu2611", status: "open", type: "limit", side: "buy", qty: 2, price: 2980 },
+             { id: "O6", contract: "SHFE.fu2611", status: "open", type: "stop", side: "sell", qty: 1, price: 2960 },
+             { id: "O4", contract: "SHFE.fu2611", status: "filled", side: "sell", qty: 1, price: 3010 },
+             { id: "O3", contract: "SHFE.fu2609", status: "open", side: "sell", qty: 1, price: 2950 }],
   };
-  assert.deepEqual(priceLines(state), [
+  const lines = priceLines(state);
+  assert.deepEqual(lines, [
     { kind: "avg", price: 3000, color: SELL_COLOR, style: "solid", title: "空2 均价" },
     { kind: "tp", price: 2900, color: TP_COLOR, style: "dotted", title: "止盈" },
     { kind: "sl", price: 3050, color: SL_COLOR, style: "dotted", title: "止损" },
-    { kind: "order", price: 2980, color: BUY_COLOR, style: "dashed", title: "买2 挂单" },
+    { kind: "order", id: "O5", price: 2980, color: BUY_COLOR, style: "dashed", title: "买2 限价" },
+    { kind: "order", id: "O6", price: 2960, color: SELL_COLOR, style: "largeDashed", title: "卖1 条件" },
   ]);
+  assert.deepEqual(lines.map(lineKey), ["avg", "tp", "sl", "order:O5", "order:O6"]);
   assert.deepEqual(priceLines({ contract: null }), []);
   assert.deepEqual(priceLines(null), []);
 });
 
-test("划线: 能拖的是止盈、止损和均价线(止盈止损在前); 没有持仓就没有", () => {
-  const state = { contract: "SHFE.fu2611",
+test("划线: 能拖的是止盈、止损、当前合约的挂单和均价线(均价线最后); 没有持仓也能拖挂单", () => {
+  const orders = [{ id: "O7", contract: "SHFE.fu2611", status: "open", type: "limit", side: "buy", qty: 1, price: 2990 },
+                  { id: "O8", contract: "SHFE.fu2609", status: "open", type: "limit", side: "buy", qty: 1, price: 2900 }];
+  const state = { contract: "SHFE.fu2611", orders,
                   positions: [{ contract: "SHFE.fu2611", qty: 2, avgPrice: 3000, sl: 2950 }] };
-  assert.deepEqual(dragTargets(state), [{ from: "sl", price: 2950 }, { from: "avg", price: 3000 }]);
+  assert.deepEqual(dragTargets(state), [{ from: "sl", price: 2950 }, { from: "order:O7", price: 2990 },
+                                        { from: "avg", price: 3000 }]);
+  assert.deepEqual(dragTargets({ contract: "SHFE.fu2611", positions: [], orders }), [{ from: "order:O7", price: 2990 }]);
   assert.deepEqual(dragTargets({ contract: "SHFE.fu2611", positions: [] }), []);
   assert.deepEqual(dragTargets(null), []);
+});
+
+test("拖挂单改价: 会当场成交的限价、没在突破一侧的触发价标出原因(和服务端校验一致)", () => {
+  const quote = { last: 3000, ask: 3001, bid: 2999, priceTick: 1, priceDecs: 0 };
+  const buy = { id: "O1", contract: "c", status: "open", type: "limit", side: "buy", qty: 1, price: 2990 };
+  const sell = { ...buy, id: "O2", side: "sell", price: 3010 };
+  const stopBuy = { ...buy, id: "O3", type: "stop", price: 3010 };
+  const stopSell = { ...buy, id: "O4", type: "stop", side: "sell", price: 2990 };
+  const state = { contract: "c", quote, positions: [], orders: [buy, sell, stopBuy, stopSell] };
+  assert.equal(amendProblem(state, buy, 3000), "");
+  assert.equal(amendProblem(state, buy, 3001), "会立即成交");          // 够到卖一
+  assert.equal(amendProblem({ ...state, quote: { ...quote, last: 2995 } }, buy, 2996), "会立即成交");   // 高于最新价
+  assert.equal(amendProblem(state, sell, 3000), "");
+  assert.equal(amendProblem(state, sell, 2999), "会立即成交");
+  assert.equal(amendProblem(state, stopBuy, 3001), "");
+  assert.equal(amendProblem(state, stopBuy, 3000), "触发价要高于最新价");
+  assert.equal(amendProblem(state, stopSell, 3000), "触发价要低于最新价");
+  assert.equal(amendProblem({ ...state, quote: {} }, stopSell, 3100), "");     // 没有最新价交给服务端判
+  assert.deepEqual(dragLine(state, "order:O1", 2995.4),
+                   { kind: "order", id: "O1", price: 2995, problem: "", color: BUY_COLOR, title: "买1 限价" });
+  assert.deepEqual(dragLine(state, "order:O3", 2999.6),
+                   { kind: "order", id: "O3", price: 3000, problem: "触发价要高于最新价", color: BUY_COLOR,
+                     title: "买1 条件 · 触发价要高于最新价" });
+  assert.equal(dragLine(state, "order:O9", 3000), null);
+});
+
+test("右键挂单: 最新价下方买限价/卖条件, 上方卖限价/买条件, 正好在最新价上给两个限价", () => {
+  assert.deepEqual(menuChoices(3000, 2990), [{ side: "buy", type: "limit" }, { side: "sell", type: "stop" }]);
+  assert.deepEqual(menuChoices(3000, 3010), [{ side: "sell", type: "limit" }, { side: "buy", type: "stop" }]);
+  assert.deepEqual(menuChoices(3000, 3000), [{ side: "buy", type: "limit" }, { side: "sell", type: "limit" }]);
+  assert.deepEqual(menuChoices(null, 3000), [{ side: "buy", type: "limit" }, { side: "sell", type: "limit" }]);
 });
 
 test("划线: 价位对齐最小变动价位, 从均价线拖出按落在最新价哪一侧定止盈止损, 标题带预估盈亏", () => {
@@ -87,6 +127,8 @@ test("金额与盈亏格式", () => {
   assert.equal(pnlClass(-1), "down");
   assert.equal(pnlClass(0), "");
   assert.equal(orderLabel({ side: "buy", qty: 2, type: "limit", price: 2980 }, 0), "买 2 限 2980");
+  assert.equal(orderLabel({ side: "buy", qty: 1, type: "stop", price: 3010 }, 0), "买 1 条件 ≥3010");
+  assert.equal(orderLabel({ side: "sell", qty: 1, type: "stop", price: 84000.5 }, 1), "卖 1 条件 ≤84000.5");
   assert.equal(orderLabel({ side: "sell", qty: 1, type: "market", price: null }, 0), "卖 1 市价");
   assert.equal(orderLabel({ side: "sell", qty: 1, type: "market", price: null, reason: "止损" }, 0), "卖 1 止损");
   assert.equal(orderLabel({ side: "buy", qty: 1, type: "market", price: null, reason: "已撤单" }, 0), "买 1 市价");

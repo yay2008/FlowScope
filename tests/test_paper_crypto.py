@@ -231,6 +231,33 @@ class BookTests(unittest.TestCase):
         position = book.positions[BTC.symbol]
         self.assertEqual((position["qty"], position["tp"], position["sl"]), (2.0, 104.0, 97.0))   # 反手成多 2
 
+    def test_stop_order_triggers_on_last_and_sweeps_with_taker_fee(self):
+        book = CryptoBook()
+        with self.assertRaisesRegex(OrderError, "买入条件单的触发价要高于最新价 100"):
+            book.place(order("buy", 2.0, "stop", 100.0), make_quote(), NOW)
+        placed = book.place(order("buy", 2.0, "stop", 100.5), make_quote(), NOW)
+        self.assertEqual((placed["status"], placed["price"]), ("open", 100.5))
+        self.assertFalse(book.match({BTC.symbol: make_quote(last=100.4)}, NOW))
+        thin = make_quote(last=100.5, asks=((100.6, 1.0),))
+        self.assertFalse(book.match({BTC.symbol: thin}, NOW))                 # 吃不够五档: 留着重试
+        self.assertIn("五档", placed["reason"])
+        self.assertTrue(book.match({BTC.symbol: make_quote(last=100.5, asks=((100.6, 1.0), (100.8, 1.0)))}, NOW))
+        self.assertAlmostEqual(placed["fillPrice"], 100.7)
+        self.assertEqual((placed["reason"], book.trades[-1]["liquidity"]), ("", "taker"))
+        self.assertAlmostEqual(book.fees_paid, 2 * 100.7 * 0.0005)
+
+    def test_amend_never_moves_an_order_into_an_immediate_fill(self):
+        book = CryptoBook()
+        resting = book.place(order("sell", 1.0, "limit", 100.5), make_quote(), NOW)
+        with self.assertRaisesRegex(OrderError, "立即成交"):
+            book.amend(resting["id"], 100.0, make_quote(), NOW)                 # 够到买一
+        self.assertEqual(book.amend(resting["id"], 100.3, make_quote(), NOW)["price"], 100.3)
+        stop = book.place(order("sell", 1.0, "stop", 99.5), make_quote(), NOW)
+        with self.assertRaisesRegex(OrderError, "卖出条件单的触发价要低于最新价 100"):
+            book.amend(stop["id"], 100.2, make_quote(), NOW)
+        self.assertEqual(book.amend(stop["id"], 99.0, make_quote(), NOW)["price"], 99.0)
+        self.assertEqual([item["status"] for item in book.orders], ["open", "open"])
+
     def test_client_id_places_once(self):
         book = CryptoBook()
         first = book.place(order("buy", 1.0, client_id="x"), make_quote(), NOW)
@@ -291,6 +318,16 @@ class ServiceTests(unittest.TestCase):
         summary = self.service.reset(500)
         self.assertEqual(summary["account"]["equity"], 500.0)
         self.assertEqual(self.service.state(BTC.symbol)["leverage"], 5)       # 重置保留杠杆设置
+
+    def test_amend_through_the_service(self):
+        resting = self.service.place(order("buy", 1.0, "limit", 99.0))
+        self.assertEqual(self.service.amend(resting["id"], 99.5)["price"], 99.5)
+        with self.assertRaisesRegex(OrderError, "立即成交"):
+            self.service.amend(resting["id"], 100.1)
+        with self.assertRaisesRegex(OrderError, "找不到"):
+            self.service.amend("CO99", 99.0)
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["orders"][0]["price"], 99.5)
 
     def test_stops_set_through_the_service_fire_on_the_cycle(self):
         self.service.place(order("sell", 1.0))                            # 空 1 @100
@@ -360,6 +397,7 @@ class RoutingTests(unittest.TestCase):
     def test_crypto_requests_go_to_the_crypto_account(self):
         self.assertEqual(asyncio.run(server.paper_state(BTC.symbol))["mode"], "crypto")
         placed = asyncio.run(server.paper_order(order("sell", 1.0, "limit", 105.0)))
+        self.assertEqual(server.paper_amend(placed["id"], {"price": 104.0})["price"], 104.0)
         self.assertEqual(server.paper_cancel(placed["id"])["status"], "cancelled")
         self.assertEqual(server.paper_leverage(BTC.symbol, 3)["account"]["equity"], 10000.0)
         self.assertEqual(server.paper_reset(cash=300, symbol=BTC.symbol)["account"]["initialCash"], 300.0)

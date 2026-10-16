@@ -327,6 +327,144 @@ class LimitOrderTest(unittest.TestCase):
         self.assertEqual(len(account.trades), 4)
 
 
+class StopOrderTest(unittest.TestCase):
+    """条件单(突破单): 最新价碰到触发价后按市价单的规则成交。"""
+
+    def test_buy_stop_rests_then_fills_at_ask_when_last_touches(self):
+        account = book(fees=FeeTable())
+        placed = account.place(order("buy", 1, "stop", 3010.0), snap(), NOW)
+        self.assertEqual((placed["status"], placed["type"], placed["price"]), ("open", "stop", 3010.0))
+        self.assertEqual(account.match({CONTRACT: snap(last_price=3009.0, ask_price1=3010.0)}, NOW), [])
+        # 最新价碰到触发价就触发, 按对手价成交(不是触发价)
+        changed = account.match({CONTRACT: snap(last_price=3010.0, bid_price1=3010.0, ask_price1=3012.0)}, NOW)
+        self.assertEqual([item["id"] for item in changed], [placed["id"]])
+        self.assertEqual((placed["status"], placed["fillPrice"]), ("filled", 3012.0))
+        self.assertEqual(account.positions[CONTRACT]["qty"], 1)
+
+    def test_sell_stop_closes_a_long_on_breakdown(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 2), snap(), NOW)                        # 多 2 @3000
+        placed = account.place(order("sell", 2, "stop", 2990.0), snap(), NOW)
+        account.match({CONTRACT: snap(last_price=2990.0, bid_price1=2989.0, ask_price1=2990.0)}, NOW)
+        self.assertEqual((placed["status"], placed["fillPrice"]), ("filled", 2989.0))
+        self.assertEqual(account.positions, {})
+        self.assertEqual(account.trades[-1]["pnl"], -220.0)
+
+    def test_trigger_must_be_beyond_last_price(self):
+        account = book()
+        with self.assertRaisesRegex(OrderError, "买入条件单的触发价要高于最新价 3000"):
+            account.place(order("buy", 1, "stop", 3000.0), snap(), NOW)
+        with self.assertRaisesRegex(OrderError, "卖出条件单的触发价要低于最新价 3000"):
+            account.place(order("sell", 1, "stop", 3005.0), snap(), NOW)
+        with self.assertRaisesRegex(OrderError, "整数倍"):
+            account.place(order("buy", 1, "stop", 3010.5), snap(), NOW)
+        with self.assertRaisesRegex(OrderError, "涨停价"):
+            account.place(order("buy", 1, "stop", 3400.0), snap(), NOW)
+        with self.assertRaisesRegex(OrderError, "还没有最新价"):
+            account.place(order("buy", 1, "stop", 3010.0), snap(last_price=float("nan")), NOW)
+        self.assertEqual(account.orders, [])
+
+    def test_waits_for_the_session_and_fills_a_gap_at_the_open(self):
+        account = book(fees=FeeTable())
+        placed = account.place(order("buy", 1, "stop", 3010.0), snap(), datetime(2026, 9, 30, 12, 0))
+        self.assertEqual(placed["status"], "open")   # 休市也能挂
+        gapped = {CONTRACT: snap(last_price=3030.0, bid_price1=3030.0, ask_price1=3031.0)}
+        self.assertEqual(account.match(gapped, datetime(2026, 9, 30, 12, 5)), [])
+        account.match(gapped, datetime(2026, 9, 30, 13, 30, 1))
+        self.assertEqual(placed["fillPrice"], 3031.0)   # 跳空越过触发价: 第一笔报价按对手价成交
+
+    def test_unfillable_trigger_stays_open_with_reason_and_retries(self):
+        account = book(fees=FeeTable())
+        placed = account.place(order("buy", 5, "stop", 3010.0), snap(), NOW)
+        thin = {CONTRACT: snap(last_price=3010.0, ask_price1=3011.0, ask_volume1=2)}
+        self.assertEqual(account.match(thin, NOW), [])
+        self.assertEqual(placed["status"], "open")
+        self.assertIn("已触发, 未成交: 卖一只有 2 手", placed["reason"])
+        self.assertEqual(account.match({CONTRACT: snap()}, NOW), [])     # 价格回去了: 接着等, 原因清掉
+        self.assertEqual(placed["reason"], "")
+        account.match({CONTRACT: snap(last_price=3012.0, ask_price1=3012.0, ask_volume1=9)}, NOW)
+        self.assertEqual((placed["status"], placed["fillPrice"], placed["reason"]), ("filled", 3012.0, ""))
+
+    def test_stops_are_checked_against_the_trigger_and_attach_on_fill(self):
+        account = book(fees=FeeTable())
+        with self.assertRaisesRegex(OrderError, "空单止损价要高于触发价 2990"):
+            account.place(order("sell", 1, "stop", 2990.0) | {"tp": 2950.0, "sl": 2985.0}, snap(), NOW)
+        placed = account.place(order("sell", 1, "stop", 2990.0) | {"tp": 2950.0, "sl": 2995.0}, snap(), NOW)
+        account.match({CONTRACT: snap(last_price=2990.0, bid_price1=2989.0, ask_price1=2990.0)}, NOW)
+        position = account.positions[CONTRACT]
+        self.assertEqual((placed["status"], position["qty"], position["tp"], position["sl"]),
+                         ("filled", -1, 2950.0, 2995.0))
+
+    def test_automatic_stops_use_the_actual_fill(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 1, "stop", 3010.0) | {"autoStopLoss": 100.0}, snap(), NOW)
+        account.match({CONTRACT: snap(last_price=3010.0, ask_price1=3012.0)}, NOW)
+        position = account.positions[CONTRACT]
+        self.assertEqual((position["avgPrice"], position["sl"], position["tp"]), (3012.0, 3002.0, 3027.0))
+
+    def test_rejected_when_funds_gone_at_trigger(self):
+        account = book(cash=10_000.0, fees=FeeTable())
+        placed = account.place(order("buy", 2, "stop", 3010.0), snap(), NOW)
+        account.cash = 1_000.0
+        account.match({CONTRACT: snap(last_price=3010.0, ask_price1=3010.0)}, NOW)
+        self.assertEqual(placed["status"], "rejected")
+        self.assertIn("资金不足", placed["reason"])
+        self.assertEqual(account.positions, {})
+
+
+class AmendTest(unittest.TestCase):
+    """改挂单价格: 单号不变; 会当场成交的改价拒绝, 原委托不动。"""
+
+    def test_limit_moves_but_never_into_an_immediate_fill(self):
+        account = book()
+        placed = account.place(order("buy", 1, "limit", 2990.0), snap(), NOW)
+        moved = account.amend(placed["id"], 2995.0, {CONTRACT: snap()}, NOW)
+        self.assertIs(moved, placed)
+        self.assertEqual((placed["price"], placed["status"]), (2995.0, "open"))
+        for price, quote in ((3000.0, snap()),                                       # 够到卖一
+                             (2996.0, snap(last_price=2995.0, ask_price1=2998.0))):    # 高于最新价, 下一轮就穿过
+            with self.subTest(price=price), self.assertRaisesRegex(OrderError, "立即成交"):
+                account.amend(placed["id"], price, {CONTRACT: quote}, NOW)
+        self.assertEqual(placed["price"], 2995.0)
+        sell = account.place(order("sell", 1, "limit", 3010.0), snap(), NOW)
+        with self.assertRaisesRegex(OrderError, "立即成交"):
+            account.amend(sell["id"], 2999.0, {CONTRACT: snap()}, NOW)
+        self.assertEqual(account.amend(sell["id"], 3001.0, {CONTRACT: snap()}, NOW)["price"], 3001.0)
+
+    def test_stop_trigger_stays_beyond_last_price(self):
+        account = book()
+        placed = account.place(order("buy", 1, "stop", 3010.0), snap(), NOW)
+        self.assertEqual(account.amend(placed["id"], 3020.0, {CONTRACT: snap()}, NOW)["price"], 3020.0)
+        with self.assertRaisesRegex(OrderError, "触发价要高于最新价 3000"):
+            account.amend(placed["id"], 3000.0, {CONTRACT: snap()}, NOW)
+        self.assertEqual(placed["price"], 3020.0)
+
+    def test_validation_and_order_state(self):
+        account = book()
+        placed = account.place(order("buy", 1, "limit", 2990.0) | {"sl": 2980.0}, snap(), NOW)
+        with self.assertRaisesRegex(OrderError, "多单止损价要低于委托价 2979"):
+            account.amend(placed["id"], 2979.0, {CONTRACT: snap()}, NOW)
+        with self.assertRaisesRegex(OrderError, "整数倍"):
+            account.amend(placed["id"], 2985.5, {CONTRACT: snap()}, NOW)
+        with self.assertRaisesRegex(OrderError, "跌停价"):
+            account.amend(placed["id"], 2600.0, {CONTRACT: snap()}, NOW)
+        with self.assertRaisesRegex(OrderError, "行情未就绪"):
+            account.amend(placed["id"], 2985.0, {}, NOW)
+        self.assertEqual(placed["price"], 2990.0)
+        account.cancel(placed["id"], NOW)
+        with self.assertRaisesRegex(OrderError, "已经成交或撤销"):
+            account.amend(placed["id"], 2985.0, {CONTRACT: snap()}, NOW)
+        with self.assertRaisesRegex(OrderError, "找不到"):
+            account.amend("O999", 2985.0, {CONTRACT: snap()}, NOW)
+
+    def test_funds_are_rechecked_at_the_new_price(self):
+        account = book(cash=9_500.0, fees=FeeTable())
+        placed = account.place(order("buy", 2, "stop", 3010.0), snap(), NOW)
+        with self.assertRaisesRegex(OrderError, "资金不足"):
+            account.amend(placed["id"], 3050.0, {CONTRACT: snap()}, NOW)
+        self.assertEqual(placed["price"], 3010.0)
+
+
 class StopTest(unittest.TestCase):
     def test_set_validates_side_tick_and_position(self):
         account = book(fees=FeeTable())
@@ -577,6 +715,8 @@ class RequestTest(unittest.TestCase):
         self.assertEqual((good["tp"], good["sl"]), (None, None))
         stops = paper.normalize_request({"symbol": CONTRACT, "side": "buy", "qty": 1, "tp": "3100", "sl": ""})
         self.assertEqual((stops["tp"], stops["sl"]), (3100.0, None))
+        trigger = paper.normalize_request({"symbol": CONTRACT, "side": "sell", "qty": 1, "type": "stop", "price": "2990"})
+        self.assertEqual((trigger["type"], trigger["price"]), ("stop", 2990.0))
         bad = [{"symbol": "x/../y", "side": "buy", "qty": 1},
                {"symbol": CONTRACT, "side": "buy", "qty": 1, "tp": "abc"},
                {"symbol": CONTRACT, "side": "buy", "qty": 1, "sl": -5},
@@ -586,6 +726,7 @@ class RequestTest(unittest.TestCase):
                {"symbol": CONTRACT, "side": "buy", "qty": float("nan")},
                {"symbol": CONTRACT, "side": "buy", "qty": paper.MAX_ORDER_QTY + 1},
                {"symbol": CONTRACT, "side": "buy", "qty": 1, "type": "stop"},
+               {"symbol": CONTRACT, "side": "buy", "qty": 1, "type": "iceberg", "price": 3000},
                {"symbol": CONTRACT, "side": "buy", "qty": 1, "type": "limit"},
                "not a dict"]
         for raw in bad:
@@ -787,6 +928,21 @@ class ServiceTest(unittest.TestCase):
             self.service.on_loop(self.api)
         self.assertEqual(self.service._watch, {})
 
+    def test_amend_goes_through_the_service_and_persists(self):
+        placed = self.run_async(self.service.place(
+            {"symbol": CONTRACT, "side": "buy", "qty": 1, "type": "stop", "price": 3010.0}))
+        with self.assertRaisesRegex(OrderError, "价格要是正数"):
+            self.service.amend(placed["id"], True)
+        self.assertEqual(self.service.amend(placed["id"], "3015")["price"], 3015.0)
+        with open(self.path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual((saved["orders"][0]["type"], saved["orders"][0]["price"]), ("stop", 3015.0))
+        self.quotes[CONTRACT].last_price = 3015.0     # 报价对象就地更新, 与 TqSdk 一样
+        self.quotes[CONTRACT].ask_price1 = 3016.0
+        self.service.on_loop(self.api)
+        state = self.run_async(self.service.state(CONTRACT))
+        self.assertEqual(state["positions"][0]["avgPrice"], 3016.0)
+
     def test_cancel_and_reset(self):
         placed = self.run_async(self.service.place(
             {"symbol": CONTRACT, "side": "sell", "qty": 1, "type": "limit", "price": 3050.0}))
@@ -846,6 +1002,16 @@ class EndpointTest(unittest.TestCase):
         self.assertEqual(server.paper_stops({"symbol": CONTRACT, "tp": 3100, "sl": ""})["tp"], 3100.0)
         flat = asyncio.run(server.paper_flatten(CONTRACT))
         self.assertEqual((flat["side"], flat["status"]), ("sell", "filled"))
+
+    def test_amend_route(self):
+        placed = asyncio.run(server.paper_order(
+            {"symbol": CONTRACT, "side": "buy", "qty": 1, "type": "limit", "price": 2990}))
+        self.assertEqual(server.paper_amend(placed["id"], {"price": 2995})["price"], 2995.0)
+        with self.assertRaises(HTTPException) as caught:
+            server.paper_amend(placed["id"], {"price": 3000})
+        self.assertIn("立即成交", caught.exception.detail)
+        with self.assertRaises(HTTPException):
+            server.paper_amend(placed["id"], "not a dict")
 
 
 class LoopHookTest(unittest.TestCase):

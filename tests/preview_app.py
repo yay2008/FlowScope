@@ -379,7 +379,7 @@ class PreviewManager(ingest.FeedManager):
                     feed.recompute(self.broadcast)
                     continue
                 if feed.ticks is None:
-                    feed.quote = SimpleNamespace(price_tick=1.)
+                    feed.quote = SimpleNamespace(price_tick=1., volume_multiple=10)
                     feed.ticks = tick_rows(0, 10000)
                     feed.klines = kline_rows(feed.ticks, feed.tf)
                     if feed.tf == ROLLUP_BASE_TF:

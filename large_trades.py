@@ -1,7 +1,13 @@
 """先筛原始成交事件, 再按图表周期汇总。统计只使用当前事件之前的样本。
 
-期货输入快照区间量; 加密输入交易所逐笔/聚合成交。只保留本次采集的检测结果,
+期货输入快照区间量; 加密输入交易所逐笔/聚合成交, 同一毫秒、同一方向的连续成交合并成一个事件
+(一张吃单扫多档、吃多个挂单时交易所会拆成多条)。只保留本次采集(含回填补判)的检测结果,
 不从 OHLCV/买卖量历史反推大额事件。不同图表周期应共用一个 Detector。
+
+判定: 金额达到该品种的门槛(主条件, 各品种初始值见 large_trade_defaults.py), 且超过基线事件量的 P99
+(相对条件, 防止放量时满屏都是大单)。基线是最近 10 分钟交易时间的事件, 但不含最近 30 秒: 一阵密集大单
+都和放量前的水平比, 不会被自己抬高的门槛压掉; 放量持续下去门槛照样跟上。相对均量的倍数与 Z 只供查看
+(实测超过 P99 的事件都远高于均量 1.5 倍, 原来的倍数条件从没挡掉过事件, 已去掉)。
 """
 from bisect import bisect_left, insort
 from collections import deque
@@ -9,17 +15,37 @@ from functools import lru_cache
 import json
 import math
 import os
+import re
 
 from indicator import GAP_NS, TZ_SHIFT_S
+from large_trade_defaults import MIN_NOTIONAL
 
 NS = 1_000_000_000
+WINDOW_CAP = 50_000    # 基线最多保留的事件数(币安 BTC 10 分钟约 9000 笔, 极端行情留足余量)
+RAW_SLACK = 20_000     # 原始记录在基线之外多留的条数, 供修订重放
+EVENT_CAP = 20_000     # 最多保留的大额事件数, 更早的只折进 CVD 起点
 SOURCE_LABELS = {"snapshot": "期货快照估算", "trade": "交易所逐笔", "aggregate": "交易所聚合成交"}
+_PRODUCT_RE = re.compile(r"(?:KQ\.[a-z]@)?([A-Z]+)\.([A-Za-z]+)\d*")
 
 
-def default_settings(source):
-    return {"window": 2000, "warmup": 200, "quantile": 0.99, "minRatio": 1.5,
-            "minQty": 20.0 if source == "snapshot" else 0.0,
-            "minNotional": 0.0 if source == "snapshot" else 10000.0}
+def product_of(symbol):
+    """品种键: 期货去掉主连前缀和月份(KQ.m@SHFE.fu、SHFE.fu2611 -> SHFE.fu), 加密合约原样。"""
+    match = _PRODUCT_RE.fullmatch(symbol or "")
+    return f"{match[1]}.{match[2]}" if match else symbol
+
+
+def default_settings(source, symbol=None):
+    """内置参数。金额门槛取该品种的初始值; 表里没有的期货回落到 20 手, 加密回落到 1 万 USDT。"""
+    # 基线 10 分钟: 30 分钟时放量后半小时都压着相对门槛, 行情转淡后迟迟不出点。
+    # 最近 30 秒不进基线: 连串大单不被前面几笔抬高的门槛压掉。
+    settings = {"windowSec": 600, "lagSec": 30, "warmup": 200, "quantile": 0.99,
+                "minQty": 0.0, "minNotional": 0.0 if source == "snapshot" else 10000.0}
+    floor = MIN_NOTIONAL.get(product_of(symbol)) if symbol else None
+    if floor is not None:
+        settings["minNotional"] = float(floor)
+    elif source == "snapshot":
+        settings["minQty"] = 20.0
+    return settings
 
 
 @lru_cache(maxsize=4)
@@ -35,23 +61,24 @@ def _overrides(text):
 
 
 def settings_for(symbol, source):
-    settings = default_settings(source)
-    # 可按完整合约代码覆盖, '*' 为全部合约的公共覆盖; 非法配置明确报错。留空等于不覆盖。
+    settings = default_settings(source, symbol)
+    # 依次按 '*'(全部合约)、品种(SHFE.fu)、完整合约代码覆盖; 非法配置明确报错。留空等于不覆盖。
     overrides = _overrides(os.getenv("LARGE_TRADE_SETTINGS", "").strip() or "{}")
-    for key in ("*", symbol):
+    for key in dict.fromkeys(("*", product_of(symbol), symbol)):
         settings.update({k: v for k, v in overrides.get(key, {}).items() if k in settings})
-    for key in ("window", "warmup", "quantile", "minRatio", "minQty", "minNotional"):
+    for key in ("windowSec", "lagSec", "warmup", "quantile", "minQty", "minNotional"):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError(f"大额成交 {key} 必须是有限数值")
-        if key in ("window", "warmup"):
+        if key in ("windowSec", "lagSec", "warmup"):
             if not float(value).is_integer():
                 raise ValueError(f"大额成交 {key} 必须是整数")
             settings[key] = int(value)
         else:
             settings[key] = float(value)
-    if not (2 <= settings["warmup"] <= settings["window"] <= 10000 and
-            0 < settings["quantile"] < 1 and settings["minRatio"] >= 1 and
+    if not (60 <= settings["windowSec"] <= 86400 and 0 <= settings["lagSec"] < settings["windowSec"] and
+            2 <= settings["warmup"] <= WINDOW_CAP and
+            0 < settings["quantile"] < 1 and
             settings["minQty"] >= 0 and settings["minNotional"] >= 0):
         raise ValueError("大额成交参数超出范围")
     return settings
@@ -68,7 +95,27 @@ def _settings_or_default(symbol, source):
         if str(exc) not in _warned:
             _warned.add(str(exc))
             print(f"[large] {exc}; {symbol} 等合约按默认参数检测大额成交", flush=True)
-        return default_settings(source)
+        return default_settings(source, symbol)
+
+
+def _scan(entries, spans, open_span):
+    """按序号顺序扫 (时间ns, 已判定, 与上一条之间没丢数据), 把已判定数据覆盖的时间段接到 spans 后面。
+
+    未判定的记录切断区间; 它与上一条之间没丢数据时, 区间延伸到它前 1ns:
+    收盘前最后一笔之后到下一笔之前确实没有成交, 收盘那根 K 线不应一直算作部分覆盖。
+    返回 (spans, 扫完时区间是否还开着), 裁剪原始记录时据此接着扫。
+    """
+    for ns, ready, joined in entries:
+        if ready and open_span and joined:
+            spans[-1][1] = ns
+        elif ready:
+            spans.append([ns, ns])
+            open_span = True
+        else:
+            if open_span and joined:
+                spans[-1][1] = max(spans[-1][1], ns - 1)
+            open_span = False
+    return spans, open_span
 
 
 class LargeTradeDetector:
@@ -78,61 +125,110 @@ class LargeTradeDetector:
         # key -> (时间ns, 价格, 量, 方向, 重置基线, 可用, 与上一条之间没丢数据)
         self.raw = {}
         self.events = {}       # key -> 已筛选事件; 不随图表窗口移动清零
-        self.readiness = {}    # key -> (时间ns, 已判定, 与上一条之间没丢数据)
+        self.readiness = {}    # key -> (时间ns, 已判定, 与上一条之间没丢数据); 随 raw 裁剪
         self.base_delta = 0.0
         self.since = None
         self.version = 0       # 每次有记录变化加一, 供按版本复用汇总结果
+        # 每手对应的标的数量: 加密的量已是币, 期货等报价里的合约乘数(Feed 拿到后设置)
+        self.multiplier = None if source == "snapshot" else 1.0
         self._last_crypto = None
+        self._run = None        # 加密: 正在合并的事件 (key, 时间ns, 方向)
         self._cache = None
-        self._window = deque()
+        self._window = deque()  # 基线 (交易时钟, 量)
+        self._lagged = deque()  # 还在滞后期里的 (交易时钟, 量), 到期才进基线
         self._sorted = []
         self._sum = self._sum2 = 0.0
+        self._clock, self._last_ns = 0, None
         self._spans = None
+        # 已裁掉的原始记录留下的覆盖区间与扫描状态; 回填补判来的区间; 已丢弃的最新一个事件的时刻
+        self._archived, self._archived_open = [], False
+        self._history = []
+        self._events_floor = None
 
     def config(self):
         return {**self.settings, "source": self.source, "label": SOURCE_LABELS[self.source],
-                "symbol": self.symbol, "history": "本次采集; 旧K线历史不回推"}
+                "symbol": self.symbol, "multiplier": self.multiplier,
+                "history": "本次采集; 旧K线历史不回推" if self.source == "snapshot"
+                else "本次采集, 断线/关机缺口回填后补判最近 6 小时; 已完整落盘的旧K线不回推"}
 
     def _clear_window(self):
         self._window.clear()
+        self._lagged.clear()
         self._sorted.clear()
         self._sum = self._sum2 = 0.0
 
-    def _push(self, q):
-        if len(self._window) == self.settings["window"]:
-            old = self._window.popleft()
+    def _advance(self, ns):
+        """交易时钟: 相邻记录的间隔按 GAP_NS 封顶, 午休、收盘到夜盘不占基线的时间窗。"""
+        if self._last_ns is not None and ns > self._last_ns:
+            self._clock += min(ns - self._last_ns, GAP_NS)
+        self._last_ns = ns if self._last_ns is None else max(self._last_ns, ns)
+
+    def _promote(self):
+        """滞后期满的事件进基线。lagSec=0 时此前的事件全部进入(判定只看本条之前的)。"""
+        cutoff = self._clock - self.settings["lagSec"] * NS
+        while self._lagged and self._lagged[0][0] <= cutoff:
+            self._push(*self._lagged.popleft())
+
+    def _evict(self):
+        """丢掉时间窗以外的旧事件, 但至少留 warmup 个: 冷门品种按笔数补足, 不会一直预热。"""
+        cutoff = self._clock - self.settings["windowSec"] * NS
+        warmup = self.settings["warmup"]
+        while self._window and (len(self._window) > WINDOW_CAP or
+                                (len(self._window) > warmup and self._window[0][0] < cutoff)):
+            _, old = self._window.popleft()
             self._sorted.pop(bisect_left(self._sorted, old))
             self._sum -= old
             self._sum2 -= old * old
-        self._window.append(q)
+
+    def _push(self, clock, q):
+        self._window.append((clock, q))
         insort(self._sorted, q)
         self._sum += q
         self._sum2 += q * q
 
-    def _process(self, key, row):
+    def _process(self, key, row, judge=True):
+        """推进基线; judge=False 只重建基线(修订重放), 不改判定结果。"""
         ns, price, qty, side, reset, usable, joined = row
+        self._advance(ns)
         if reset:
             self._clear_window()
-        ready = usable and len(self._window) >= self.settings["warmup"]
-        self.readiness[key] = (ns, ready, joined)
-        if not usable or qty <= 0:
+        self._promote()
+        self._evict()
+        if judge:
+            ready = usable and len(self._window) >= self.settings["warmup"]
+            self.readiness[key] = (ns, ready, joined)
+            if ready and qty > 0:
+                self._judge(key, ns, price, qty, side)
+        if usable and qty > 0:
+            self._lagged.append((self._clock, qty))
+
+    def _judge(self, key, ns, price, qty, side):
+        n = len(self._window)
+        mean = self._sum / n
+        sd = math.sqrt(max(0.0, self._sum2 / n - mean * mean))
+        pos = (n - 1) * self.settings["quantile"]
+        lo, hi = math.floor(pos), math.ceil(pos)
+        threshold = self._sorted[lo] + (self._sorted[hi] - self._sorted[lo]) * (pos - lo)
+        ratio = qty / mean if mean else 0.0
+        z = (qty - mean) / sd if sd > 0 else None
+        floor = self.settings["minNotional"]
+        # 合约乘数未知时不能判断金额门槛, 宁可不报。
+        rich = floor <= 0 or (self.multiplier is not None and price * qty * self.multiplier >= floor)
+        if qty > threshold and qty >= self.settings["minQty"] and rich:
+            self.events[key] = {"ns": ns, "price": price, "qty": qty, "side": side,
+                                "ratio": ratio, "z": z, "threshold": threshold}
+            self._cache = None
+
+    def _trim_events(self):
+        """事件太多时丢掉最早的(按时间), 其净量折进 CVD 起点; 那以前的 K 线不再算作已覆盖。"""
+        if len(self.events) <= EVENT_CAP + EVENT_CAP // 20:   # 攒一点再裁, 不必每来一个事件就排序
             return
-        if ready:
-            n = len(self._window)
-            mean = self._sum / n
-            sd = math.sqrt(max(0.0, self._sum2 / n - mean * mean))
-            pos = (n - 1) * self.settings["quantile"]
-            lo, hi = math.floor(pos), math.ceil(pos)
-            threshold = self._sorted[lo] + (self._sorted[hi] - self._sorted[lo]) * (pos - lo)
-            ratio = qty / mean if mean else 0.0
-            z = (qty - mean) / sd if sd > 0 else None
-            notional = price * qty
-            if (qty > threshold and ratio >= self.settings["minRatio"] and
-                    qty >= self.settings["minQty"] and notional >= self.settings["minNotional"]):
-                self.events[key] = {"ns": ns, "price": price, "qty": qty, "side": side,
-                                    "ratio": ratio, "z": z, "threshold": threshold}
-                self._cache = None
-        self._push(qty)
+        ordered = sorted(self.events.items(), key=lambda item: item[1]["ns"])
+        for key, event in ordered[:-EVENT_CAP]:
+            del self.events[key]
+            self.base_delta += event["qty"] * event["side"]
+            self._events_floor = event["ns"] if self._events_floor is None else max(self._events_floor, event["ns"])
+        self._cache = self._spans = None
 
     def update(self, rows):
         """已按 key 排序的原始记录。重复不计, 修订从该记录起重放, 保留此前的统计基线。"""
@@ -151,31 +247,37 @@ class LargeTradeDetector:
         if replay:
             self.raw = dict(sorted(self.raw.items()))
             self._clear_window()
-            # 重建修订之前的基线; 不修改此前已确定的大额事件。
+            self._clock, self._last_ns = 0, None
+            # 重建修订之前的基线(含交易时钟, 时间窗只看相对间隔); 不修改此前已确定的大额事件。
             for key, row in self.raw.items():
                 if key >= earliest:
                     break
-                if row[4]:
-                    self._clear_window()
-                if row[5] and row[2] > 0:
-                    self._push(row[2])
+                self._process(key, row, judge=False)
             self.events = {key: value for key, value in self.events.items() if key < earliest}
             self._cache = None
         tail = ((key, row) for key, row in self.raw.items() if key >= earliest) if replay else changes
         for key, row in tail:
             self._process(key, row)
-        # 保留足够的修订前置基线, 同时限制原始样本占用。
-        limit = 20000 + self.settings["window"]
-        if len(self.raw) > limit + 1024:
-            keep = list(self.raw)[-limit:]
-            self.raw = {key: self.raw[key] for key in keep}
-            self.readiness = {key: self.readiness[key] for key in keep}
-        if len(self.events) > 20000:
-            removed = list(self.events)[:-20000]
-            for key in removed:
-                event = self.events.pop(key)
-                self.base_delta += event["qty"] * event["side"]
-            self._cache = None
+        self._settle()
+
+    def _append(self, key, row):
+        """update 的快速路径: key 比已有的都大(加密成交编号只增不减), 不必查重、不会重放。"""
+        self.raw[key] = row
+        if self.since is None:
+            self.since = row[0]
+        self._process(key, row)
+        self._settle()
+
+    def _settle(self):
+        # 原始记录要能在修订重放时重建当前基线, 另外多留一段; 再早的只留下覆盖区间。攒够一批再裁。
+        limit = len(self._window) + len(self._lagged) + RAW_SLACK
+        if len(self.raw) > limit + max(1024, limit // 4):
+            keys = list(self.raw)
+            self._archived, self._archived_open = _scan(
+                (self.readiness[key] for key in keys[:-limit]), self._archived, self._archived_open)
+            self.raw = {key: self.raw[key] for key in keys[-limit:]}
+            self.readiness = {key: self.readiness[key] for key in keys[-limit:]}
+        self._trim_events()
         self._spans = None
         self.version += 1
 
@@ -208,11 +310,12 @@ class LargeTradeDetector:
                     joined = identity == previous_id + 1
                 else:
                     joined = ns - int(previous.datetime) <= GAP_NS
-                # 累计量回落是换交易日(首笔含集合竞价), 本条量不可用并重新预热。
-                reset = row.volume < previous.volume or not joined
+                # 累计量回落是换交易日: 首笔含集合竞价, 本条量不可用; 序号连续说明没丢数据, 基线沿用,
+                # 否则夜盘开盘最活跃的一两分钟都在预热。
+                roll = row.volume < previous.volume
                 qty = float(row.volume - previous.volume)
                 rows.append((key, (ns, float(row.last_price), max(qty, 0.0), int(row.side_lr),
-                                   reset, not reset, joined)))
+                                   not joined, joined and not roll, joined)))
             previous = row
             previous_id = identity
         self.update(rows)
@@ -223,39 +326,82 @@ class LargeTradeDetector:
             return
         joined = (self._last_crypto is not None and identity == self._last_crypto[0] + 1 and
                   ns >= self._last_crypto[1])
+        self._last_crypto = (identity, ns)
         # 坏价格/量的一笔也要占住编号, 否则下一笔会被当成漏号而重新预热; 本身记为不可判定。
         valid = math.isfinite(price) and math.isfinite(qty) and price > 0 and qty >= 0
-        self.update([(identity, (ns, float(price) if valid else 0.0, float(qty) if valid else 0.0,
-                                 -1 if sell else 1, not joined, valid, joined))])
-        self._last_crypto = (identity, ns)
+        side = -1 if sell else 1
+        run = self._run
+        if valid and qty > 0 and joined and run is not None and run[1:] == (ns, side):
+            self._extend(run[0], float(price), float(qty))
+            return
+        self._append(identity, (ns, float(price) if valid else 0.0, float(qty) if valid else 0.0,
+                                side, not joined, valid, joined))
+        self._run = (identity, ns, side) if valid and qty > 0 else None
+
+    def _extend(self, key, price, qty):
+        """同一毫秒、同一方向的连续成交多半是一张吃单扫了多档或吃了多个挂单: 并进当前事件,
+        价格取成交量加权。按判定首笔时的同一基线重判(两笔之间基线没动过, 本事件还在滞后队列末尾)。"""
+        ns, p0, q0, side, reset, usable, joined = self.raw[key]
+        total = q0 + qty
+        vwap = (p0 * q0 + price * qty) / total
+        self.raw[key] = (ns, vwap, total, side, reset, usable, joined)
+        self._lagged[-1] = (self._lagged[-1][0], total)
+        if self.readiness[key][1]:
+            self._judge(key, ns, vwap, total, side)
+        self.version += 1
+
+    def absorb(self, events, spans):
+        """并入回填补判的结果: 洞里(本次运行开始前或断线期间)的事件 {成交编号: 事件} 与已判定区间。
+        它们只参与展示和 CVD, 不动实时基线。"""
+        if not events and not spans:
+            return
+        self.events.update(events)
+        self._history = sorted([*self._history, *(tuple(span) for span in spans)])
+        starts = [lo for lo, _ in spans] + [event["ns"] for event in events.values()]
+        self.since = min(starts) if self.since is None else min(self.since, *starts)
+        self._trim_events()
+        self._cache = self._spans = None
+        self.version += 1
 
     def event_rows(self):
         if self._cache is None:
             self._cache = sorted(self.events.values(), key=lambda e: e["ns"])
         return self._cache
 
-    def spans(self):
-        """已判定数据覆盖的时间段 [(起, 止)], 按时间排序。
+    def collected(self):
+        """有原始记录(含预热)的时间段 (起, 止), 没有时 None。事件丢弃过的部分不算。"""
+        if self.since is None or not self.raw:
+            return None
+        start = self.since if self._events_floor is None else max(self.since, self._events_floor + 1)
+        return start, next(reversed(self.raw.values()))[0]
 
-        未判定的记录切断区间; 它与上一条之间没丢数据时, 区间延伸到它前 1ns:
-        收盘前最后一笔之后到下一笔之前确实没有成交, 收盘那根 K 线不应一直算作部分覆盖。
-        """
+    def spans(self):
+        """已判定数据覆盖的时间段 [(起, 止)], 按时间排序: 当前原始记录(见 _scan)接在已裁掉部分之后,
+        再并上回填补判的区间; 相接的合并, 事件已丢弃的部分去掉。"""
         if self._spans is None:
-            spans = []
-            open_span = False
-            for key in sorted(self.readiness):
-                ns, ready, joined = self.readiness[key]
-                if ready and open_span and joined:
-                    spans[-1][1] = ns
-                elif ready:
-                    spans.append([ns, ns])
-                    open_span = True
+            live, _ = _scan((self.readiness[key] for key in sorted(self.readiness)),
+                            [list(span) for span in self._archived], self._archived_open)
+            merged = []
+            for lo, hi in sorted([*(tuple(span) for span in live), *self._history]):
+                if self._events_floor is not None:
+                    if hi <= self._events_floor:
+                        continue
+                    lo = max(lo, self._events_floor + 1)
+                if merged and lo <= merged[-1][1] + 1:
+                    merged[-1][1] = max(merged[-1][1], hi)
                 else:
-                    if open_span and joined:
-                        spans[-1][1] = max(spans[-1][1], ns - 1)
-                    open_span = False
-            self._spans = [(lo, hi) for lo, hi in spans]
+                    merged.append([lo, hi])
+            self._spans = [(lo, hi) for lo, hi in merged]
         return self._spans
+
+
+def judge_history(symbol, source, trades):
+    """回填线程用: 按编号顺序把一段历史成交 (编号, 价, 量, 毫秒, 是否主动卖) 过一遍独立的检测器
+    (编号接不上处重新预热), 返回可交给 absorb 的 (事件, 覆盖区间)。"""
+    detector = LargeTradeDetector(symbol, source)
+    for identity, price, qty, ms, sell in trades:
+        detector.trade(identity, price, qty, ms, sell)
+    return dict(detector.events), detector.spans()
 
 
 def decorate_bars(bars, detectors, tf):
@@ -275,10 +421,9 @@ def decorate_bars(bars, detectors, tf):
         shift = TZ_SHIFT_S * NS - (1 if detector.source == "snapshot" else 0)
         spans = [(lo+shift, hi+shift) for lo,hi in detector.spans()]
         rows = detector.event_rows()
-        collected = None   # 有原始记录(含预热)的时间段
-        if detector.since is not None and detector.raw:
-            collected = (max(detector.since, next(iter(detector.raw.values()))[0]) + shift,
-                         next(reversed(detector.raw.values()))[0] + shift)
+        collected = detector.collected()   # 有原始记录(含预热)的时间段
+        if collected is not None:
+            collected = (collected[0] + shift, collected[1] + shift)
         event_index, span_index, cumulative = 0, 0, detector.base_delta
         for i, bar in enumerate(bars):
             s = summaries[i]

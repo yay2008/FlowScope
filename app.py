@@ -325,9 +325,10 @@ async def paper_state(symbol: str = DEFAULT_SYMBOL):
 
 @app.post("/api/paper/orders")
 async def paper_order(order: dict = Body(...)):
-    """下单: ``{symbol, side: buy|sell, qty, type: market|limit, price?, tp?, sl?, clientId?}``。
+    """下单: ``{symbol, side: buy|sell, qty, type: market|limit|stop, price?, tp?, sl?, clientId?}``。
 
-    市价单当场成交或返回 400(对手盘不够、不在交易时段等); 限价单够得着就成交, 否则挂单。
+    市价单当场成交或返回 400(对手盘不够、不在交易时段等); 限价单够得着就成交, 否则挂单;
+    条件单(stop, price 是触发价)挂着等最新价碰到触发价, 触发后按市价成交。
     同一个 clientId 只下一次, 页面双击或超时重发不会重复成交。tp/sl 是成交后挂到持仓上的止盈/止损价。
     期货可传 autoStopLoss(元), 开仓后按整份持仓换算止损和 1.5 倍止盈, 不可与 tp/sl 同传。
     加密合约的数量是小数的币, 按五档盘口撮合(见 paper_crypto.py)。
@@ -347,6 +348,22 @@ def paper_cancel(order_id: str):
         if order_id.startswith("C"):
             return crypto_paper.cancel(order_id)
         return paper.cancel(order_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/paper/orders/{order_id}")
+def paper_amend(order_id: str, body: dict = Body(...)):
+    """改挂单价格: ``{price}``(限价单的委托价、条件单的触发价), 单号不变。
+
+    会让它当场成交的改价(限价单够得着对手价、条件单的触发价已被越过)返回 400, 原委托不变。
+    """
+    try:
+        if not isinstance(body, dict):
+            raise ValueError("请求格式不对")
+        if order_id.startswith("C"):
+            return crypto_paper.amend(order_id, body.get("price"))
+        return paper.amend(order_id, body.get("price"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

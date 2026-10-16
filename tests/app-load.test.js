@@ -291,7 +291,7 @@ test("模拟交易面板加载后在 K 线上画出持仓均价、止盈与挂�
   await vm.runInContext("paperPanel.refresh()", context);
   const titles = createdPriceLines.map((line) => line.title).filter(Boolean);
   assert.ok(titles.includes("多1 均价"), `应画出持仓均价线, 实际 ${JSON.stringify(titles)}`);
-  assert.ok(titles.includes("卖1 挂单"), `应画出挂单价格线, 实际 ${JSON.stringify(titles)}`);
+  assert.ok(titles.includes("卖1 限价"), `应画出挂单价格线, 实际 ${JSON.stringify(titles)}`);
   assert.ok(titles.includes("止盈") && !titles.includes("止损"), `只画设了的止盈线, 实际 ${JSON.stringify(titles)}`);
   assert.ok(stubCharts.length === 2 && stubCharts.every((chart) => chart.markers.length > 0),
             "两张图都应把成交标记交给图表(即使这次为空)");
@@ -930,7 +930,7 @@ test("OB Zones: 图元按实际价格坐标绘制、裁掉画外区域, 两条�
   assert.deepEqual(texts, [["多 · ▲: 80 | ▼: 20", 297, 58]]);
 });
 
-test("大额成交: 每根只画一个净方向点, 同净量同大小, 零净量不画, 悬停保留买卖明细", () => {
+test("大额成交: 买卖两侧各画一个点, 大小按该侧量, 对冲不抵消, 只有未知方向不画, 悬停保留买卖明细", () => {
   const storage = createLocalStorage();
   const context = runBrowser({ localStorage: storage });
   const bars = obBars();
@@ -944,11 +944,15 @@ test("大额成交: 每根只画一个净方向点, 同净量同大小, 零净�
   stubCharts[1].timeScale.setVisibleLogicalRange({ from: 90, to: 110 });
   const p = stubCharts[1].primitives.find((item) => item.constructor.name === "Primitive");
   const marks = p.geometry();
-  assert.deepEqual(Array.from(marks, (m) => m.side), ["buy", "buy", "sell"]);
-  assert.equal(new Set(marks.map((m) => m.bar.time)).size, marks.length, "一根 K 线最多一个点");
-  assert.equal(marks[0].r, marks[1].r, "买卖总量不同而净量相同, 点大小必须相同");
-  assert.equal(marks[0].r, marks[2].r, "正负方向不影响大小");
-  assert.ok(marks[0].y > 0 && marks[2].y < 0, "净买方在低点下、净卖方在高点上");
+  assert.deepEqual(Array.from(marks, (m) => m.side), ["buy", "sell", "buy", "sell", "buy", "sell", "buy", "sell"]);
+  const at = (i) => marks.filter((m) => m.bar.time === bars[i].time);
+  assert.equal(at(102).length, 2, "买卖对冲、净值为零也画出两侧");
+  assert.equal(at(103).length, 0, "只有未知方向不画点");
+  assert.ok(marks[0].r > marks[1].r, "买 80 的点比卖 40 的大");
+  assert.equal(marks[0].r, at(101)[1].r, "相同量的买卖两侧同样大");
+  assert.equal(at(102)[0].r, at(102)[1].r);
+  assert.ok(marks[0].y > 0 && marks[1].y < 0, "买在低点下、卖在高点上");
+  assert.equal(marks[0].x, marks[1].x, "同一根的两个点在同一竖线上");
   const ctx = { save() {}, restore() {}, beginPath() {}, arc() {}, stroke() {}, fill() {}, fillText() {} };
   p.draw({ useMediaCoordinateSpace: (fn) => fn({ context: ctx, mediaSize: { width: 1000, height: 400 } }) });
   stubCharts[1].crosshairHandlers.forEach((fn) => fn({ time: bars[99].time, paneIndex: 0, point: marks[0] }));
@@ -969,15 +973,15 @@ test("大额成交: 每根只画一个净方向点, 同净量同大小, 零净�
   stubCharts[0].timeScale.setVisibleLogicalRange({ from: 90, to: 110 });
   const a = stubCharts[0].primitives.find((item) => item.constructor.name === "Primitive");
   const b = stubCharts[1].primitives.find((item) => item.constructor.name === "Primitive");
-  assert.equal(a.geometry().length, 3);
+  assert.equal(a.geometry().length, 8);
   assert.equal(b.geometry().length, 0);
   viewSetter(again)("footprint");
   assert.equal(a.geometry().length, 0);
   viewSetter(again)("candle");
-  assert.equal(a.geometry().length, 3);
+  assert.equal(a.geometry().length, 8);
 });
 
-test("大额成交: WebSocket 净量翻转会换色移位, 相抵后移除圆点, 旧历史显示未采集", async () => {
+test("大额成交: WebSocket 更新时两侧各自变大小, 对冲仍保留两点, 无大额买卖时移除, 旧历史显示未采集", async () => {
   const bars = obBars();
   const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
     colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
@@ -996,25 +1000,31 @@ test("大额成交: WebSocket 净量翻转会换色移位, 相抵后移除圆点
   const send = (revision, buy, sell) => socket.onmessage({ data: JSON.stringify({ type: "bars", symbol: "KQ.m@SHFE.fu",
     tf: 30, ltf: 0, revision, bars: [{ ...bars[109], large: { buy, sell, unknown: 0, count: 2,
       buyScale: buy / 20, sellScale: sell / 20, delta: buy - sell, cvd: buy - sell, coverage: "partial" } }] }) });
+  const pair = () => Object.fromEntries(p.geometry().map((m) => [m.side, m]));
   send(1, 120, 80);
-  assert.equal(p.geometry().length, 1);
-  const initial = p.geometry()[0];
-  assert.equal(initial.side, "buy");
+  assert.equal(p.geometry().length, 2);
+  const initial = pair();
+  assert.ok(initial.buy.r > initial.sell.r);
+  assert.ok(initial.buy.y > 0 && initial.sell.y < 0);
   assert.match(read.textContent, /CVD \+40/);
   send(2, 40, 80);
-  assert.equal(p.geometry().length, 1);
-  const flipped = p.geometry()[0];
-  assert.equal(flipped.side, "sell");
-  assert.equal(flipped.r, initial.r);
-  assert.ok(flipped.y < 0 && initial.y > 0);
+  assert.equal(p.geometry().length, 2);
+  const flipped = pair();
+  assert.ok(flipped.buy.r < initial.buy.r, "买侧变小");
+  assert.equal(flipped.sell.r, initial.sell.r, "卖侧没变, 大小不变");
+  assert.ok(flipped.buy.r < flipped.sell.r);
   assert.match(read.textContent, /CVD -40/);
   const tooltip = findByClass(chartEl(context, 1), "large-tooltip");
-  stubCharts[1].crosshairHandlers.forEach((fn) => fn({ time: bars[109].time, paneIndex: 0, point: flipped }));
+  stubCharts[1].crosshairHandlers.forEach((fn) => fn({ time: bars[109].time, paneIndex: 0, point: flipped.sell }));
   assert.equal(tooltip.hidden, false);
   assert.match(tooltip.textContent, /买 40 \/ 卖 80/);
   send(3, 80, 80);
-  assert.equal(p.geometry().length, 0);
+  assert.equal(p.geometry().length, 2, "买卖相抵也保留两侧");
   assert.match(read.textContent, /CVD 0/);
+  assert.equal(tooltip.hidden, false, "悬停的卖点还在, 明细保留");
+  assert.match(tooltip.textContent, /买 80 \/ 卖 80/);
+  send(4, 0, 0);
+  assert.equal(p.geometry().length, 0);
   assert.equal(tooltip.hidden, true, "光标没动、圆点随行情消失: 不等重绘就收起明细");
 });
 
@@ -1784,7 +1794,8 @@ test("测量读数: 时长只留两级单位; 根数只数真实的 bar, 时长�
 // 在第 index 张图上按下再抬起鼠标左键: dx 是按下后挪动的像素(拖动), onCorner 表示点在左上角的按钮/图例上
 function pressChart(context, index, { shiftKey = false, dx = 0, onCorner = false } = {}) {
   const el = chartEl(context, index);
-  const target = { closest: (selector) => (onCorner && selector === ".chart-corner" ? {} : null) };
+  // closest 收的可能是逗号分开的一组选择器(".chart-corner, .paper-menu"), 和浏览器一样任一个对上就算
+  const target = { closest: (selector) => (onCorner && selector.split(",").some((part) => part.trim() === ".chart-corner") ? {} : null) };
   el.handlers.pointerdown.forEach((fn) => fn({ button: 0, clientX: 100, clientY: 100, target }));
   el.handlers.pointerup.forEach((fn) => fn({ button: 0, clientX: 100 + dx, clientY: 100, target, shiftKey }));
 }

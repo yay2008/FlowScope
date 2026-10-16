@@ -199,6 +199,45 @@ body { display: flex; flex-direction: column; }
 .chart-view + .chart-view { border-left: 1px solid #2a2e39; }
 /* 划线止盈止损: 鼠标在能拖的线上(或正拖着)时换成上下箭头; 库在自己的元素上写了内联光标, 要 !important 才盖得住 */
 .chart-view.paper-drag, .chart-view.paper-drag * { cursor: ns-resize !important; }
+/* 右键挂单菜单与图上操作的结果提示: 摆在鼠标旁边, 压在图表和左上角图例之上 */
+.paper-menu {
+  position: absolute;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  min-width: 150px;
+  padding: 4px 0;
+  border: 1px solid #363c4e;
+  border-radius: 4px;
+  background: #1e222d;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+.paper-menu button {
+  padding: 5px 12px;
+  border: none;
+  background: transparent;
+  font: 12px Consolas, "Microsoft YaHei", monospace;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.paper-menu button.buy { color: #f23645; }
+.paper-menu button.sell { color: #00b36b; }
+.paper-menu button:hover { background: #2a2e39; }
+.paper-toast {
+  position: absolute;
+  z-index: 40;
+  max-width: 320px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(30, 34, 45, 0.95);
+  border: 1px solid #363c4e;
+  color: #66bb6a;
+  font-size: 12px;
+  pointer-events: none;
+}
+.paper-toast.error { color: #f7525f; }
+.paper-toast[hidden] { display: none; }
 
 /* 每张图的左上角(也就是主图窗格的左上角): 周期下拉框, 下面挂主图指标图例。
    容器不挡十字光标, 只有下拉框和图例的每一行接收鼠标(选周期、悬停看说明、点眼睛) */
@@ -611,6 +650,7 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
 .trade-list li.done { opacity: 0.6; }
 .trade-list li.with-stops { flex-wrap: wrap; }
 .trade-order-stops-line { width: 100%; padding-left: 1em; color: #9598a1; font-size: 11px; }
+.trade-order-stops-line.error { color: #f7525f; }
 .trade-cancel { background: #363c4e; padding: 0 6px; }
 .trade-cancel:hover { background: #434a60; }
 

@@ -137,8 +137,9 @@
         <label>类型<select id="trade-type">
           <option value="market" selected>市价</option>
           <option value="limit">限价</option>
+          <option value="stop" title="突破单: 最新价涨到触发价时买入、跌到触发价时卖出, 触发后按市价成交">条件</option>
         </select></label>
-        <label id="trade-price-row" hidden>价格<input id="trade-price" type="number" min="0" step="any"></label>
+        <label id="trade-price-row" hidden><span id="trade-price-label">价格</span><input id="trade-price" type="number" min="0" step="any"></label>
         <label id="trade-leverage-row" hidden title="加密合约每个合约一个杠杆(全仓); 降杠杆后保证金不够会被拒">杠杆<select id="trade-leverage"></select></label>
         <div id="trade-auto-stops" class="trade-auto-stops" title="开仓成交后按整份持仓的均价和手数换算价格, 加仓、部分平仓后重算。只影响后续成交, 不修改已有持仓; 手动改价后退出金额模式。触发后按市价平仓, 实际盈亏会受跳动价位、价差和手续费影响">
           <label class="trade-auto-toggle"><input id="trade-auto-enabled" type="checkbox" checked>自动止盈止损</label>
@@ -148,14 +149,14 @@
           </div>
           <div id="trade-auto-note" class="trade-auto-note">整份持仓 · 不含手续费 · 价位取整</div>
         </div>
-        <div id="trade-order-stops" class="trade-order-stops" hidden title="可选, 留空表示不设。成交后挂到持仓上(只覆盖填了的那一项), 按最新价触发后市价平掉全部持仓。市价单按最新价校验, 限价单按委托价校验; 只减仓、平仓的委托不能带。下单成功后清空">
+        <div id="trade-order-stops" class="trade-order-stops" hidden title="可选, 留空表示不设。成交后挂到持仓上(只覆盖填了的那一项), 按最新价触发后市价平掉全部持仓。市价单按最新价校验, 限价单按委托价校验, 条件单按触发价校验; 只减仓、平仓的委托不能带。下单成功后清空">
           <label>止盈<input id="trade-order-tp" type="number" min="0" step="any" placeholder="不设"></label>
           <label>止损<input id="trade-order-sl" type="number" min="0" step="any" placeholder="不设"></label>
         </div>
       </div>
       <div class="trade-actions">
-        <button id="trade-buy" class="trade-buy" title="市价: 按卖一价整笔成交; 限价: 卖一不高于限价就立即成交, 否则挂单">买入</button>
-        <button id="trade-sell" class="trade-sell" title="市价: 按买一价整笔成交; 限价: 买一不低于限价就立即成交, 否则挂单">卖出</button>
+        <button id="trade-buy" class="trade-buy" title="市价: 按卖一价整笔成交; 限价: 卖一不高于限价就立即成交, 否则挂单; 条件: 触发价要高于最新价, 最新价涨到触发价时按市价买入">买入</button>
+        <button id="trade-sell" class="trade-sell" title="市价: 按买一价整笔成交; 限价: 买一不低于限价就立即成交, 否则挂单; 条件: 触发价要低于最新价, 最新价跌到触发价时按市价卖出">卖出</button>
       </div>
       <button id="trade-flatten" class="trade-flatten" title="按市价平掉当前合约的全部持仓">平仓</button>
       <div id="trade-msg" class="trade-msg"></div>
@@ -170,7 +171,7 @@
       <div class="trade-section">账户</div>
       <div id="trade-account" class="trade-grid"></div>
       <details class="trade-fold">
-        <summary class="trade-section" title="点击展开/折叠">委托<span id="trade-orders-count" class="trade-fold-count"></span></summary>
+        <summary class="trade-section" title="点击展开/折叠。K 线上: 拖挂单线改价, 双击挂单线撤单, 右键点价位挂限价单或条件单">委托<span id="trade-orders-count" class="trade-fold-count"></span></summary>
         <ul id="trade-orders" class="trade-list"></ul>
       </details>
       <details class="trade-fold">

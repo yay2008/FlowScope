@@ -11,6 +11,8 @@
 - 市价单: 按五档盘口逐档吃到够为止, 按成交均价成交(吃单费率); 五档都吃完还不够就拒单。
 - 限价单: 下单时就够得着(买: 卖一不高于限价)且五档里限价以内的量够, 立即按均价成交(吃单费率);
   否则挂单, 之后最新价或对手一档**穿过**限价才按限价成交(挂单费率), 碰到不算。
+- 条件单与改价同期货账户(规则见 paper.py): 最新价碰到触发价后按五档盘口市价成交(吃单费率), 五档不够就留着重试;
+  挂单改价不能改到当场成交。
 - 杠杆每个合约一个(默认 10 倍), 初始保证金 = 名义金额 / 杠杆。开仓(含反手的开仓部分)要求成交后
   权益仍够付全部持仓的初始保证金; 只减仓不查。
 - 资金费: 到交易所公布的结算时刻, 按结算前最后看到的资金费率与标记价格结算(费率为正时多头付费)。
@@ -30,8 +32,9 @@ from datetime import datetime, timedelta, timezone
 
 from crypto_feed import is_crypto, venue_of
 from ingest import validate_symbol
-from paper import (MAX_FINISHED_ORDERS, MAX_TRADES, STOP_LABELS, OrderError, PaperStore, _num, attach_stops,
-                   check_stops, keep_stops, normalize_stop, order_stops, snap_to_tick, stop_hit)
+from paper import (MAX_FINISHED_ORDERS, MAX_TRADES, MISSING_PRICE, ORDER_TYPES, STOP_LABELS, OrderError, PaperStore,
+                   _num, attach_stops, check_amend_limit, check_amend_stops, check_stops, check_trigger,
+                   find_open_order, keep_stops, normalize_stop, order_stops, snap_to_tick, stop_hit, trigger_hit)
 
 DEFAULT_CASH = 10_000.0           # USDT
 MIN_CASH, MAX_CASH = 10.0, 1e9
@@ -108,17 +111,17 @@ def normalize_request(raw) -> dict:
     if side not in ("buy", "sell"):
         raise OrderError("方向只能是买或卖")
     kind = raw.get("type") or "market"
-    if kind not in ("market", "limit"):
-        raise OrderError("委托类型只能是市价或限价")
+    if kind not in ORDER_TYPES:
+        raise OrderError("委托类型只能是市价、限价或条件")
     qty = raw.get("qty")
     qty = _num(qty) if isinstance(qty, (int, float)) and not isinstance(qty, bool) else None
     if qty is None or qty <= 0:
         raise OrderError("数量要是正数")
     price = None
-    if kind == "limit":
+    if kind != "market":
         price = _num(raw.get("price"))
         if price is None or price <= 0:
-            raise OrderError("限价单要填价格")
+            raise OrderError(MISSING_PRICE[kind])
     return {"symbol": symbol, "side": side, "type": kind, "qty": qty, "price": price,
             "tp": normalize_stop(raw.get("tp"), "tp"), "sl": normalize_stop(raw.get("sl"), "sl"),
             "clientId": str(raw.get("clientId") or "")[:64]}
@@ -176,7 +179,7 @@ class CryptoBook:
     # ---------- 下单 / 撤单 ----------
 
     def place(self, request: dict, quote: dict | None, now_ms: int) -> dict:
-        """下单: 市价单当场成交或抛 OrderError; 限价单能成交就成交, 否则挂单。同一个 clientId 只下一次。"""
+        """下单: 市价单当场成交或抛 OrderError; 限价单能成交就成交, 否则挂单; 条件单挂着等触发。同一个 clientId 只下一次。"""
         client_id = request.get("clientId") or ""
         if client_id:
             for order in self.orders:
@@ -204,7 +207,11 @@ class CryptoBook:
             limit = self._check_limit_price(order["price"], quote)
             order["price"] = limit
             self._check_notional(qty, limit, quote)
-            price = sweep(book, qty, limit, side) if quote["open"] else None
+            if kind == "stop":
+                check_trigger(side, limit, quote.get("last"))   # 挂着等触发, 触发后按盘口市价成交(见 match)
+                price = None
+            else:
+                price = sweep(book, qty, limit, side) if quote["open"] else None
             self._check_funds(quote["contract"], side, qty, limit if price is None else price, taker, quote)
         held = (self.positions.get(quote["contract"]) or {}).get("qty", 0.0)
         order.update(order_stops({**request, "qty": qty}, held, quote, order["price"], price is not None))
@@ -224,14 +231,25 @@ class CryptoBook:
                           quote, now_ms)
 
     def cancel(self, order_id: str, now_ms: int) -> dict:
-        for order in self.orders:
-            if order["id"] == order_id:
-                if order["status"] != "open":
-                    raise OrderError("委托已经成交或撤销")
-                order.update(status="cancelled", reason="已撤单", updatedAt=_stamp(now_ms))
-                self._trim()
-                return order
-        raise OrderError("找不到这笔委托")
+        order = find_open_order(self.orders, order_id)
+        order.update(status="cancelled", reason="已撤单", updatedAt=_stamp(now_ms))
+        self._trim()
+        return order
+
+    def amend(self, order_id: str, price: float, quote: dict, now_ms: int) -> dict:
+        """改挂单的价格(限价单的委托价、条件单的触发价), 单号不变; 会当场成交的改价拒绝, 原委托不动。"""
+        order = find_open_order(self.orders, order_id)
+        price = self._check_limit_price(price, quote)
+        if order["type"] == "stop":
+            check_trigger(order["side"], price, quote.get("last"))
+        else:
+            check_amend_limit(order["side"], price, quote)
+        self._check_notional(order["qty"], price, quote)
+        check_amend_stops(order, price)
+        _, taker = FEES.get(venue_of(order["contract"]), FEES["BINANCE"])
+        self._check_funds(order["contract"], order["side"], order["qty"], price, taker, quote)
+        order.update(price=price, updatedAt=_stamp(now_ms))
+        return order
 
     def set_stops(self, symbol: str, tp: float | None, sl: float | None, quote: dict) -> dict:
         """设置持仓的止盈/止损价, None 表示不设; 两个都是 None 就是取消。返回持仓。"""
@@ -269,21 +287,39 @@ class CryptoBook:
         return placed
 
     def match(self, quotes: dict, now_ms: int) -> bool:
-        """用最新报价检查挂单(按挂单费率成交); 返回有没有状态变化。"""
+        """用最新报价检查挂单(按挂单费率成交)与条件单(触发后按盘口吃单); 返回有没有状态变化。
+
+        条件单触发了却吃不够五档, 原因写在委托的 reason 上(只改内存), 价格回去了就清掉。
+        """
         changed = False
         for order in self.orders:
             if order["status"] != "open":
                 continue
             quote = quotes.get(order["contract"])
-            if quote is None or not quote["open"] or not self._trades_through(order, quote):
+            if quote is None or not quote["open"]:
                 continue
-            maker, _ = FEES.get(venue_of(order["contract"]), FEES["BINANCE"])
+            maker, taker = FEES.get(venue_of(order["contract"]), FEES["BINANCE"])
+            if order["type"] == "stop":
+                if not trigger_hit(order, quote.get("last")):
+                    order["reason"] = ""
+                    continue
+                book = quote["asks"] if order["side"] == "buy" else quote["bids"]
+                price = sweep(book, order["qty"], None, order["side"])
+                if price is None:
+                    order["reason"] = "已触发, 未成交: 五档盘口的量不够"
+                    continue
+                fee_rate, liquidity = taker, "taker"
+            elif self._trades_through(order, quote):
+                price, fee_rate, liquidity = order["price"], maker, "maker"
+            else:
+                continue
             try:
-                self._check_funds(order["contract"], order["side"], order["qty"], order["price"], maker, quote)
+                self._check_funds(order["contract"], order["side"], order["qty"], price, fee_rate, quote)
             except OrderError as exc:
                 order.update(status="rejected", reason=str(exc), updatedAt=_stamp(now_ms))
             else:
-                self._fill(order, order["price"], maker, "maker", quote, now_ms)
+                order["reason"] = ""
+                self._fill(order, price, fee_rate, liquidity, quote, now_ms)
             changed = True
         if changed:
             self._trim()
@@ -602,6 +638,20 @@ class CryptoPaperService:
         with self._lock:
             book = self._book_now()
             order = book.cancel(order_id, self._clock())
+            self._save(book)
+            return order
+
+    def amend(self, order_id: str, price) -> dict:
+        value = None if isinstance(price, bool) else _num(price)
+        if value is None or value <= 0:
+            raise OrderError("价格要是正数")
+        with self._lock:
+            symbol = find_open_order(self._book_now().orders, order_id)["contract"]
+        symbol, instrument = self._tradable(symbol)
+        quote = self._quote(symbol, instrument)
+        with self._lock:
+            book = self._book_now()
+            order = book.amend(order_id, value, quote, self._clock())
             self._save(book)
             return order
 

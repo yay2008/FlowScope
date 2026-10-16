@@ -19,7 +19,7 @@ import app as server
 import crypto_feed
 import ingest
 from binance_feed import BinanceAdapter
-from crypto_backfill import DAY_MS, Backfiller, FetchError, NotPublished, RestBlocked
+from crypto_backfill import DAY_MS, LARGE_HISTORY_MS, Backfiller, FetchError, NotPublished, RestBlocked
 from crypto_feed import (CandleStore, Channel, CryptoFeed, CryptoManager, Instrument, TradeBars,
                          aggregate_trades)
 from indicator import NATIVE_TFS, TZ_SHIFT_S, ltf_options
@@ -355,6 +355,29 @@ class BackfillTests(unittest.TestCase):
         backfiller._fill(job)
         return job, drain(backfiller.results), backfiller
 
+    def test_instrument_list_retries_until_it_loads(self):
+        # 启动时合约列表超时(用户遇到过 OKX 超时): 要自己隔一会儿重试, 不能一直停在内置合约上
+        # (内置的 OKX 只有 BTC, 多所汇总就只剩 BTC)
+        attempts = []
+
+        def load(http):
+            attempts.append(time.monotonic())
+            if len(attempts) < 3:
+                raise FetchError("TimeoutError: The read operation timed out")
+            return [FAKE]
+
+        backfiller = Backfiller()
+        backfiller.bind({"FAKE": SimpleNamespace(load_instruments=load)})
+        with patch("crypto_backfill.LIST_RETRY_SEC", 0.01), patch("builtins.print"):
+            backfiller.start()
+            try:
+                wait_for(lambda: not backfiller.results.empty())
+                self.assertEqual(backfiller.snapshot()["lists"], {"FAKE": "1 个合约"})
+            finally:
+                backfiller.stop()
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(drain(backfiller.results), [("instruments", "FAKE", [FAKE])])
+
     def test_segments_go_newest_first_by_archive_day_then_hour(self):
         okx = SimpleNamespace(archive_tz_ms=8 * 3_600_000)
         segments = Backfiller().segments_of(okx, DAY0 + 14 * 3_600_000, DAY0 + DAY_MS + 18 * 3_600_000 + 5)
@@ -403,6 +426,26 @@ class BackfillTests(unittest.TestCase):
         complete = {tf: set(range(DAY0 + DAY_MS, DAY0 + 2 * DAY_MS, tf * 1000)) for tf in NATIVE_TFS}
         self.run_job(venue, complete)
         self.assertNotIn(("day", DAY0 + DAY_MS), venue.calls)
+
+    def test_recent_hole_trades_are_judged_for_large_events_before_done(self):
+        trades = self.trades.copy()
+        recent = trades[(trades.id < self.before_id) & (trades.t >= self.before_ms - 3_600_000)]
+        big = recent.id.iloc[[300, 500]].tolist()          # 预热(200 个 + 30 秒滞后)之后的两笔大单
+        trades.loc[trades.id.isin(big), "qty"] = 500.0
+        _, results, _ = self.run_job(FakeVenue(trades, published_before=DAY0 + 2 * DAY_MS))
+        large = [item for item in results if item[0] == "large"]
+        self.assertEqual(len(large), 1)
+        _, symbol, events, spans = large[0]
+        self.assertEqual((symbol, sorted(events)), ("FAKE.X", big))
+        self.assertEqual(results[-1][0], "done", "先交补判结果, 再报洞补完")
+        # 只判洞右端往前 6 小时: 更早的(包括 2 天前的归档日)不过检测器
+        self.assertGreaterEqual(spans[0][0], (self.before_ms - LARGE_HISTORY_MS) * 1_000_000)
+        self.assertLess(spans[-1][1], self.before_ms * 1_000_000)
+
+    def test_failed_hole_is_not_judged_until_it_is_complete(self):
+        venue = FakeVenue(self.trades, published_before=DAY0 + 2 * DAY_MS, blocked=True)
+        _, results, _ = self.run_job(venue)
+        self.assertEqual([item for item in results if item[0] == "large"], [])
 
 
 class FakeSpec:

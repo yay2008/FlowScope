@@ -330,10 +330,17 @@ class Feed:
         self.analytics.update(self.ticks)
         self.analytics.retain([0], want_fp)
         classified = self.analytics.frame
+        # 金额门槛要用合约乘数; 报价到之前先不喂, 到了再从整个 tick 窗口补算。
+        detector = self.large_trades
+        multiple = getattr(self.quote, "volume_multiple", None)
+        if isinstance(multiple, (int, float)) and math.isfinite(multiple) and multiple > 0:
+            detector.multiplier = float(multiple)
         # 同合约的 10s/30s 共用一个检测器, 各自的 tick 窗口没变时不必重复比对。
         synced = (self.analytics, self.analytics.version)
-        if synced != self._large_synced:
-            self.large_trades.sync_futures(classified, self.analytics.changed_ns, self.analytics.version == 1)
+        if synced != self._large_synced and detector.multiplier is not None:
+            fresh = not detector.raw
+            detector.sync_futures(classified, None if fresh else self.analytics.changed_ns,
+                                  fresh or self.analytics.version == 1)
             self._large_synced = synced
         valid_klines = self.klines.dropna(subset=["datetime", "close"])
         if valid_klines.empty:

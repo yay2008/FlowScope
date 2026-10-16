@@ -3,22 +3,36 @@ import copy
 import json
 import math
 import os
+import queue
 import unittest
 from unittest.mock import patch
 
 import pandas as pd
+from types import SimpleNamespace
 
 from indicator import GAP_NS, TZ_SHIFT_S
-from large_trades import LargeTradeDetector, decorate_bars, default_settings, settings_for, NS
+from large_trades import (LargeTradeDetector, decorate_bars, default_settings, judge_history, product_of,
+                          settings_for, NS)
+from large_trade_defaults import MIN_NOTIONAL
 from tick_analytics import TickAnalytics
 
 BASE = 1_800_000_000 * NS  # 整 30 秒
 
 
 def detector(source="snapshot", **options):
-    settings = dict(window=100, warmup=3, quantile=0.99, minRatio=1.5, minQty=20, minNotional=0)
+    # lagSec=0: 此前的事件立即进基线, 便于单独检查其它规则; 滞后另有测试
+    settings = dict(windowSec=1800, lagSec=0, warmup=3, quantile=0.99, minQty=20, minNotional=0)
     settings.update(options)
     return LargeTradeDetector("TEST.X", source, settings)
+
+
+def baseline(d):
+    """基线里的 (交易时钟, 量): 已进时间窗的, 加上还在滞后队列里的(lagSec=0 时只有最新一条)。"""
+    return [*d._window, *d._lagged]
+
+
+def qtys(d):
+    return [q for _, q in baseline(d)]
 
 
 def raw(i, q=1, side=1, reset=False, usable=True, price=100, joined=None):
@@ -42,7 +56,7 @@ class FuturesIdentityTests(unittest.TestCase):
     def setUp(self):
         self.ticks = futures_ticks()
         self.analytics = TickAnalytics()
-        self.detector = detector(window=2000, warmup=200)
+        self.detector = detector(warmup=200)
 
     def sync(self, ticks, initial=False):
         self.analytics.update(ticks)
@@ -59,11 +73,11 @@ class FuturesIdentityTests(unittest.TestCase):
         self.assertEqual((summary["count"], summary["buy"], summary["delta"], summary["cvd"]),
                          (2, 120, 120, 120))
         expected_events = copy.deepcopy(self.detector.events)
-        expected_window = list(self.detector._window)
+        expected_window = baseline(self.detector)
         for initial in (False, False, True, False):
             self.detector.sync_futures(self.analytics.frame, self.analytics.changed_ns, initial)
             self.assertEqual(self.detector.events, expected_events)
-            self.assertEqual(list(self.detector._window), expected_window)
+            self.assertEqual(baseline(self.detector), expected_window)
             self.assertEqual(self.summary(), summary)
 
     def test_same_timestamp_ticks_arriving_in_separate_updates_are_not_revisions(self):
@@ -78,17 +92,17 @@ class FuturesIdentityTests(unittest.TestCase):
         for volumes, expected_qty in [([301, 381, 382], 80), ([340, 341, 342], 40)]:
             with self.subTest(volumes=volumes):
                 self.analytics = TickAnalytics()
-                self.detector = detector(window=2000, warmup=200)
+                self.detector = detector(warmup=200)
                 self.sync(self.ticks, initial=True)
                 revised = self.ticks.copy()
                 revised.loc[201:, "volume"] = volumes
                 self.sync(revised)
-                fresh = detector(window=2000, warmup=200)
+                fresh = detector(warmup=200)
                 full = TickAnalytics()
                 full.update(revised)
                 fresh.sync_futures(full.frame, full.changed_ns, initial=True)
                 self.assertEqual(self.detector.events, fresh.events)
-                self.assertEqual(list(self.detector._window), list(fresh._window))
+                self.assertEqual(baseline(self.detector), baseline(fresh))
                 self.assertEqual((self.summary()["count"], self.summary()["buy"], self.summary()["cvd"]),
                                  (1, expected_qty, expected_qty))
 
@@ -100,7 +114,7 @@ class FuturesIdentityTests(unittest.TestCase):
         peer.update(tail)
         self.detector.sync_futures(peer.frame, peer.changed_ns, initial=True)
         self.assertEqual((self.summary()["count"], self.summary()["buy"]), (1, 40))
-        self.assertEqual(list(self.detector._window), [500])
+        self.assertEqual(qtys(self.detector), [500])
 
     def test_timestamp_fallback_is_not_checked_as_a_consecutive_sdk_id(self):
         ticks = self.ticks.drop(columns="id")
@@ -125,10 +139,10 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(small.events, {})  # 虽然 10 倍, 仍小于 20 手
 
     def test_warmup_constant_volume_quantile_and_rolling_window(self):
-        d = detector(window=3)
+        d = detector(windowSec=3)
         d.update([raw(0, 100), raw(1, 100), raw(2, 100), raw(3, 100)])
         self.assertEqual(d.events, {})  # 不能因 std=0 或 >=P99 就把普通成交当大额
-        d.update([raw(4), raw(5), raw(6), raw(7, 30)])
+        d.update([raw(4), raw(5), raw(6), raw(7, 30)])  # 3 秒前的 100 已滑出时间窗
         self.assertEqual(d.event_rows()[0]["ratio"], 30)
         self.assertIsNone(d.event_rows()[0]["z"])
         json.dumps(d.event_rows(), allow_nan=False)
@@ -145,7 +159,7 @@ class DetectionTests(unittest.TestCase):
         fresh = detector()
         fresh.update(rows)
         self.assertEqual(d.events, fresh.events)
-        self.assertEqual(list(d._window), list(fresh._window))
+        self.assertEqual(baseline(d), baseline(fresh))
         self.assertEqual(d.readiness, fresh.readiness)
 
     def test_crypto_notional_floor_id_gap_and_duplicate(self):
@@ -162,6 +176,101 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(len(d.events), 1)  # 漏号后重建基线, 首笔不发信号
         self.assertFalse(d.readiness[9][1])
 
+    def test_lag_judges_a_burst_against_the_level_before_it(self):
+        def burst(lag):
+            d = detector(windowSec=600, lagSec=lag)
+            d.update([raw(i) for i in range(300)])               # 300 秒, 每秒 1 手
+            d.update([raw(300 + j, 50) for j in range(60)])      # 接着连续 60 秒每秒 50 手
+            return [(e["ns"] - BASE) // NS - 300 for e in d.event_rows()]
+        lagged, instant = burst(30), burst(0)
+        self.assertEqual(lagged[:30], list(range(30)), "滞后期内的连串大单都和放量前的水平比")
+        self.assertTrue(all(j < 40 for j in lagged), "放量持续超过滞后期, 门槛照样抬高, 不会满屏")
+        self.assertEqual(instant, list(range(5)), "不滞后: 第六笔起被前几笔抬高的门槛压掉")
+
+    def test_lag_delays_warmup_and_reset_clears_lagged_events(self):
+        d = detector(windowSec=600, lagSec=30, warmup=3)
+        d.update([raw(i) for i in range(30)])
+        self.assertFalse(any(ready for _, ready, _ in d.readiness.values()), "前 30 秒都还在滞后期, 基线是空的")
+        d.update([raw(i) for i in range(30, 34)])
+        self.assertTrue(d.readiness[BASE + 33 * NS][1])
+        d.update([raw(34, reset=True)])
+        self.assertEqual(qtys(d), [1], "断档后滞后队列一并清掉, 只剩断档后这一条")
+
+    def test_crypto_same_millisecond_same_side_trades_merge_into_one_event(self):
+        d = detector("aggregate", minQty=0, minNotional=10000)
+        ms = BASE // 1_000_000
+        for i in range(1, 5):
+            d.trade(i, 100, 1, ms + i, False)
+        d.trade(5, 100, 40, ms + 10, False)        # 4000 USDT, 单看不够
+        d.trade(6, 101, 40, ms + 10, False)        # 同一毫秒同向: 并成 80
+        self.assertEqual(d.events, {})
+        d.trade(7, 102, 40, ms + 10, False)        # 120 × 均价 101 = 12120 USDT, 立即报出
+        self.assertEqual(list(d.events), [5])
+        self.assertEqual((d.events[5]["qty"], d.events[5]["price"], d.events[5]["side"]), (120, 101, 1))
+        self.assertEqual(qtys(d)[-1], 120, "基线里是一个 120 的事件, 不是三个 40")
+        d.trade(8, 100, 40, ms + 10, True)         # 方向变了: 另起一个事件
+        d.trade(9, 100, 40, ms + 10, True)
+        d.trade(10, 100, 40, ms + 11, True)        # 换了毫秒: 另起
+        d.trade(12, 100, 200, ms + 11, True)       # 漏号: 不合并, 重新预热
+        self.assertEqual(sorted(d.raw), [1, 2, 3, 4, 5, 8, 10, 12])
+        self.assertEqual(d.raw[8][2], 80)
+        self.assertEqual(list(d.events), [5])
+        self.assertFalse(d.readiness[12][1])
+
+    def test_trimmed_records_keep_their_coverage(self):
+        ms = BASE // 1_000_000
+        with patch("large_trades.RAW_SLACK", 50):
+            d = detector("trade", minQty=0, minNotional=0, windowSec=60)
+            for i in range(1, 3001):                   # 300 秒, 每 0.1 秒一笔
+                d.trade(i, 100, 1 + i % 3, ms + i * 100, i % 2 == 0)
+        self.assertLess(len(d.raw), 2000, "原始记录裁过")
+        values = bars(30, count=10)
+        decorate_bars(values, [d], 30)
+        self.assertEqual([v["large"]["coverage"] for v in values], ["partial"] + ["complete"] * 9,
+                         "裁掉的记录照样算已采集, 不能显示成未采集")
+        self.assertTrue(all(v["large"]["cvd"] is not None for v in values))
+
+    def test_absorbed_history_is_shown_without_touching_the_live_baseline(self):
+        ms = BASE // 1_000_000
+        env = '{"TEST.X": {"warmup": 3, "lagSec": 0, "minNotional": 0}}'
+        with patch.dict(os.environ, {"LARGE_TRADE_SETTINGS": env}):
+            # 回填的洞: 编号 1~59 (0~29 秒), 61~119 (30~59 秒) —— 60 号缺, 检测器在那里重新预热
+            history = [(i, 100.0, 50.0 if i in (20, 90) else 1.0, ms + i * 500, i == 90) for i in range(1, 120) if i != 60]
+            events, spans = judge_history("TEST.X", "trade", history)
+        self.assertEqual(sorted(events), [20, 90])
+        self.assertEqual(len(spans), 2, "编号接不上处切开")
+        d = detector("trade", minQty=0, minNotional=0)
+        for i in range(200, 260):                    # 实时从第 60 秒开始
+            d.trade(i, 100, 1, ms + 60_000 + (i - 200) * 500, False)
+        window = baseline(d)
+        version = d.version
+        d.absorb(events, spans)
+        d.absorb(events, spans)                      # 重派的洞再交一次: 不重复计数
+        self.assertEqual(baseline(d), window)
+        self.assertGreater(d.version, version)
+        self.assertEqual(d.since, spans[0][0])
+        values = bars(30, count=3)
+        decorate_bars(values, [d], 30)
+        first, second, live = (v["large"] for v in values)
+        self.assertEqual((first["count"], first["buy"], first["coverage"]), (1, 50, "partial"))
+        self.assertEqual((second["count"], second["sell"], second["cvd"]), (1, 50, 0))
+        self.assertEqual(live["cvd"], 0)
+
+    def test_event_cap_drops_the_oldest_by_time_and_stops_covering_before_them(self):
+        with patch("large_trades.EVENT_CAP", 2):
+            d = detector()
+            d.update([raw(i) for i in range(100, 105)] + [raw(105, 40), raw(106, 40, -1)])
+            old = {key: {"ns": BASE + t * NS, "price": 100, "qty": 30, "side": 1, "ratio": 5, "z": None,
+                         "threshold": 2} for key, t in [(1, 10), (2, 20)]}
+            d.absorb(old, [(BASE + 5 * NS, BASE + 25 * NS)])      # 后并进来但时间更早
+        self.assertEqual(sorted(d.events), [BASE + 105 * NS, BASE + 106 * NS])
+        self.assertEqual(d.base_delta, 60)
+        self.assertEqual(d.spans()[0], (BASE + 20 * NS + 1, BASE + 25 * NS))
+        values = bars(30, count=4)
+        decorate_bars(values, [d], 30)
+        self.assertEqual(values[0]["large"]["coverage"], "partial")
+        self.assertEqual((values[3]["large"]["count"], values[3]["large"]["cvd"]), (2, 60))
+
     def test_futures_reset_volume_gap_id_gap_and_nonoverlapping_window(self):
         def frame(offsets, volumes, ids=None):
             result = pd.DataFrame({"datetime": [BASE + i * NS for i in offsets], "volume": volumes,
@@ -172,8 +281,7 @@ class DetectionTests(unittest.TestCase):
         d = detector()
         d.sync_futures(initial, initial=True)
         self.assertEqual(len(d.events), 1)
-        for tail in [frame([4, 5, 6, 7], [143, 0, 300, 600]),  # 跨交易日清零
-                     frame([4, 10, 11, 12], [143, 5000, 5300, 5600]),  # 断线补量
+        for tail in [frame([4, 10, 11, 12], [143, 5000, 5300, 5600]),  # 断线补量
                      frame([4, 5, 6, 7], [143, 5000, 5300, 5600], [4, 8, 9, 10]),
                      frame([5, 6, 7], [5000, 5300, 5600])]:  # 无重叠的新窗口
             case = detector()
@@ -181,6 +289,72 @@ class DetectionTests(unittest.TestCase):
             case.sync_futures(tail, changed_ns=int(tail.datetime.iloc[0]))
             self.assertEqual(len(case.events), 1)
             self.assertLess(len(case._window), case.settings["warmup"])
+
+    def test_trading_day_roll_skips_auction_tick_but_keeps_baseline(self):
+        def frame(offsets, volumes, ids):
+            return pd.DataFrame({"datetime": [BASE + i * NS for i in offsets], "volume": volumes,
+                                 "last_price": 100., "side_lr": 1, "_key": ids})
+        # 15:00 收盘后 6 小时到夜盘: 首笔累计量回落到 3000(集合竞价), 之后正常成交
+        d = detector()
+        d.sync_futures(frame(range(5), [50000, 50001, 50002, 50003, 50004], range(5)), initial=True)
+        d.sync_futures(frame([4, 21600, 21601, 21602], [50004, 3000, 3001, 3041], range(4, 8)),
+                       changed_ns=BASE + 21600 * NS)
+        self.assertEqual(qtys(d), [1, 1, 1, 1, 1, 40], "序号连续: 基线沿用, 集合竞价那笔不进基线")
+        self.assertEqual([ready for _, ready, _ in d.readiness.values()][-3:], [False, True, True])
+        self.assertEqual([e["qty"] for e in d.event_rows()], [40], "开盘后立即可判定")
+        # 序号断了才重新预热
+        gap = detector()
+        gap.sync_futures(frame(range(5), [50000, 50001, 50002, 50003, 50004], range(5)), initial=True)
+        gap.sync_futures(frame([4, 21600, 21601, 21602], [50004, 3000, 3001, 3041], [4, 9, 10, 11]),
+                         changed_ns=BASE + 21600 * NS)
+        self.assertEqual(gap.events, {})
+        self.assertLess(len(gap._window), gap.settings["warmup"])
+
+    def test_baseline_window_is_trading_time_and_keeps_warmup_count(self):
+        # 时间窗按交易时钟: 6 小时休市只算 GAP_NS(60 秒), 收盘前的事件开盘后仍在 2 分钟窗口里
+        d = detector(windowSec=120)
+        d.update([raw(i) for i in range(10)])
+        d.update([raw(21600 + i) for i in range(5)])
+        self.assertEqual(len(baseline(d)), 15)
+        d.update([raw(21605 + i) for i in range(60)])
+        self.assertEqual(len(baseline(d)), 65, "交易时间超过 2 分钟的收盘前事件滑出")
+        # 冷门品种: 时间窗里不够 warmup 个时往前补足, 不会一直预热
+        thin = detector(windowSec=60, warmup=5)
+        thin.update([raw(i * 600) for i in range(8)])
+        self.assertEqual(len(thin._window), 5)
+        self.assertTrue(thin.readiness[BASE + 7 * 600 * NS][1])
+
+    def test_futures_notional_floor_uses_contract_multiplier(self):
+        d = detector(minQty=0, minNotional=1_000_000)
+        rows = [raw(0), raw(1), raw(2), raw(3, 40, price=2000), raw(4, 60, price=2000)]
+        d.update(rows)
+        self.assertEqual(d.events, {}, "合约乘数未知: 判断不了金额, 不报")
+        d = detector(minQty=0, minNotional=1_000_000)
+        d.multiplier = 10.0
+        d.update(rows)
+        self.assertEqual([e["qty"] for e in d.event_rows()], [60], "40 手 × 2000 × 10 = 80 万不够, 60 手 = 120 万")
+        self.assertEqual(d.config()["multiplier"], 10.0)
+
+    def test_product_defaults_and_overrides_by_product(self):
+        self.assertEqual(product_of("KQ.m@SHFE.fu"), "SHFE.fu")
+        self.assertEqual(product_of("SHFE.fu2611"), "SHFE.fu")
+        self.assertEqual(product_of("CZCE.TA611"), "CZCE.TA")
+        self.assertEqual(product_of("BINANCE.BTCUSDT.P"), "BINANCE.BTCUSDT.P")
+        self.assertEqual(product_of("OKX.BTC-USDT-SWAP"), "OKX.BTC-USDT-SWAP")
+        for symbol, source in [("KQ.m@SHFE.fu", "snapshot"), ("SHFE.fu2611", "snapshot"),
+                               ("BINANCE.BTCUSDT.P", "aggregate"), ("OKX.BTC-USDT-SWAP", "trade")]:
+            settings = settings_for(symbol, source)
+            self.assertEqual(settings["minNotional"], MIN_NOTIONAL[product_of(symbol)])
+            self.assertEqual(settings["minQty"], 0)
+            self.assertEqual((settings["windowSec"], settings["lagSec"]), (600, 30))
+        unknown = settings_for("SHFE.zz2611", "snapshot")
+        self.assertEqual((unknown["minNotional"], unknown["minQty"]), (0, 20), "表里没有的品种沿用 20 手")
+        self.assertEqual(settings_for("BINANCE.XYZUSDT.P", "aggregate")["minNotional"], 10000)
+        env = '{"*": {"warmup": 50}, "SHFE.fu": {"minNotional": 5000000}, "SHFE.fu2611": {"quantile": 0.995}}'
+        with patch.dict(os.environ, {"LARGE_TRADE_SETTINGS": env}):
+            month = settings_for("SHFE.fu2611", "snapshot")
+            self.assertEqual((month["warmup"], month["minNotional"], month["quantile"]), (50, 5_000_000, 0.995))
+            self.assertEqual(settings_for("KQ.m@SHFE.fu", "snapshot")["quantile"], 0.99)
 
     def test_futures_quiet_gap_with_consecutive_ids_keeps_baseline_and_judges_tick(self):
         def frame(offsets, volumes, ids=None):
@@ -191,15 +365,15 @@ class DetectionTests(unittest.TestCase):
         # 200 条预热后静默 6 秒、2 分钟各一次, 序号连续: 都不是断档, 静默后的 300 手照常判为大额。
         offsets = [*range(201), 207, 327, 328]
         volumes = [*range(100, 301), 302, 304, 604]
-        d = detector(window=2000, warmup=200)
+        d = detector(warmup=200)
         d.sync_futures(frame(offsets, volumes), initial=True)
         self.assertEqual([e["qty"] for e in d.event_rows()], [300])
-        self.assertEqual(len(d._window), 203)
+        self.assertEqual(len(baseline(d)), 203)
         self.assertTrue(all(ready for _, ready, _ in list(d.readiness.values())[201:]))
         # 时间戳回退键不能检查漏号: 超过 GAP_NS 才当断档, 短静默照常。
         fallback = frame(offsets, volumes).assign(_key=lambda f: f.datetime)
         fallback.attrs["key_column"] = "datetime"
-        d = detector(window=2000, warmup=200)
+        d = detector(warmup=200)
         d.sync_futures(fallback, initial=True)
         self.assertTrue(d.readiness[BASE + 207 * NS][1])
         self.assertGreater(120 * NS, GAP_NS)
@@ -228,7 +402,7 @@ class DetectionTests(unittest.TestCase):
         d.trade(5, 100, 0, BASE // 1_000_000 + 5, False)            # 零量成交: 没东西可判, 区间不断
         d.trade(6, float("nan"), 3, BASE // 1_000_000 + 6, False)   # 坏价格: 本条不判, 但不是漏号
         d.trade(7, 100, 50, BASE // 1_000_000 + 7, False)
-        self.assertEqual(len(d._window), 5)
+        self.assertEqual(len(baseline(d)), 5)
         self.assertTrue(d.readiness[5][1])
         self.assertFalse(d.readiness[6][1])
         self.assertTrue(d.readiness[7][1])
@@ -236,7 +410,8 @@ class DetectionTests(unittest.TestCase):
         json.dumps(d.raw[6], allow_nan=False)
 
     def test_bad_environment_setting_falls_back_to_defaults_instead_of_breaking_feeds(self):
-        for text in ["{", "[]", '{"*": 5}', '{"*": {"minQty": "多"}}', '{"*": {"window": 10, "warmup": 20}}']:
+        for text in ["{", "[]", '{"*": 5}', '{"*": {"minQty": "多"}}', '{"*": {"windowSec": 10}}',
+                     '{"*": {"lagSec": 600}}', '{"*": {"lagSec": -1}}', '{"*": {"lagSec": 1.5}}']:
             with self.subTest(text=text), patch.dict(os.environ, {"LARGE_TRADE_SETTINGS": text}):
                 with self.assertRaises(ValueError):
                     settings_for("TEST.X", "snapshot")
@@ -250,7 +425,7 @@ class DetectionTests(unittest.TestCase):
             self.assertEqual(settings_for("TEST.X", "snapshot")["minQty"], 80)
             self.assertEqual(settings_for("OTHER.Y", "snapshot")["minQty"], 20)
             self.assertEqual(settings_for("TEST.X", "snapshot")["warmup"], 50)
-        with patch.dict(os.environ, {"LARGE_TRADE_SETTINGS": '{"*":{"window":10,"warmup":20}}'}):
+        with patch.dict(os.environ, {"LARGE_TRADE_SETTINGS": '{"*":{"windowSec":30,"warmup":20}}'}):
             with self.assertRaises(ValueError):
                 settings_for("TEST.X", "snapshot")
 
@@ -334,6 +509,25 @@ class FeedIntegrationTests(unittest.TestCase):
         self.assertEqual(revised["bars"][0]["large"]["count"], 0)
         self.assertEqual(message["bars"][0]["large"]["count"], 0)
 
+    def test_futures_feed_waits_for_multiplier_then_backfills_whole_tick_window(self):
+        import tempfile
+        import ingest
+        from test_data import ticks, klines
+        with tempfile.TemporaryDirectory() as temp, patch.object(ingest, "DATA_DIR", temp):
+            feed = ingest.Feed("SHFE.fu2611")
+            feed.quote = SimpleNamespace(price_tick=1.)        # 报价还没带合约乘数
+            feed.klines = klines()
+            feed.ticks = ticks()
+            feed.recompute(lambda _: None)
+            self.assertEqual(feed.large_trades.raw, {})
+            feed.quote = SimpleNamespace(price_tick=1., volume_multiple=10)
+            feed.ticks = ticks(offsets=(0.5, 1, 30.5, 31, 60.5, 61), prices=(101, 103, 101, 103, 103, 103),
+                               volumes=(100, 110, 120, 130, 140, 150))
+            feed.recompute(lambda _: None)
+            self.assertEqual(feed.large_trades.multiplier, 10.0)
+            self.assertEqual(len(feed.large_trades.raw), 6, "不能只取最新一次变化, 整个窗口都要补上")
+            self.assertEqual(feed.cfg()["largeTrades"][0]["multiplier"], 10.0)
+
     def test_crypto_manager_deduplicates_shared_detector_and_backfill_does_not_fake_signals(self):
         from binance_feed import BinanceAdapter
         from crypto_feed import CryptoManager
@@ -360,6 +554,27 @@ class FeedIntegrationTests(unittest.TestCase):
         a.trades.insert([(5, 100., 1000, BASE // 1_000_000 + 5000, True)], before_id=9)
         self.assertEqual(len(a.large_trades.events), 1)
         self.assertFalse(a.large_trades.readiness[9][1])
+
+
+    def test_crypto_manager_absorbs_backfill_judgement_into_the_shared_detector(self):
+        from binance_feed import BinanceAdapter
+        from crypto_feed import CryptoManager
+        adapter = BinanceAdapter()
+        instrument = adapter.builtin_instruments()[0]
+        results = queue.Queue()
+        manager = CryptoManager([adapter], backfiller=SimpleNamespace(results=results, bind=lambda adapters: None))
+        for tf in (10, 30):
+            feed = manager._new_feed(instrument, tf)
+            feed.loaded = True
+            manager.feeds[(instrument.symbol, tf)] = feed
+        event = {"ns": BASE, "price": 100.0, "qty": 3.0, "side": -1, "ratio": 9.0, "z": None, "threshold": 1.0}
+        results.put(("large", instrument.symbol, {7: event}, [(BASE - NS, BASE + NS)]))
+        results.put(("large", "BINANCE.NOPEUSDT.P", {8: event}, []))       # 已经不采集的合约: 忽略
+        manager._apply_results(0.0)
+        detector = manager.feeds[(instrument.symbol, 10)].large_trades
+        self.assertEqual(detector.events, {7: event})
+        self.assertEqual(detector.spans(), [(BASE - NS, BASE + NS)])
+        self.assertIn(instrument.symbol, manager._dirty)
 
 
 if __name__ == "__main__":

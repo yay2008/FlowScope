@@ -164,8 +164,11 @@ function makeChart(tf, index) {
     onBandK: setBandK,
     onCrosshair: (time, price) => syncCrosshair(chartView, time, price),
     onRangeChange: syncRanges,
-    // 图上划线改了止盈止损: 交给交易面板提交(paperPanel 在下面才建, 到用户拖线时早就有了)
+    // 图上划线改止盈止损、拖挂单改价、双击撤单、右键挂单: 交给交易面板提交(paperPanel 在下面才建, 到用户操作时早就有了)
     onPaperStops: (change) => paperPanel.setStops(change),
+    onPaperAmend: (id, price) => paperPanel.amendOrder(id, price),
+    onPaperCancel: (id) => paperPanel.cancelOrder(id),
+    paperMenu: (price) => paperPanel.menuItems(price),
     onTfChange: () => {
       chartTfs[index] = chartView.tf;
       saveChartTfs();

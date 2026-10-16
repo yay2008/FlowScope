@@ -11,10 +11,16 @@
 
 每补完一段就把其中整根的 bar(开高低收量、主动买卖量、各拆分粒度)交给管理线程写盘; 洞两端
 所在 bar 缺的那几笔最后一起交回去插进内存窗口。任何一段取不到(REST 不通、归档包还没发布), 这个洞
-就算没补完, 管理线程过一会儿再派一次 —— 已经补好的 bar 那时会被跳过。
+就算没补完, 管理线程过一会儿再派一次 —— 已经补好的 bar 那时会被跳过。洞补完时, 洞右端往前
+6 小时内取到的成交再过一遍大额检测(断线、关机期间的大单也能标出), 结果同样交给管理线程。
 
 每个交易所一个回填线程(互不排队: OKX 用 REST 慢慢翻的时候, 币安的归档包照样下载), 只做网络与
 计算, 不碰历史文件; 结果都经 results 队列交给管理线程。
+
+合约列表另有每个交易所一个线程取(不排在回填任务后面: 第一次启动补 7 天时队列里有很多洞)。取不到
+(超时、限频、被拒)就先用内置合约, 隔 LIST_RETRY_SEC 再试、间隔翻倍到 LIST_RETRY_MAX_SEC, 取到为止;
+取到之后每 LIST_REFRESH_SEC 再取一次, 新上的合约不用重启也能看到。只取一次的话, 启动那一下网络
+不好(比如 OKX 超时), 内置合约里 OKX 只有 BTC, 多所汇总就一直只剩 BTC。
 """
 from __future__ import annotations
 
@@ -30,15 +36,22 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from crypto_feed import EDGE_MS, Instrument, aggregate_trades
+from crypto_feed import EDGE_MS, Instrument, aggregate_trades, large_trade_source
 from indicator import NATIVE_TFS, ltf_options
+from large_trades import judge_history
 
 USER_AGENT = "FlowScope/1.0"
 DAY_MS = 86_400_000
 HOUR_MS = 3_600_000
+# 补洞时顺手补判大额的范围: 洞右端往前这么久(30s 图推给页面的 800 根约 6.7 小时)。
+# 只用本来就要下载的成交, 已完整落盘、不用补的部分不为此重新下载。
+LARGE_HISTORY_MS = 6 * HOUR_MS
 # 回填多少天: 第一次启动从这么久以前补起, 之后每次启动只补其中还不完整的 bar。
 BACKFILL_DAYS = int(os.getenv("CRYPTO_BACKFILL_DAYS", "7") or 7)
 BLOCKED_RETRY_SEC = 3600       # REST 被拒(451/403)后多久再试
+LIST_RETRY_SEC = 30            # 合约列表取不到后第一次重试的间隔, 之后翻倍
+LIST_RETRY_MAX_SEC = 1800      # 重试间隔的上限
+LIST_REFRESH_SEC = 6 * 3600    # 取到之后多久再刷新一次
 RATE_LIMIT_RETRIES = 5
 
 
@@ -126,7 +139,7 @@ class HoleJob:
 
 
 class Backfiller:
-    """回填: 每个交易所一个线程, 各自一次处理一个任务(一个洞, 或刷新合约列表)。"""
+    """回填: 每个交易所一个线程, 各自一次处理一个洞; 合约列表每个交易所另一个线程取。"""
 
     def __init__(self, http: Http | None = None, days: int = BACKFILL_DAYS):
         self.http = http or Http()
@@ -141,6 +154,7 @@ class Backfiller:
         self.last_error: str | None = None
         self.segments = 0                    # 本次运行补完的段数(诊断用)
         self.blocked: dict[str, tuple[float, str]] = {}   # 交易所 -> (REST 被拒到何时, 原因)
+        self.lists: dict[str, str] = {}      # 交易所 -> 合约列表的状态(诊断用)
 
     def bind(self, adapters: dict):
         self.adapters = adapters
@@ -152,6 +166,8 @@ class Backfiller:
         self._stop.clear()
         self._threads = [threading.Thread(target=self._run, args=(venue,), daemon=True,
                                           name=f"crypto-backfill-{venue}") for venue in self.jobs]
+        self._threads += [threading.Thread(target=self._list_loop, args=(venue,), daemon=True,
+                                           name=f"crypto-list-{venue}") for venue in self.jobs]
         for thread in self._threads:
             thread.start()
 
@@ -161,10 +177,9 @@ class Backfiller:
             if thread.is_alive():
                 thread.join(timeout=5)
 
-    def submit(self, job):
-        """任务: ("instruments", 交易所) 或 HoleJob; 交给对应交易所的线程。"""
-        venue = job[1] if isinstance(job, tuple) else job.instrument.venue
-        self.jobs[venue].put(job)
+    def submit(self, job: "HoleJob"):
+        """交给对应交易所的回填线程。"""
+        self.jobs[job.instrument.venue].put(job)
 
     def job(self, instrument, after_id, after_ms, before_id, before_ms, complete, days=None) -> HoleJob:
         """洞 -> 回填任务; 左端没有已知成交时从回填窗口起点补起(往前 days 天, 对齐到最长主周期)。"""
@@ -182,7 +197,8 @@ class Backfiller:
                     "lastError": self.last_error,
                     "segments": self.segments, "days": self.days,
                     "restBlocked": {venue: reason for venue, (until, reason) in self.blocked.items()
-                                    if until > now}}
+                                    if until > now},
+                    "lists": dict(self.lists)}
 
     def _run(self, venue: str):
         while not self._stop.is_set():
@@ -191,33 +207,45 @@ class Backfiller:
             except queue.Empty:
                 continue
             try:
-                if isinstance(job, tuple) and job[0] == "instruments":
-                    self._load_instruments(job[1])
-                else:
-                    self._fill(job)
+                self._fill(job)
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
                 with self._lock:
                     self.last_error = message
                 print(f"[crypto] 回填任务失败: {message}", flush=True)
-                if isinstance(job, HoleJob):
-                    self.results.put(("done", job.symbol, job.before_id, None, message))
+                self.results.put(("done", job.symbol, job.before_id, None, message))
             finally:
                 with self._lock:
                     self.current.pop(venue, None)
 
-    def _load_instruments(self, venue: str):
-        adapter = self.adapters[venue]
-        with self._lock:
-            self.current[venue] = "合约列表"
-        try:
-            instruments = rate_limited(lambda: adapter.load_instruments(self.http))
-        except FetchError as exc:
+    def _list_loop(self, venue: str):
+        """取合约列表, 取不到就隔一段再试(间隔翻倍), 取到之后定期刷新; 结果交给管理线程。"""
+        delay = LIST_RETRY_SEC
+        loaded = failing = False
+        while not self._stop.is_set():
+            try:
+                instruments = rate_limited(lambda: self.adapters[venue].load_instruments(self.http))
+            except Exception as exc:
+                # 已经取到过就留着上次的(管理线程只增不减), 没取到过就还是内置合约
+                using = "上次取到的" if loaded else "内置的"
+                reason = str(exc) if isinstance(exc, FetchError) else f"{type(exc).__name__}: {exc}"
+                message = f"{venue} 合约列表取不到({reason}), 先用{using}, {delay:.0f} 秒后重试"
+                with self._lock:
+                    self.last_error = message
+                    self.lists[venue] = message
+                print(f"[crypto] {message}", flush=True)
+                failing = True
+                self._stop.wait(delay)
+                delay = min(delay * 2, LIST_RETRY_MAX_SEC)
+                continue
+            if failing:
+                print(f"[crypto] {venue} 合约列表重试取到了: {len(instruments)} 个合约", flush=True)
+            loaded, failing = True, False
             with self._lock:
-                self.last_error = f"{venue} 合约列表: {exc}"
-            print(f"[crypto] {venue} 合约列表取不到, 先用内置的: {exc}", flush=True)
-            return
-        self.results.put(("instruments", venue, instruments))
+                self.lists[venue] = f"{len(instruments)} 个合约"
+            self.results.put(("instruments", venue, instruments))
+            delay = LIST_RETRY_SEC
+            self._stop.wait(LIST_REFRESH_SEC)
 
     # ------------------------------------------------------------------ 补一个洞
     def segments_of(self, adapter, start: int, end: int):
@@ -268,6 +296,7 @@ class Backfiller:
             left = job.start_ms // EDGE_MS * EDGE_MS
             edges.append((job.start_ms, left + EDGE_MS))
         edge_frames = []
+        recent, large_frames = job.end_ms - LARGE_HISTORY_MS, []
         failed = None
         pending = self.segments_of(adapter, job.start_ms, job.end_ms + 1)
         while pending:
@@ -299,6 +328,8 @@ class Backfiller:
                     self.results.put(("bars", job.symbol, tf, bars))
             for lo, hi in edges:
                 edge_frames.append(trades[(trades["t"] >= lo) & (trades["t"] < hi)])
+            if end > recent:
+                large_frames.append(trades[trades["t"] >= recent])
             with self._lock:
                 self.segments += 1
         if failed is not None:
@@ -306,6 +337,13 @@ class Backfiller:
                 self.last_error = f"{job.symbol}: {failed}"
             self.results.put(("done", job.symbol, job.before_id, None, failed))
             return
+        if large_frames:
+            # 段是由新到旧取的, 按编号排回去; 跳过的段(已完整落盘)处编号接不上, 检测器在那里重新预热。
+            large = pd.concat(large_frames, ignore_index=True).drop_duplicates("id").sort_values("id")
+            events, spans = judge_history(job.symbol, large_trade_source(job.symbol),
+                                          large[["id", "price", "qty", "t", "sell"]].itertuples(index=False, name=None))
+            if events or spans:
+                self.results.put(("large", job.symbol, events, spans))
         edge = pd.concat(edge_frames, ignore_index=True) if edge_frames else empty_trades()
         edge = edge.drop_duplicates("id").sort_values("id")
         trades = list(edge[["id", "price", "qty", "t", "sell"]].itertuples(index=False, name=None))

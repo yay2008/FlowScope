@@ -21,6 +21,12 @@
 - 限价单: 下单时已够得着对手价(买: 卖一 <= 限价)且一档量够, 按对手价立即成交; 否则挂着,
   之后价格**穿过**限价(买: 卖一或最新价 < 限价)才按限价成交, 只碰到不算 —— 没有排队信息,
   碰到就算成交会把结果算得太好。
+- 条件单(突破单): 买单的触发价要高于最新价、卖单要低于最新价, 挂着等最新价**碰到**触发价(买: >=, 卖: <=),
+  触发后按市价单的规则成交(对手价整笔)。触发了却成交不了(涨跌停没有对手盘、一档量不够)就留着, 原因写在
+  委托上, 价格仍在触发一侧时每轮重试; 价格回去了就接着等下一次触发。开盘跳空越过触发价的, 第一笔报价就触发。
+- 改价: 挂着的限价单、条件单可以改价格, 单号不变。改价不能让它当场成交 —— 限价单改到够得着对手价
+  (买: 卖一 <= 新价, 或最新价 < 新价)、条件单改到最新价已经越过的一侧都拒绝, 原委托不动(图上拖线手滑
+  不会变成一笔成交)。带的止盈止损与资金按新价重新校验。
 - 只在交易时段内、且报价是本时段的才撮合: 节假日没有新报价, 旧报价不能拿来成交。
 - 净持仓: 每个合约只有一个带符号的手数, 反向成交先平后开(反手)。平仓先平昨再平今。
 - 保证金按 ``MARGIN_RATE`` 乘最新价估算; 手续费来自 docs/ 下的手续费率表, 查不到按 0 计。
@@ -272,17 +278,17 @@ def normalize_request(raw) -> dict:
     if side not in ("buy", "sell"):
         raise OrderError("方向只能是买或卖")
     kind = raw.get("type") or "market"
-    if kind not in ("market", "limit"):
-        raise OrderError("委托类型只能是市价或限价")
+    if kind not in ORDER_TYPES:
+        raise OrderError("委托类型只能是市价、限价或条件")
     qty = raw.get("qty")
     qty = _num(qty) if isinstance(qty, (int, float)) and not isinstance(qty, bool) else None
     if qty is None or qty != int(qty) or not 1 <= qty <= MAX_ORDER_QTY:
         raise OrderError(f"手数必须是 1~{MAX_ORDER_QTY} 的整数")
     price = None
-    if kind == "limit":
+    if kind != "market":
         price = _price(raw.get("price"))
         if price is None:
-            raise OrderError("限价单要填价格")
+            raise OrderError(MISSING_PRICE[kind])
     return {"symbol": symbol, "side": side, "type": kind, "qty": int(qty), "price": price,
             "tp": normalize_stop(raw.get("tp"), "tp"), "sl": normalize_stop(raw.get("sl"), "sl"),
             "autoStopLoss": normalize_auto_stop_loss(raw.get("autoStopLoss")),
@@ -298,6 +304,10 @@ def snap_to_tick(price: float, tick: float) -> float:
 
 
 STOP_LABELS = {"tp": "止盈", "sl": "止损"}
+# 委托类型: 条件单(stop)的 price 存的是触发价
+ORDER_TYPES = ("market", "limit", "stop")
+MISSING_PRICE = {"limit": "限价单要填价格", "stop": "条件单要填触发价"}
+PRICE_BASIS = {"limit": "委托价", "stop": "触发价"}
 
 
 def normalize_auto_stop_loss(value) -> float | None:
@@ -382,7 +392,7 @@ def order_stops(request: dict, held, quote: dict, limit: float | None, fills_now
     """下单时带的止盈止损: 对齐最小变动价位并按委托方向校验, 返回要记在委托上的 ``{"tp", "sl"}``(没填的不在里面)。
 
     ``held`` 是下单前的持仓(带符号)。只减仓或平仓的委托不能带: 成交后没有同向的持仓可挂。
-    限价单(``limit``)按委托价校验; 当场成交的(``fills_now``, 含市价单)再按最新价校验, 免得一成交就触发。
+    限价单(``limit``)按委托价校验, 条件单按触发价; 当场成交的(``fills_now``, 含市价单)再按最新价校验, 免得一成交就触发。
     """
     stops = {key: request.get(key) for key in STOP_LABELS if request.get(key) is not None}
     if not stops:
@@ -392,7 +402,7 @@ def order_stops(request: dict, held, quote: dict, limit: float | None, fills_now
         raise OrderError("这笔委托只减仓或平仓, 不能带止盈止损")
     stops = {key: snap_to_tick(value, quote["priceTick"]) for key, value in stops.items()}
     if limit is not None:
-        check_stops(signed, stops.get("tp"), stops.get("sl"), limit, "委托价")
+        check_stops(signed, stops.get("tp"), stops.get("sl"), limit, PRICE_BASIS.get(request.get("type"), "委托价"))
     if fills_now:
         check_stops(signed, stops.get("tp"), stops.get("sl"), quote.get("last"))
     return stops
@@ -405,6 +415,50 @@ def attach_stops(order: dict, position: dict):
     """
     if position["qty"] and (position["qty"] > 0) == (order["side"] == "buy"):
         position.update({key: order[key] for key in STOP_LABELS if order.get(key) is not None})
+
+
+def check_trigger(side: str, trigger: float, last: float | None):
+    """条件单的触发价要在最新价的突破一侧(买在上、卖在下), 否则一挂上就触发 —— 那是市价单。"""
+    if last is None:
+        raise OrderError("还没有最新价, 稍后再下条件单")
+    buy = side == "buy"
+    if trigger <= last if buy else trigger >= last:
+        raise OrderError(f"{'买入' if buy else '卖出'}条件单的触发价要{'高' if buy else '低'}于最新价 {last:.10g}")
+
+
+def trigger_hit(order: dict, last: float | None) -> bool:
+    """条件单: 最新价碰到触发价(买: 涨到触发价及以上, 卖: 跌到及以下)就触发。"""
+    if last is None:
+        return False
+    return last >= order["price"] if order["side"] == "buy" else last <= order["price"]
+
+
+def check_amend_limit(side: str, price: float, quote: dict):
+    """限价单改价不能改到当场成交: 买价够到卖一或高于最新价(卖单反之)就拒, 图上拖线手滑不会变成一笔成交。"""
+    last = quote.get("last")
+    if side == "buy":
+        ask = quote.get("ask")
+        crosses = (ask is not None and price >= ask) or (last is not None and price > last)
+    else:
+        bid = quote.get("bid")
+        crosses = (bid is not None and price <= bid) or (last is not None and price < last)
+    if crosses:
+        raise OrderError("改到这个价会立即成交, 已保留原价; 要立即成交请用市价单")
+
+
+def check_amend_stops(order: dict, price: float):
+    """挂单带的止盈止损要在新价两侧(和下单时按委托价/触发价校验一样)。"""
+    signed = order["qty"] if order["side"] == "buy" else -order["qty"]
+    check_stops(signed, order.get("tp"), order.get("sl"), price, PRICE_BASIS[order["type"]])
+
+
+def find_open_order(orders: list[dict], order_id: str) -> dict:
+    for order in orders:
+        if order["id"] == order_id:
+            if order["status"] != "open":
+                raise OrderError("委托已经成交或撤销")
+            return order
+    raise OrderError("找不到这笔委托")
 
 
 class PaperBook:
@@ -441,7 +495,7 @@ class PaperBook:
     # ---------- 下单 / 撤单 ----------
 
     def place(self, request: dict, quote: dict | None, now: datetime) -> dict:
-        """下单: 市价单当场成交或抛 OrderError; 限价单能成交就成交, 否则挂单。返回订单。
+        """下单: 市价单当场成交或抛 OrderError; 限价单能成交就成交, 否则挂单; 条件单挂着等触发。返回订单。
 
         同一个 clientId 只下一次: 双击、超时重试都拿回第一次的结果。
         """
@@ -464,11 +518,16 @@ class PaperBook:
         else:
             price = self._check_limit_price(order["price"], quote)
             order["price"] = price
-            opposite = quote.get("ask") if side == "buy" else quote.get("bid")
-            volume = quote.get("askVolume") if side == "buy" else quote.get("bidVolume")
-            crosses = opposite is not None and (opposite <= price if side == "buy" else opposite >= price)
-            # 够得着对手价就按对手价成交(可能比限价更好); 否则挂着等价格穿过限价。
-            price = opposite if open_now and crosses and (volume or 0) >= qty else None
+            if kind == "stop":
+                # 条件单挂着等最新价碰到触发价, 触发后按市价成交(见 match)
+                check_trigger(side, price, quote.get("last"))
+                price = None
+            else:
+                opposite = quote.get("ask") if side == "buy" else quote.get("bid")
+                volume = quote.get("askVolume") if side == "buy" else quote.get("bidVolume")
+                crosses = opposite is not None and (opposite <= price if side == "buy" else opposite >= price)
+                # 够得着对手价就按对手价成交(可能比限价更好); 否则挂着等价格穿过限价。
+                price = opposite if open_now and crosses and (volume or 0) >= qty else None
         held = (self.positions.get(quote["contract"]) or {}).get("qty", 0)
         auto_loss = normalize_auto_stop_loss(request.get("autoStopLoss"))
         if auto_loss is not None:
@@ -494,30 +553,58 @@ class PaperBook:
                            "symbol": contract}, quote, now)
 
     def cancel(self, order_id: str, now: datetime) -> dict:
-        for order in self.orders:
-            if order["id"] == order_id:
-                if order["status"] != "open":
-                    raise OrderError("委托已经成交或撤销")
-                order.update(status="cancelled", reason="已撤单", updatedAt=_stamp(now))
-                self._trim()
-                return order
-        raise OrderError("找不到这笔委托")
+        order = find_open_order(self.orders, order_id)
+        order.update(status="cancelled", reason="已撤单", updatedAt=_stamp(now))
+        self._trim()
+        return order
+
+    def amend(self, order_id: str, price: float, quotes: dict, now: datetime) -> dict:
+        """改挂单的价格(限价单的委托价、条件单的触发价), 单号不变; 会当场成交的改价拒绝, 原委托不动。"""
+        order = find_open_order(self.orders, order_id)
+        quote = quotes.get(order["contract"])
+        self._check_tradable(quote)
+        price = self._check_limit_price(price, quote)
+        if order["type"] == "stop":
+            check_trigger(order["side"], price, quote.get("last"))
+        else:
+            check_amend_limit(order["side"], price, quote)
+        check_amend_stops(order, price)
+        self._check_funds({**order, "price": price}, price, quote, now)
+        order.update(price=price, updatedAt=_stamp(now))
+        return order
 
     def match(self, quotes: dict, now: datetime) -> list[dict]:
-        """用最新报价检查挂单; 返回状态变了的委托(成交, 或成交时资金不足被拒)。"""
+        """用最新报价检查挂单与条件单; 返回状态变了的委托(成交, 或成交时资金不足被拒)。
+
+        条件单触发了却成交不了, 原因写在委托的 reason 上(只改内存, 不算状态变化), 价格回去了就清掉。
+        """
         changed = []
         for order in self.orders:
             if order["status"] != "open":
                 continue
             quote = quotes.get(order["contract"])
-            if quote is None or not market_status(quote, now)[0] or not self._trades_through(order, quote):
+            if quote is None or not market_status(quote, now)[0]:
+                continue
+            if order["type"] == "stop":
+                if not trigger_hit(order, quote.get("last")):
+                    order["reason"] = ""
+                    continue
+                try:
+                    price = self._taker_price(order["side"], order["qty"], quote)
+                except OrderError as exc:
+                    order["reason"] = f"已触发, 未成交: {exc}"
+                    continue
+            elif self._trades_through(order, quote):
+                price = order["price"]
+            else:
                 continue
             try:
-                self._check_funds(order, order["price"], quote, now)
+                self._check_funds(order, price, quote, now)
             except OrderError as exc:
                 order.update(status="rejected", reason=str(exc), updatedAt=_stamp(now))
             else:
-                self._fill(order, order["price"], quote, now)
+                order["reason"] = ""
+                self._fill(order, price, quote, now)
             changed.append(order)
         if changed:
             self._trim()
@@ -842,6 +929,17 @@ class PaperService:
         with self._lock:
             book = self._book_now()
             order = book.cancel(order_id, self._clock())
+            self._save(book)
+            return order
+
+    def amend(self, order_id: str, price) -> dict:
+        """改挂单价格。同 set_stops 用采集循环刷新的报价快照校验: 挂单的合约每轮都在跟踪。"""
+        value = None if isinstance(price, bool) else _price(price)
+        if value is None:
+            raise OrderError("价格要是正数")
+        with self._lock:
+            book = self._book_now()
+            order = book.amend(order_id, value, self._quotes, self._clock())
             self._save(book)
             return order
 

@@ -1163,9 +1163,7 @@ class CryptoManager:
         for channel in self.channels:
             channel.start()
         if self.backfiller is not None:
-            self.backfiller.start()
-            for venue in self.adapters:
-                self.backfiller.submit(("instruments", venue))
+            self.backfiller.start()      # 也开始取各交易所的合约列表(取不到会自己重试)
         last_compute = 0.0
         while not self._stop.is_set():
             try:
@@ -1243,6 +1241,13 @@ class CryptoManager:
                         feed.apply_backfill(bars)
                     except Exception as exc:
                         print(f"[crypto] {feed_label((symbol, tf))} 回填写入失败: {exc}", flush=True)
+                    self._dirty.add(symbol)
+            elif kind == "large":
+                # 回填补判的大额事件: 同合约各周期共用一个检测器, 并进一次即可
+                _, symbol, events, spans = result
+                feed = next((self.feeds[(symbol, tf)] for tf in NATIVE_TFS if (symbol, tf) in self.feeds), None)
+                if feed is not None:
+                    feed.large_trades.absorb(events, spans)
                     self._dirty.add(symbol)
             elif kind == "done":
                 _, symbol, before_id, edges, error = result
