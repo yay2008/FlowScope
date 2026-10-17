@@ -64,7 +64,7 @@ function harness(fetchImpl, symbol = "KQ.m@SHFE.fu") {
     document: { createElement: () => new Element(), createTextNode: (value) => {
       const node = new Element(); node.textContent = value; return node;
     } },
-    FlowIndicators: { EMA_PERIODS: [] }, fetch: fetchImpl, AbortController, TextDecoder, URLSearchParams,
+    FlowIndicators: { EMA_PERIODS: [], HTF_EMA_PERIODS: [] }, fetch: fetchImpl, AbortController, TextDecoder, URLSearchParams,
     setInterval, clearInterval, console,
   };
   vm.createContext(context);

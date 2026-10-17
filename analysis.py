@@ -59,6 +59,8 @@ COLUMN_NOTES = {
     "cvd": "累计 delta(CVD)",
     "rvol": "相对成交量 = 成交量 / 近 20 根均量, 大于 1 为放量",
     "ema21": "EMA21", "ema55": "EMA55", "ema100": "EMA100", "ema200": "EMA200",
+    "htf_ema21": "大周期 EMA21(大周期见各图说明; 每根是最近一根已收盘的大周期 bar 的 EMA21, 大周期走完一根才更新)",
+    "htf_ema55": "大周期 EMA55(同上)",
     "fw": "FlowWave 主线 LSMA(0~100, 量价合成振荡; 图上没有单独窗格)",
     "fw_sig": "FlowWave 信号 wt2(大于 80 超买、小于 20 超卖; 主图 FlowWave带 按它染色)",
     "crv_slope": "CRVOL 斜率(带符号相对量累计的回归斜率, 正 = 量能偏多)",
@@ -76,7 +78,8 @@ SYSTEM_PROMPT = """你是期货与加密永续合约的盘面分析助手。用�
 每张图从上到下两个窗格: 主图(K 线)、FlowMeter(成交量类指标)。图片顶部一行写着合约、周期、视图和截止时刻。
 主图:
 - K 线涨为灰白色、跌为深灰色(不是红绿)。
-- EMA21 黄、EMA55 蓝、EMA100 青绿、EMA200 紫。默认只画最近 200 根 K 线(用户可切成画全部), 更左边没有 EMA 线是显示裁掉了, 不是没有数据。
+- EMA21 黄、EMA55 蓝、EMA100 青绿、EMA200 紫。默认只画最近 100 根 K 线(用户可切成画全部), 更左边没有 EMA 线是显示裁掉了, 不是没有数据。
+- 大周期 EMA(若显示): 粗的半透明黄色、蓝色阶梯线是更大周期(见各图说明)的 EMA21、EMA55, 颜色同本图的 EMA21、EMA55, 画线范围也相同。只取已收盘的大周期 bar, 大周期走完一根才跳一格, 所以比价格慢半拍。看本图 EMA 相对大周期 EMA 的位置判断大周期趋势。
 - FlowWave带(若显示): 收盘价 21 根线性回归通道, 两条淡线是上下轨; 中线到上轨染红、上轨加粗 = FlowWave 超买(fw_sig 大于 80), 中线到下轨染绿、下轨加粗 = 超卖(fw_sig 小于 20)。
 - 大额成交(若显示): 每根 K 线买卖各最多一个半透明圆点。标「+」的绿点在 K 线下方 = 这根里的大额主动买量, 标「−」的红点在上方 = 大额主动卖量, 面积按该侧的量缩放(有大小上下限, 按本图近期大额量归一, 不同图之间大小不可比); 同一根上下都有点说明大额买卖在对打, 比较两个点的大小看哪边占优。大单按金额门槛和近 10 分钟的相对水平筛选。只统计本次程序运行后采集到的成交, 更早的 K 线没有圆点不代表没有大单; 期货是按 tick 快照区间量估算的, 不是单个订单。颜色约定与下面模拟交易的成交箭头相反, 不要混淆。
 - OB Zones(若显示): 浅灰半透明矩形是订单块。连续上涨(下跌)实体累计长度的 Z 分数上穿 4 时, 在最近一根反向 K 线的最高价到最低价之间建区并向右延伸, 收盘连续两根突破远端或超过最大年龄后停止延伸(旧区域仍留在图上)。框内上半的绿条、下半的红条按那根反向 K 线的主动买量、卖量比例画, 文字「多 · ▲: 买量 | ▼: 卖量」里「多」是看涨区(下方支撑)、「空」是看跌区(上方压力)。区域价格不在数值表里, 只作位置参考。
@@ -190,6 +193,11 @@ def parse_chart(chart, index) -> dict:
     ltf = meta.get("ltf")   # 本图买卖量实际的拆分粒度(各图可能不同): 0 = tick 口径, 正数 = 小周期 K 线秒数
     if isinstance(ltf, bool) or not isinstance(ltf, int) or ltf not in ltf_options(tf):
         raise ValueError(f"图 {index} 的买卖量口径不对")
+    htf = meta.get("htf")   # 大周期 EMA 用的大周期(秒); 本图没有更大的周期时为 0
+    if isinstance(htf, bool) or not isinstance(htf, int) or htf not in TF_OPTIONS or htf <= tf:
+        htf = 0
+    if not htf and any(column.startswith("htf_") for column in columns):
+        raise ValueError(f"图 {index} 的大周期不对")
     shown = meta.get("shown") if isinstance(meta.get("shown"), dict) else {}
     span = meta.get("range") if isinstance(meta.get("range"), dict) else {}
     loaded = meta.get("loaded") if isinstance(meta.get("loaded"), dict) else {}
@@ -198,7 +206,9 @@ def parse_chart(chart, index) -> dict:
         "meta": {
             "view": "footprint" if meta.get("view") == "footprint" else "candle",
             "ltf": ltf,
-            "shown": {key: shown[key] for key in ("ema", "band", "large", "ob") if isinstance(shown.get(key), bool)},
+            "htf": htf,
+            "shown": {key: shown[key] for key in ("ema", "emaLong", "htfEma", "band", "large", "ob")
+                      if isinstance(shown.get(key), bool)},
             "range": {key: _number(span.get(key)) for key in ("from", "to")},
             "loaded": {key: _number(loaded.get(key)) for key in ("count", "from", "high", "low")},
             "coverage": _counts(meta.get("coverage"), ("complete", "partial", "missing", "legacy")),
@@ -269,8 +279,11 @@ def chart_text(chart, index) -> str:
     meta, tf = chart["meta"], chart["tf"]
     with_seconds = tf < 60
     on_off = lambda key: {True: "开", False: "关"}.get(meta["shown"].get(key), "-")
+    htf = f"大周期EMA({tf_label(meta['htf'])}) {on_off('htfEma')}、" if meta.get("htf") else ""
+    # EMA 开着但没画 EMA100/200 时注明: 数值表里照样有这两列, 图上却看不到
+    ema_long = "(未画 EMA100/200)" if meta["shown"].get("ema") and meta["shown"].get("emaLong") is False else ""
     lines = [f"=== 图 {index}: {tf_label(tf)} 周期 ===",
-             f"视图: {'足迹图' if meta['view'] == 'footprint' else 'K 线'}; 主图叠加: EMA {on_off('ema')}、"
+             f"视图: {'足迹图' if meta['view'] == 'footprint' else 'K 线'}; 主图叠加: EMA {on_off('ema')}{ema_long}、{htf}"
              f"FlowWave带 {on_off('band')}、大额成交 {on_off('large')}、OB Zones {on_off('ob')}",
              f"买卖量: {split_text(meta['ltf'])}",
              f"截图可视范围: {bar_time(meta['range']['from'], with_seconds)} → "

@@ -25,6 +25,8 @@
   const COLUMNS = ["time", "open", "high", "low", "close", "volume", "buy", "sell", "delta", "cvd", "rvol",
                    ...Ind.EMA_PERIODS.map((p) => `ema${p}`), "fw", "fw_sig", "crv_slope",
                    "band_up", "band_mid", "band_dn"];
+  // 大周期 EMA 只在图上画着时接在后面(列名不带周期, 大周期写在 meta.htf)
+  const HTF_COLUMNS = Ind.HTF_EMA_PERIODS.map((p) => `htf_ema${p}`);
   const MODE_NAMES = { rvol: "RVOL", crvol: "CRVOL", volume: "Volume", bsv: "买卖量", delta: "Delta", cvd: "CVD" };
   const FINISH_NOTES = { length: "输出达到长度上限, 后面被截断了", content_filter: "部分内容被 DeepSeek 过滤掉了",
                          insufficient_system_resource: "DeepSeek 资源不足, 输出没有完成" };
@@ -71,6 +73,9 @@
     const line = (v) => round(v, pd == null ? null : pd + 1);   // 均线、轨道多留一位
     const vd = (cfg && cfg.volumeDigits) || 0;
     const [from, to] = rowSpan(bars.length, input.range);
+    const shown = input.shown || {};
+    const htf = Number.isInteger(input.htf) && input.htf > 0 ? input.htf : 0;
+    const htfLines = shown.htfEma && htf && input.view !== "footprint" && d.htfEma ? d.htfEma : null;
     const rows = [];
     const coverage = {};
     for (let i = from; i < to; i++) {
@@ -80,7 +85,8 @@
                  round(d.rvol[i], 2), ...d.emaLines.map((ema) => line(ema[i])),
                  round(d.lw.wave[i], 1), round(d.lw.wt2[i], 1),
                  round(d.lw.crvSlope[i], 2),
-                 line(d.band.up[i]), line(d.band.mid[i]), line(d.band.dn[i])]);
+                 line(d.band.up[i]), line(d.band.mid[i]), line(d.band.dn[i]),
+                 ...(htfLines ? htfLines.map((ema) => line(ema[i])) : [])]);
       const quality = ["complete", "partial", "legacy"].includes(b.coverage) ? b.coverage : "missing";
       coverage[quality] = (coverage[quality] || 0) + 1;
     }
@@ -90,14 +96,15 @@
       if (b.high > high) high = b.high;
       if (b.low < low) low = b.low;
     }
-    const shown = input.shown || {};
     return {
-      columns: COLUMNS,
+      columns: htfLines ? [...COLUMNS, ...HTF_COLUMNS] : COLUMNS,
       rows,
       meta: {
         view: input.view === "footprint" ? "footprint" : "candle",
         ltf: input.ltf,          // 本图买卖量实际的拆分粒度: 0 = tick 口径, 正数 = 按这么多秒的小周期 K 线归类
-        shown: { ema: !!shown.ema, band: !!shown.band, large: !!shown.large, ob: !!shown.ob },
+        htf,                     // 大周期 EMA 用的大周期(秒), 本图没有更大的周期时为 0
+        shown: { ema: !!shown.ema, emaLong: shown.emaLong !== false, htfEma: !!shown.htfEma, band: !!shown.band,
+                 large: !!shown.large, ob: !!shown.ob },
         range: { from: bars[from].time, to: bars[to - 1].time },
         loaded: { count: bars.length, from: bars[0].time, high: px(high), low: px(low) },
         coverage,
@@ -418,7 +425,7 @@
     return { run, stop, close, busy: () => controller !== null };
   }
 
-  const api = { COLUMNS, MIN_ROWS, MAX_ROWS, FINISH_NOTES, tfLabel, rowSpan, buildChartData, shotTitle, parseSse, footText,
+  const api = { COLUMNS, HTF_COLUMNS, MIN_ROWS, MAX_ROWS, FINISH_NOTES, tfLabel, rowSpan, buildChartData, shotTitle, parseSse, footText,
                 create };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.AiPanel = api;

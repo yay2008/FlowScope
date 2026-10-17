@@ -18,6 +18,8 @@
 
   // 主图 EMA 周期
   const EMA_PERIODS = [21, 55, 100, 200];
+  // 主图叠加的大周期 EMA 周期(在本图上画更大周期的 EMA, 见 htfEma)
+  const HTF_EMA_PERIODS = [21, 55];
 
   // OB Zones.pine 默认值。阈值固定为 4; 一组区域对应 Pine 的三个 box, 最多显示 166 组完整区域。
   const OB = { zLen: 100, maxAge: 500, preventOverlap: true,
@@ -86,6 +88,55 @@
       out[i] = prev;
     }
     return out;
+  }
+
+  // 大周期分桶: t 落在哪根大周期 bar 里, 返回它的起点。starts 是大周期图已知各根的起点(升序), 按大周期图自己的切法分
+  // (期货大周期是 TqSdk 原生 K 线, 不假设它怎么对齐); 越过最近那根的跨度(还没有的新 bar、休市之后)或早于第一根时,
+  // 从最近那根的起点(没有就从 0)按 htf 的整数倍往后推, 即按自然时间对齐, 同加密大周期的合成
+  function htfBucket(starts, htf, t) {
+    let lo = 0, hi = starts.length - 1, k = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (starts[mid] <= t) { k = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    const origin = k < 0 ? 0 : starts[k];
+    return origin + Math.floor((t - origin) / htf) * htf;
+  }
+
+  // 大周期 EMA 画在本图上: 本图 bar 按大周期分桶(htfBucket), 桶的收盘价 = 桶里最后一根的收盘价, 在这些收盘价上算 EMA
+  // (同 ema, 首个收盘价播种)。htfBars 是大周期图的 bar [{time, close}](升序, 可省略): 定分桶的起点, 本图窗口之前的桶
+  // 用它们的收盘价接着算 —— 页面每张图只有最近 800 根, 10s 折成 1m 才 133 根, 不靠它 EMA55 在窗口里大半段都在预热。
+  // 窗口里的桶以本图为准(大周期图的最后一根拿到时还没收盘)。
+  // 画回本图时每根 bar 取最近一根已收盘的大周期 bar 的 EMA: 大周期这一根还没走完时一直是上一根的值, 走完了
+  // (本图出现下一桶的第一根)才更新, 画成阶梯; 相当于大周期图的 EMA 往右挪一根。历史与实时一致, 不会事后重画。
+  // 窗口里第一个桶之前既没有大周期图的 bar 也没有本图的 bar 时, 那个桶里还没有值(null)。
+  // 返回 {lines, buckets}: lines 与 periods 一一对应, 每条与 bars 等长(htf 不是正数时全为 null); buckets 是每根所在桶的起点。
+  function htfEma(bars, htf, periods, htfBars = []) {
+    const lines = periods.map(() => new Array(bars.length).fill(null));
+    const buckets = new Array(bars.length).fill(null);
+    if (!(htf > 0)) return { lines, buckets };
+    const starts = htfBars.map((b) => b.time);
+    const alpha = periods.map((p) => 2 / (p + 1));
+    const step = (prev, close, j) => (prev == null ? close : alpha[j] * close + (1 - alpha[j]) * prev);
+    const closed = periods.map(() => null);   // 最近一根已收盘的大周期 bar 的 EMA
+    let bucket = bars.length ? htfBucket(starts, htf, bars[0].time) : null;
+    for (const b of htfBars) {                // 本图窗口之前的桶: 接着大周期图的收盘价算
+      if (bucket == null || b.time >= bucket) break;
+      if (b.close != null) periods.forEach((p, j) => { closed[j] = step(closed[j], b.close, j); });
+    }
+    let last = null;                          // 当前桶到这根为止最后的收盘价, 桶走完时就是桶的收盘价
+    for (let i = 0; i < bars.length; i++) {
+      const start = htfBucket(starts, htf, bars[i].time);
+      if (start !== bucket) {                 // 进了新桶: 上一桶已收盘, 用它的收盘价把 EMA 往前推一根
+        if (last != null) periods.forEach((p, j) => { closed[j] = step(closed[j], last, j); });
+        bucket = start;
+        last = null;
+      }
+      buckets[i] = start;
+      if (bars[i].close != null) last = bars[i].close;
+      periods.forEach((p, j) => { lines[j][i] = closed[j]; });
+    }
+    return { lines, buckets };
   }
 
   function rma(v, n) {              // ta.rma: 前 n 个均值播种(Wilder)
@@ -504,8 +555,8 @@
   }
 
   const api = {
-    LW, BAND, EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf,
-    rollingSma, rollingZ, ema, rma, rsi, linreg, smaStrict, channelIndex,
+    LW, BAND, EMA_PERIODS, HTF_EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf,
+    rollingSma, rollingZ, ema, htfBucket, htfEma, rma, rsi, linreg, smaStrict, channelIndex,
     deriveLw, deriveBand, deriveObZones, normalizeObOptions, obVolumeEnds, derive, levelOf, volumeProfile,
   };
   if (typeof module === "object" && module.exports) module.exports = api;

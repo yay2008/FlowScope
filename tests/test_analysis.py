@@ -170,6 +170,34 @@ class RequestTest(unittest.TestCase):
         self.assertNotIn("按 15s", second)
         self.assertNotIn("小周期", first.split("=== 图 1")[0], "开头的工具栏说明里不能有统一的拆分粒度")
 
+    def test_long_ema_hidden(self):
+        # EMA 开着但没画 EMA100/200: 说明里注明(数值表照样带这两列); 没报这个开关(旧页面)时不提
+        meta = dict(chart()["meta"], shown={"ema": True, "emaLong": False, "band": False})
+        text = analysis.prompt_text(analysis.parse_request(body(chart(meta=meta))), NOW)
+        self.assertIn("主图叠加: EMA 开(未画 EMA100/200)、FlowWave带 关", text)
+        meta = dict(chart()["meta"], shown={"ema": False, "emaLong": False})
+        self.assertIn("主图叠加: EMA 关、", analysis.prompt_text(analysis.parse_request(body(chart(meta=meta))), NOW))
+
+    def test_higher_timeframe_ema(self):
+        # 大周期 EMA 画着时: 说明里写出大周期和开关, 两列接在数值表后面并解释
+        meta = dict(chart(10)["meta"], htf=60, shown={"ema": True, "htfEma": True, "band": False})
+        htf_chart = chart(10, meta=meta, columns=["time", "close", "htf_ema21", "htf_ema55"],
+                          rows=[[T0, 3001.0, 3000.5, 2999.8], [T0 + 10, 3002.0, 3000.6, 2999.9]])
+        request = analysis.parse_request(body(htf_chart, chart(30)))
+        self.assertEqual([c["meta"]["htf"] for c in request["charts"]], [60, 0])
+        text = analysis.prompt_text(request, NOW)
+        self.assertIn("主图叠加: EMA 开、大周期EMA(1m) 开、FlowWave带 关", text)
+        self.assertEqual(text.count("大周期EMA("), 1, "没报大周期的图不提")
+        self.assertIn("htf_ema21 = 大周期 EMA21", text)
+        self.assertIn("大周期 EMA", analysis.SYSTEM_PROMPT)
+
+        # 大周期不比本图大、不是可选周期时当作没有; 这时还带着大周期列就是请求不对
+        for bad in (10, 7, True, "60"):
+            meta = dict(chart(10)["meta"], htf=bad)
+            self.assertEqual(analysis.parse_request(body(chart(10, meta=meta)))["charts"][0]["meta"]["htf"], 0)
+        with self.assertRaisesRegex(ValueError, "大周期不对"):
+            analysis.parse_request(body(dict(htf_chart, meta=dict(meta, htf=0))))
+
 
 class SettingsTest(unittest.TestCase):
     def test_load_settings(self):

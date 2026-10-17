@@ -2,7 +2,8 @@
 /* indicators.js 的纯函数回归: 不需要 DOM 与图表, 直接在 Node 里 require。 */
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { rollingSma, rollingZ, linreg, ema, derive, levelOf, BAND, volumeProfile } = require("../static/indicators.js");
+const { rollingSma, rollingZ, linreg, ema, htfBucket, htfEma, derive, levelOf, BAND, volumeProfile } =
+  require("../static/indicators.js");
 
 test("rollingSma / rollingZ: 窗口含 null 输出 null", () => {
   const v = [1, 2, 3, null, 5, 6, 7, 8];
@@ -16,6 +17,83 @@ test("linreg: 直线序列的回归末点等于自身; ema 首个非 null 播种
   assert.equal(out[19], null);
   assert.ok(Math.abs(out[29] - line[29]) < 1e-9);
   assert.deepEqual(ema([null, 4, 4], 3), [null, 4, 4]);
+});
+
+// 10s bar: 窗口从某分钟的第 30 秒开始(第一个 1 分钟桶只有后半段), 中间缺几根(没成交)
+function tenSecondBars(start, count) {
+  const bars = [];
+  for (let i = 0; i < count; i++) {
+    if (i % 17 === 5 || i % 23 === 7) continue;
+    bars.push({ time: start + i * 10, close: 100 + Math.sin(i / 5) * 3 + i * 0.01 });
+  }
+  return bars;
+}
+
+// 按分钟分桶: 每桶最后一根的下标
+function minuteEnds(bars) {
+  const lastOf = new Map();
+  bars.forEach((b, i) => lastOf.set(Math.floor(b.time / 60) * 60, i));
+  return [...lastOf.values()];
+}
+
+// 每根 bar 属于第几个分钟桶(从 0 数)
+function minuteIndex(bars) {
+  const starts = [...new Set(bars.map((b) => Math.floor(b.time / 60) * 60))];
+  return bars.map((b) => starts.indexOf(Math.floor(b.time / 60) * 60));
+}
+
+test("htfEma: 每根取最近一根已收盘的大周期 bar 的 EMA, 大周期走完才更新(桶内不变); 缺 bar、窗口不从整点开始也照样分桶", () => {
+  const bars = tenSecondBars(1700000000 - (1700000000 % 60) + 30, 200);
+  const { lines: [e21, e55], buckets } = htfEma(bars, 60, [21, 55]);
+  assert.equal(e21.length, bars.length);
+  assert.deepEqual(buckets, bars.map((b) => Math.floor(b.time / 60) * 60), "没有大周期图的 bar 时按自然时间对齐");
+
+  // 桶的收盘价 = 桶里最后一根的收盘价, 对照直接在这些收盘价上算 ema: 第 k 分钟里每根都是第 k-1 分钟收盘时的值
+  const minuteCloses = minuteEnds(bars).map((i) => bars[i].close);
+  const ref21 = ema(minuteCloses, 21), ref55 = ema(minuteCloses, 55);
+  minuteIndex(bars).forEach((k, i) => {
+    if (k === 0) {
+      assert.deepEqual([e21[i], e55[i]], [null, null], "窗口里第一分钟还没有已收盘的大周期 bar");
+      return;
+    }
+    assert.ok(Math.abs(e21[i] - ref21[k - 1]) < 1e-9, `第 ${k} 分钟里应是第 ${k - 1} 分钟收盘时的 EMA21`);
+    assert.ok(Math.abs(e55[i] - ref55[k - 1]) < 1e-9);
+  });
+
+  // 历史与实时一致: 少了后面的 bar 时前面的值不变
+  assert.deepEqual(htfEma(bars.slice(0, 100), 60, [21]).lines[0], e21.slice(0, 100));
+  // 没有大周期(本图已是最大周期)时全为 null
+  assert.deepEqual(htfEma(bars.slice(0, 3), 0, [21]).lines, [[null, null, null]]);
+});
+
+test("htfEma 接着大周期图的历史算: 本图窗口之前的桶用大周期图的收盘价播种, 窗口里以本图为准; 分桶按大周期图的起点", () => {
+  const T = 1700000000 - (1700000000 % 60);
+  // 大周期图: 窗口之前 300 根 1m, 再加窗口里的几根(最后一根拿到时还没收盘, 收盘价和本图对不上)
+  const before = Array.from({ length: 300 }, (_, k) => ({ time: T - (300 - k) * 60, close: 90 + Math.cos(k / 9) * 4 }));
+  const bars = tenSecondBars(T + 30, 200);
+  const inWindow = [...new Set(bars.map((b) => Math.floor(b.time / 60) * 60))]
+    .map((time) => ({ time, close: 12345 }));   // 窗口里的桶以本图为准, 这些收盘价不该用上
+  const { lines: [e21, e55] } = htfEma(bars, 60, [21, 55], [...before, ...inWindow]);
+
+  // 对照: 大周期图之前的收盘价 + 本图每分钟最后一根的收盘价, 连成一串算 ema; 第 k 分钟里是前一根已收盘的值
+  const closes = [...before.map((b) => b.close), ...minuteEnds(bars).map((i) => bars[i].close)];
+  const ref21 = ema(closes, 21), ref55 = ema(closes, 55);
+  minuteIndex(bars).forEach((k, i) => {
+    assert.ok(Math.abs(e21[i] - ref21[before.length + k - 1]) < 1e-9);
+    assert.ok(Math.abs(e55[i] - ref55[before.length + k - 1]) < 1e-9,
+              `第 ${k} 分钟: 窗口最左边也已经接上大周期图(第一分钟就是大周期图最后一根已收盘的值)`);
+  });
+  const unseeded = htfEma(bars, 60, [55]).lines[0];
+  const second = minuteIndex(bars).indexOf(1);
+  assert.ok(Math.abs(unseeded[second] - e55[second]) > 1, "不播种的话窗口最左边差得远");
+
+  // 分桶按大周期图的起点: 起点偏了 30 秒(不是整分钟)也跟着它切; 越过最后一根的跨度按周期往后推
+  const shifted = [{ time: T + 30, close: 1 }];
+  const { buckets } = htfEma([{ time: T + 30, close: 1 }, { time: T + 80, close: 2 }, { time: T + 95, close: 3 },
+                              { time: T + 400, close: 4 }], 60, [21], shifted);
+  assert.deepEqual(buckets, [T + 30, T + 30, T + 90, T + 390]);
+  assert.equal(htfBucket([], 60, T + 59), T, "没有起点可依时按自然时间对齐");
+  assert.equal(htfBucket([T + 30], 60, T + 10), T, "早于第一根时同上");
 });
 
 test("derive / levelOf: 无状态调用, SMA 缓存随 derived 重建", () => {

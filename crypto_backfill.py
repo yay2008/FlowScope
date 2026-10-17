@@ -11,8 +11,9 @@
 
 每补完一段就把其中整根的 bar(开高低收量、主动买卖量、各拆分粒度)交给管理线程写盘; 洞两端
 所在 bar 缺的那几笔最后一起交回去插进内存窗口。任何一段取不到(REST 不通、归档包还没发布), 这个洞
-就算没补完, 管理线程过一会儿再派一次 —— 已经补好的 bar 那时会被跳过。洞补完时, 洞右端往前
-6 小时内取到的成交再过一遍大额检测(断线、关机期间的大单也能标出), 结果同样交给管理线程。
+就算没补完, 管理线程过一会儿再派一次 —— 已经补好的 bar 那时会被跳过。每派一次, 洞右端往前
+6 小时内这次取到的成交都过一遍大额检测(断线、关机期间的大单也能标出), 结果同样交给管理线程;
+有段没取到也照判, 因为取到的整根 bar 已经交去落盘, 重试时会被跳过、不再下载, 这次不判就永远判不到了。
 
 每个交易所一个回填线程(互不排队: OKX 用 REST 慢慢翻的时候, 币安的归档包照样下载), 只做网络与
 计算, 不碰历史文件; 结果都经 results 队列交给管理线程。
@@ -332,18 +333,20 @@ class Backfiller:
                 large_frames.append(trades[trades["t"] >= recent])
             with self._lock:
                 self.segments += 1
-        if failed is not None:
-            with self._lock:
-                self.last_error = f"{job.symbol}: {failed}"
-            self.results.put(("done", job.symbol, job.before_id, None, failed))
-            return
         if large_frames:
-            # 段是由新到旧取的, 按编号排回去; 跳过的段(已完整落盘)处编号接不上, 检测器在那里重新预热。
+            # 段是由新到旧取的, 按编号排回去; 跳过的段(已完整落盘)和没取到的段处编号接不上, 检测器在那里重新预热。
+            # 有段失败也先判再报: 取到的段里整根的 bar 上面已经交去落盘, 重试时被跳过、不再下载, 不判就永远漏掉。
+            # 重试时没取到的段补上了再单独判; 重复判到的成交按编号并进(absorb), 覆盖区间取并集。
             large = pd.concat(large_frames, ignore_index=True).drop_duplicates("id").sort_values("id")
             events, spans = judge_history(job.symbol, large_trade_source(job.symbol),
                                           large[["id", "price", "qty", "t", "sell"]].itertuples(index=False, name=None))
             if events or spans:
                 self.results.put(("large", job.symbol, events, spans))
+        if failed is not None:
+            with self._lock:
+                self.last_error = f"{job.symbol}: {failed}"
+            self.results.put(("done", job.symbol, job.before_id, None, failed))
+            return
         edge = pd.concat(edge_frames, ignore_index=True) if edge_frames else empty_trades()
         edge = edge.drop_duplicates("id").sort_values("id")
         trades = list(edge[["id", "price", "qty", "t", "sell"]].itertuples(index=False, name=None))

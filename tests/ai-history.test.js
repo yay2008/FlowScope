@@ -70,7 +70,7 @@ function harness(fetchImpl) {
     document: { createElement: (tag) => new Element(tag), createTextNode: (text) => { const n = new Element("#text"); n.textContent = text; return n; } },
     navigator: { clipboard: { writeText: async (text) => copied.push(text) } },
     localStorage: { getItem: () => null, setItem() {} },
-    FlowIndicators: { EMA_PERIODS: [] },
+    FlowIndicators: { EMA_PERIODS: [], HTF_EMA_PERIODS: [] },
     fetch: fetchImpl, AbortController, URLSearchParams, TextEncoder, TextDecoder,
     setTimeout, clearTimeout, setInterval, clearInterval, console,
   };

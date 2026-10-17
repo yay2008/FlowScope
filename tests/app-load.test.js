@@ -1098,14 +1098,14 @@ test("截止标记: HTTP/WS 共用合约时段, 配置单独补到也更新, 换
   await new Promise((resolve) => setImmediate(resolve));
 });
 
-test("WaveTrend 已删除: 图例有大额成交、OB Zones、EMA 与 FlowWave带, 工具栏没有 WT信号, K 线上没有交叉箭头和背离连线", () => {
+test("WaveTrend 已删除: 图例有大额成交、OB Zones、EMA、大周期EMA 与 FlowWave带, 工具栏没有 WT信号, K 线上没有交叉箭头和背离连线", () => {
   const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
   assert.ok(!html.includes('id="wt-signal"'), "工具栏不该再有 WT信号");
   const context = runBrowser();
   const setView = viewSetter(context);
   const keys = (index) => findAll(chartEl(context, index), (node) => node.className === "ml-item")
     .map((node) => node.getAttribute("data-key"));
-  assert.deepEqual([keys(0), keys(1)], [["large", "ob", "ema", "band"], ["large", "ob", "ema", "band"]]);
+  assert.deepEqual([keys(0), keys(1)], [["large", "ob", "ema", "htfEma", "band"], ["large", "ob", "ema", "htfEma", "band"]]);
   vm.runInContext(`(() => {
     const c = charts[1];
     c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
@@ -1158,19 +1158,23 @@ test("FlowWave 副图隐藏: 不建第三个窗格, 顶部读数不列 LSMA; Flo
 });
 
 const offFlags = (ctx, index) => ["ema", "band"].map((key) => legendRow(ctx, index, key).classList.contains("off"));
+// EMA 一行列出的周期数字(100 200 装在长周期开关按钮里)
+const emaLongOf = (ctx, index) => findByClass(legendRow(ctx, index, "ema"), "ml-toggle ml-long");
+const emaPeriodsOf = (ctx, index) => findByClass(legendRow(ctx, index, "ema"), "ml-params").children
+  .flatMap((node) => (node.tagName === "button" ? node.children : [node])).map((span) => span.textContent);
 
 test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各记进 localStorage, 重载后各自按记下的状态初始化", () => {
   const storage = createLocalStorage();
   const context = runBrowser({ localStorage: storage });
   const applied = stubCharts[1].applied;
 
-  assert.equal(findByClass(legendRow(context, 1, "ema"), "ml-params").children.length, 4, "EMA 后面列出四个周期");
+  assert.deepEqual(emaPeriodsOf(context, 1), ["21", "55", "100", "200"], "EMA 后面列出四个周期");
   clickEye(context, 1, "ema");
   assert.deepEqual(applied.slice(-4).map((o) => o.visible), [false, false, false, false]);
   assert.equal(eyeOf(context, 1, "ema").title, "显示");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")),
-                   [{ ema: true, emaAll: false, band: false, bandMid: false, ob: false, large: true },
-                    { ema: false, emaAll: false, band: false, bandMid: false, ob: false, large: true }]);
+                   [{ ema: true, emaAll: false, emaLong: true, htfEma: true, htf: 0, band: false, bandMid: false, ob: false, large: true },
+                    { ema: false, emaAll: false, emaLong: true, htfEma: true, htf: 0, band: false, bandMid: false, ob: false, large: true }]);
 
   // 切合约是整页重载: 新页面的两张图各按记下的状态画(删掉 WaveTrend 之前记的 wt 忽略掉)
   storage.setItem("flowscope.chartShown", JSON.stringify([
@@ -1216,7 +1220,7 @@ test("两张图选同一个周期时开关各管各的, 重载后不串; 切周�
   select.handlers.change[0]();
   assert.deepEqual(offFlags(again, 0), [true, true], "切周期后本图开关不变");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0],
-                   { ema: false, emaAll: false, band: false, bandMid: false, ob: false, large: true });
+                   { ema: false, emaAll: false, emaLong: true, htfEma: true, htf: 0, band: false, bandMid: false, ob: false, large: true });
 });
 
 test("图例里的带宽只在本图打开 FlowWave带 时能点", () => {
@@ -1267,13 +1271,56 @@ test("FlowWave带 的「中线」开关: 默认不画, 带关着时不能点; �
   assert.equal(stubCharts[1].applied.at(-1).midVisible, false, "再点一下隐藏");
 });
 
+test("EMA 的「100 200」开关: 默认画, 点一下只隐藏 EMA100/200、21/55 照画; EMA 关着时不能点; 只管本图, 记进 localStorage, 重载后照旧", () => {
+  const storage = createLocalStorage();
+  const context = runBrowser({ localStorage: storage });
+  // 主图的细线是本图 EMA(21/55/100/200), 粗线是大周期 EMA
+  const visible = (index) => stubCharts[index].series
+    .filter((s) => s.type === "LineSeries" && s.pane === 0 && s.options.lineWidth === 1)
+    .map((s) => s.applied.at(-1).visible);
+  const btn = emaLongOf(context, 1);
+  assert.equal(btn.tagName, "button");
+  assert.deepEqual(btn.children.map((span) => span.textContent), ["100", "200"]);
+  assert.deepEqual(btn.children.map((span) => span.style.color), ["#009688", "#ab47bc"], "数字保留各自线色, 兼当色标");
+  assert.equal(btn.classList.contains("on"), true, "默认画");
+  assert.deepEqual(visible(1), [true, true, true, true]);
+
+  btn.handlers.click[0]();
+  assert.deepEqual(visible(1), [true, true, false, false], "只隐藏 EMA100/200");
+  assert.equal(btn.classList.contains("on"), false, "按钮变暗");
+  assert.equal(legendRow(context, 1, "ema").classList.contains("off"), false, "EMA 本身仍开着");
+  assert.deepEqual(visible(0), [true, true, true, true], "另一张图不受影响");
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")).map((s) => s.emaLong), [true, false]);
+
+  clickEye(context, 1, "ema");
+  assert.deepEqual(visible(1), [false, false, false, false]);
+  assert.equal(btn.disabled, true, "EMA 关着时不能点");
+  clickEye(context, 1, "ema");
+  assert.deepEqual(visible(1), [true, true, false, false], "重新打开 EMA, 长周期仍按开关不画");
+  assert.equal(btn.disabled, false);
+
+  const setView = viewSetter(context);
+  setView("footprint");
+  assert.deepEqual(visible(1), [false, false, false, false], "足迹图下都不画");
+  setView("candle");
+  assert.deepEqual(visible(1), [true, true, false, false]);
+
+  const again = runBrowser({ localStorage: storage });
+  assert.equal(emaLongOf(again, 1).classList.contains("on"), false, "重载后照旧隐藏");
+  assert.deepEqual(visible(1), [true, true, false, false], "重载后 series 也按记下的状态画");
+  emaLongOf(again, 1).handlers.click[0]();
+  assert.deepEqual(visible(1), [true, true, true, true], "再点一下显示");
+});
+
 test("EMA 的「近100 / 全部」: 默认只画最右边 100 根, 点了画全部; 数值不变, 只管本图, 记进 localStorage, 重载后照旧", () => {
   const storage = createLocalStorage();
   const context = runBrowser({ localStorage: storage });
   const rangeOf = (ctx, index) => findByClass(legendRow(ctx, index, "ema"), "ml-range");
-  // setData 收到的数组属于页面的 vm 上下文, 转成本上下文的数组再比(deepEqual 认不出别的上下文的数组)
+  // setData 收到的数组属于页面的 vm 上下文, 转成本上下文的数组再比(deepEqual 认不出别的上下文的数组)。
+  // 主图的细线是本图 EMA, 粗线是大周期 EMA(画线范围相同, 见下面的大周期 EMA 测试)
   const emaData = () => JSON.parse(JSON.stringify(
-    stubCharts[1].series.filter((s) => s.type === "LineSeries" && s.pane === 0).map((s) => s.data)));
+    stubCharts[1].series.filter((s) => s.type === "LineSeries" && s.pane === 0 && s.options.lineWidth === 1)
+      .map((s) => s.data)));
   const load = (ctx) => vm.runInContext(`(() => {
     const c = charts[1];
     c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
@@ -1314,6 +1361,138 @@ test("EMA 的「近100 / 全部」: 默认只画最右边 100 根, 点了画全�
   assert.ok(emaData().every((d) => d.length === 300), "重载后 series 也按记下的范围画");
   rangeOf(again, 1).handlers.click[0]();
   assert.ok(emaData().every((d) => d.length === 100), "再点一下切回最近 100 根");
+});
+
+// 大周期EMA 一行的下拉框、主图上的两条粗线(本图 EMA 是细线)
+const htfPickOf = (ctx, index) => findByClass(legendRow(ctx, index, "htfEma"), "ml-tf");
+const htfOptionsOf = (ctx, index) => htfPickOf(ctx, index).children.map((option) => option.value);
+const htfSeriesOf = (index) =>
+  stubCharts[index].series.filter((s) => s.type === "LineSeries" && s.pane === 0 && s.options.lineWidth === 3);
+const htfVisible = (index) => htfSeriesOf(index).map((s) => s.applied.at(-1).visible);
+const pickHtf = (ctx, index, value) => {
+  htfPickOf(ctx, index).value = value;
+  htfPickOf(ctx, index).handlers.change[0]();
+};
+
+test("大周期EMA: 下拉框列出比本图大的周期(默认至少 4 倍的最小一档), 粗线按所选大周期画、范围同 EMA; 选择和开关只管本图、记进 localStorage", async () => {
+  const storage = createLocalStorage();
+  // 大周期历史: 1m 有(本图窗口之前 300 根), 5m 后端还没合成好
+  const htfCalls = [];
+  const T0 = 1700000010 - 300 * 60;
+  const minuteBars = Array.from({ length: 300 }, (_, k) => ({ time: T0 - (T0 % 60) + k * 60, close: 3990 + Math.cos(k / 9) * 6 }));
+  const fetchImpl = (url) => {
+    const params = new URLSearchParams(String(url).split("?")[1] || "");
+    if (String(url).startsWith("/api/history") && params.get("tf") !== "10" && params.get("tf") !== "30") {
+      htfCalls.push(params);
+      return Promise.resolve(jsonResponse(params.get("tf") === "60" ? { cfg: null, bars: minuteBars } : { pending: true, bars: [] }));
+    }
+    return stubFetch(url);
+  };
+  const context = runBrowser({ localStorage: storage, fetch: fetchImpl });
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  await flush();
+  const htfData = () => JSON.parse(JSON.stringify(htfSeriesOf(1).map((s) => s.data.map((p) => p.value))));
+  const expected = (htf, history = []) => JSON.parse(vm.runInContext(
+    `JSON.stringify(FlowIndicators.htfEma(charts[1].bars, ${htf}, [21, 55], ${JSON.stringify(history)}).lines)`, context));
+  vm.runInContext(`(() => {
+    const c = charts[1];
+    c.cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50 };
+    c.bars = [];
+    for (let i = 0; i < 300; i++) {
+      const price = 4000 + Math.sin(i / 7) * 20 + i * 0.1;
+      c.bars.push({ time: 1700000010 + i * 30, open: price - 1, high: price + 2, low: price - 2,
+                    close: price, volume: 100, buy: 60, sell: 40, delta: 20 });
+    }
+    c.renderAll();
+  })()`, context);
+
+  // 默认左 10s、右 30s: 大周期是比本图大的周期, 默认取至少 4 倍的最小一档
+  assert.deepEqual([htfOptionsOf(context, 0), htfOptionsOf(context, 1)],
+                   [["30", "60", "300", "900", "3600", "14400"], ["60", "300", "900", "3600", "14400"]]);
+  assert.deepEqual(htfPickOf(context, 1).children.map((option) => option.textContent), ["1m", "5m", "15m", "1h", "4h"]);
+  assert.deepEqual([htfPickOf(context, 0).value, htfPickOf(context, 1).value], ["60", "300"]);
+  const periods = findByClass(legendRow(context, 1, "htfEma"), "ml-params").children;
+  assert.deepEqual(periods.map((span) => span.textContent), ["21", "55"]);
+  assert.deepEqual(periods.map((span) => span.style.color), ["#f0b90d", "#2962ff"], "周期数字的颜色同本图的 EMA21 / EMA55");
+  assert.equal(htfSeriesOf(1).length, 2, "主图有两条大周期 EMA");
+  assert.deepEqual(htfVisible(1), [true, true], "默认显示");
+
+  let lines = htfData();
+  assert.ok(lines.every((d) => d.length === 100), "默认同 EMA 只画最右边 100 根");
+  assert.deepEqual(lines, expected(300).map((line) => line.slice(-100)), "还没有大周期历史: 只用本图的 K 线按 5m 分桶算");
+
+  pickHtf(context, 1, "60");
+  assert.deepEqual(htfData(), expected(60).map((line) => line.slice(-100)), "改选 1m 后先按本图的 K 线重算");
+  assert.equal(htfCalls.length, 1, "去要 1m 的历史");
+  assert.deepEqual([htfCalls[0].get("symbol"), htfCalls[0].get("tf"), htfCalls[0].get("ltf")], ["KQ.m@SHFE.fu", "60", "0"]);
+  await flush();
+  const seeded = expected(60, minuteBars);
+  assert.deepEqual(htfData(), seeded.map((line) => line.slice(-100)), "1m 历史到了: 接着它算");
+  assert.notDeepEqual(seeded, expected(60));
+  assert.equal(htfPickOf(context, 0).value, "60", "另一张图不受影响");
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")).map((s) => s.htf), [0, 60]);
+
+  pickHtf(context, 1, "300");
+  await flush();
+  assert.deepEqual(htfData(), expected(300).map((line) => line.slice(-100)), "5m 的历史后端还没好: 先只用本图的 K 线");
+  pickHtf(context, 1, "60");
+  await flush();
+  assert.equal(htfCalls.length, 2, "1m 已经要到过, 切回来不再要");
+  assert.deepEqual(htfData(), seeded.map((line) => line.slice(-100)));
+
+  findByClass(legendRow(context, 1, "ema"), "ml-range").handlers.click[0]();
+  assert.ok(htfData().every((d) => d.length === 300), "EMA 那一行切成「全部」, 大周期 EMA 也画全部");
+
+  clickEye(context, 1, "htfEma");
+  assert.deepEqual(htfVisible(1), [false, false]);
+  assert.equal(htfPickOf(context, 1).disabled, true, "关着时不能选大周期");
+  assert.equal(legendRow(context, 1, "htfEma").classList.contains("off"), true);
+  assert.deepEqual(htfVisible(0), [true, true], "另一张图不受影响");
+  assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")).map((s) => s.htfEma), [true, false]);
+
+  const again = runBrowser({ localStorage: storage });
+  assert.equal(htfPickOf(again, 1).value, "60", "重载后照旧选 1m");
+  assert.deepEqual(htfVisible(1), [false, false], "重载后照旧关着");
+  assert.equal(htfPickOf(again, 0).value, "60");
+
+  // 记下的大周期不是可选周期(手改、坏值)就按默认
+  storage.setItem("flowscope.chartShown", JSON.stringify([{ htf: 7 }, { htf: "60" }]));
+  const bad = runBrowser({ localStorage: storage });
+  assert.deepEqual([htfPickOf(bad, 0).value, htfPickOf(bad, 1).value], ["60", "300"]);
+});
+
+test("大周期EMA 跟着本图周期: 4h 图没有更大周期整行不显示、线不画; 切回来照旧用记下的大周期; 足迹图下隐藏", () => {
+  const storage = createLocalStorage();
+  storage.setItem("flowscope.chartShown", JSON.stringify([{}, { htf: 60 }]));
+  const context = runBrowser({ localStorage: storage, fetch: historyRecorder([]) });
+  const select = tfSelectOf(context, 1);
+  const switchTf = (value) => {
+    select.value = value;
+    select.handlers.change[0]();
+  };
+  assert.equal(htfPickOf(context, 1).value, "60");
+
+  switchTf("14400");
+  assert.equal(legendRow(context, 1, "htfEma").hidden, true, "4h 图没有更大的周期");
+  assert.deepEqual(htfVisible(1), [false, false]);
+
+  switchTf("300");
+  assert.equal(legendRow(context, 1, "htfEma").hidden, false);
+  assert.deepEqual(htfOptionsOf(context, 1), ["900", "3600", "14400"]);
+  assert.equal(htfPickOf(context, 1).value, "3600", "1m 不比 5m 大, 按默认取至少 4 倍的最小一档");
+  assert.deepEqual(htfVisible(1), [true, true]);
+  assert.equal(JSON.parse(storage.getItem("flowscope.chartShown"))[1].htf, 60, "切周期不改记下的选择");
+
+  switchTf("3600");
+  assert.deepEqual([htfOptionsOf(context, 1), htfPickOf(context, 1).value], [["14400"], "14400"], "不到 4 倍时取最大的");
+  switchTf("30");
+  assert.equal(htfPickOf(context, 1).value, "60", "切回 30s 照旧用 1m");
+
+  const setView = viewSetter(context);
+  setView("footprint");
+  assert.deepEqual([htfVisible(0), htfVisible(1)], [[false, false], [false, false]], "足迹图下不画");
+  setView("candle");
+  assert.deepEqual([htfVisible(0), htfVisible(1)], [[true, true], [true, true]]);
 });
 
 test("点图例里的带宽按 1.5σ → 2σ → 2.5σ 循环, 两张图共用, 半宽按 k 线性变化; 顶部读数不再列带", () => {

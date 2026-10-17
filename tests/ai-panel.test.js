@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { COLUMNS, MIN_ROWS, MAX_ROWS, rowSpan, buildChartData, shotTitle, parseSse, footText } =
+const { COLUMNS, HTF_COLUMNS, MIN_ROWS, MAX_ROWS, rowSpan, buildChartData, shotTitle, parseSse, footText } =
   require("../static/ai-panel.js");
 const Ind = require("../static/indicators.js");
 const { derive, BAND } = Ind;
@@ -41,8 +41,33 @@ test("数值表的列名都是服务端认识的(analysis.COLUMN_NOTES)", () => 
   const block = source.slice(source.indexOf("COLUMN_NOTES = {"), source.indexOf("\n}", source.indexOf("COLUMN_NOTES = {")));
   const known = new Set([...block.matchAll(/"([a-z0-9_]+)":/g)].map((m) => m[1]));
   assert.equal(COLUMNS[0], "time");
-  for (const column of COLUMNS) assert.ok(known.has(column), `analysis.py 不认识列 ${column}`);
-  assert.equal(new Set(COLUMNS).size, COLUMNS.length);
+  for (const column of [...COLUMNS, ...HTF_COLUMNS]) assert.ok(known.has(column), `analysis.py 不认识列 ${column}`);
+  assert.equal(new Set([...COLUMNS, ...HTF_COLUMNS]).size, COLUMNS.length + HTF_COLUMNS.length);
+});
+
+test("大周期 EMA 画在图上时接在数值表最后, 大周期写在 meta.htf; 关着、足迹图、没有大周期时不带这两列", () => {
+  const bars = walkBars(200);
+  const withHtf = (extra = {}, shown = {}) => {
+    const data = input(bars, null, { htf: 300, ...extra });
+    data.shown = { ...data.shown, htfEma: true, ...shown };
+    data.derived.htfEma = Ind.htfEma(bars, 300, Ind.HTF_EMA_PERIODS).lines;
+    return buildChartData(data);
+  };
+  const data = withHtf();
+  assert.deepEqual(data.columns, [...COLUMNS, "htf_ema21", "htf_ema55"]);
+  assert.equal(data.meta.htf, 300);
+  assert.equal(data.meta.shown.htfEma, true);
+  const last = data.rows.at(-1);
+  assert.equal(last.length, data.columns.length);
+  const htf21 = Ind.htfEma(bars, 300, [21]).lines[0].at(-1);
+  assert.equal(last[data.columns.indexOf("htf_ema21")], Number(htf21.toFixed(2)), "均线多留一位");
+
+  for (const [why, off] of [["关着", withHtf({}, { htfEma: false })], ["足迹图", withHtf({ view: "footprint" })],
+                            ["没有大周期", withHtf({ htf: 0 })]]) {
+    assert.deepEqual(off.columns, COLUMNS, `${why}时不带大周期列`);
+    assert.equal(off.rows[0].length, COLUMNS.length);
+  }
+  assert.equal(withHtf({ htf: 0 }).meta.htf, 0);
 });
 
 test("取可视范围内的 bar: 太多取最右边, 太少往左补, 一根都没有取最新一段", () => {
@@ -69,7 +94,9 @@ test("一张图的数据: 每行与列对齐, 价格按显示位数取整, 空�
   assert.equal(data.meta.range.to, bars[399].time);
   assert.equal(data.meta.loaded.count, 400);
   assert.equal(data.meta.loaded.from, bars[0].time);
-  assert.deepEqual(data.meta.shown, { ema: true, band: false, large: true, ob: false });
+  assert.deepEqual(data.meta.shown, { ema: true, emaLong: true, htfEma: false, band: false, large: true, ob: false });
+  assert.deepEqual(data.columns, COLUMNS, "没画大周期 EMA 时不带它的列");
+  assert.equal(data.meta.htf, 0);
   assert.equal(data.meta.view, "candle");
   assert.equal(data.meta.ltf, 0);
   assert.equal(buildChartData(input(bars, null, { ltf: 15 })).meta.ltf, 15, "口径照图上数据的实际粒度报");

@@ -16,7 +16,7 @@
  */
 (function (root) {
   "use strict";
-  const { LW, BAND, EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf } = FlowIndicators;
+  const { LW, BAND, EMA_PERIODS, HTF_EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf } = FlowIndicators;
 
   // 可选主周期(秒), 与后端 indicator.TF_OPTIONS 一致(tests/test_rollup.py 核对两边相同)
   const TF_CHOICES = [10, 30, 60, 300, 900, 3600, 14400];
@@ -347,10 +347,26 @@
 
   // 主图 EMA 21/55/100/200(金/蓝/青/紫); 图例里的周期数字也按这个上色, 兼当色标
   const EMA_COLORS = ["#f0b90d", "#2962ff", "#009688", "#ab47bc"];
+  // 长周期 EMA: 图例里这两个周期数字是一个开关(亮 = 画, 暗 = 不画), 一起显示/隐藏, 记在显示开关 emaLong
+  const EMA_LONG_PERIODS = [100, 200];
   // EMA 默认只画最右边这么多根(图例里 EMA 后面的「近100 / 全部」切换, 记在显示开关 emaAll):
   // 计算仍用全部历史(数值不变), 只是更早的部分不画, 免得几条线铺满整段历史。
   // 新 bar 进来走 renderAll 整体重设, 窗口随之右移; updateLast 只改末根, 不会越出窗口。
   const EMA_DRAW_BARS = 100;
+  // 大周期 EMA 21/55 沿用本图 EMA21/EMA55 的颜色, 画成粗的半透明阶梯线(大周期每根走完才跳一格): 同色 = 同一个周期数,
+  // 粗而淡 = 更大的周期, 本图 EMA 的细线压在上面也看得清。画线范围同 EMA(「近100 / 全部」)
+  const HTF_EMA_COLORS = ["rgba(240, 185, 13, 0.45)", "rgba(41, 98, 255, 0.55)"];
+  const HTF_EMA_WIDTH = 3;
+
+  // 本图能选的大周期: 比本图大的周期(都是本图周期的整数倍; 4h 图没有)
+  function htfOptions(tf) {
+    return TF_CHOICES.filter((s) => s > tf);
+  }
+  // 没选过时默认的大周期: 至少是本图 4 倍的最小一档(10s→1m、30s→5m、1m→5m、5m→1h、15m→1h、1h→4h), 没有就取最大的
+  function defaultHtf(tf) {
+    const options = htfOptions(tf);
+    return options.find((s) => s >= 4 * tf) ?? options.at(-1) ?? 0;
+  }
 
   // 主图左上角图例: 名称(悬停看说明) + 参数 + 眼睛按钮
   const LEGEND_ITEMS = [
@@ -359,7 +375,13 @@
     { key: "ob", name: "OB Zones", params: true,
       title: "订单块: 连续涨/跌实体累计的 Z 分数上穿 4, 在最近一根反向 K 线的高低范围建区。连续两根收盘突破远端或达到最大年龄后停止延伸, 保留历史区域。量条使用本项目买卖量, 跟随顶部买卖口径, 与 TV 默认 5 分钟估算量不同; 缺失时不画量条。末根信号随实时价格变化。" },
     { key: "ema", name: "EMA", params: true,
-      title: `主图指数移动平均线, 周期 21 / 55 / 100 / 200, 按收盘价计算(数值按全部历史算, 画多长由后面的「近${EMA_DRAW_BARS} / 全部」切换)` },
+      title: `主图指数移动平均线, 周期 21 / 55 / 100 / 200, 按收盘价计算(数值按全部历史算, 画多长由后面的「近${EMA_DRAW_BARS} / 全部」切换)。` +
+             `点周期里的「${EMA_LONG_PERIODS.join(" ")}」单独显示/隐藏这两条长周期均线` },
+    { key: "htfEma", name: "大周期EMA", params: true,
+      title: "在本图上画更大周期的 EMA 21 / 55: 粗的半透明线, 颜色同本图的 EMA21 / EMA55, 大周期在后面的下拉框里选。" +
+             "本图 K 线按大周期分桶, 本图之前的部分接着大周期图的历史算。只在大周期每根走完时更新: " +
+             "每根显示最近一根已收盘的大周期 bar 的 EMA, 画成阶梯(相当于大周期图的 EMA 往右挪一根), 历史与实时一致、不会事后重画。" +
+             `画线范围跟着 EMA 那一行的「近${EMA_DRAW_BARS} / 全部」。` },
     { key: "band", name: "FlowWave带", params: true,
       title: "FlowWave 的回归通道: 中线 = 收盘价线性回归 21 根(默认不画, 点后面的「中线」显示成淡虚线), 上下轨 = 中线 ±k 倍回归残差标准差(k 点后面的「2σ」切换)。平时只有两条淡轨线; wt2 超买(大于80)时中线到上轨之间染红、上轨加粗, 超卖(小于20)时中线到下轨之间染绿、下轨加粗, 上色段的起点就是首次越界。轨道是真实价格, 可当动态支撑压力看。" },
   ];
@@ -658,8 +680,11 @@
    *   tf        初始主周期(秒), 之后由左上角的下拉框切换(setTf)
    *   symbol    合约代码(切合约是整页重载, 所以也不变)
    *   settings  页面的工具栏状态, 按引用共用, 组件只读
-   *   shown     本图主图指标的初始显示开关 {ema, emaAll, band, bandMid, ob}, 之后由本图图例的眼睛按钮切换
+   *   shown     本图主图指标的初始显示开关 {ema, emaAll, emaLong, htfEma, htf, band, bandMid, ob, large},
+   *             之后由本图图例的眼睛按钮切换
    *             (emaAll 是 EMA 画全部历史还是只画最近 EMA_DRAW_BARS 根, 由那一行的「近100 / 全部」按钮切换;
+   *             emaLong 是画不画 EMA100/200, 由那一行周期里的「100 200」切换;
+   *             htf 是大周期 EMA 选的大周期(秒), 由那一行的下拉框切换, 0 或不比本图周期大时按 defaultHtf 取默认;
    *             bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换)
    *   profiles  本图已画的成交量分布 [{from, to, rows, extend, visible}](页面记下来的, 不合法的条目丢掉)
    *   obOptions 本图 OB Zones 参数, 由 onObOptionsChange 通知页面保存
@@ -706,7 +731,9 @@
     let loadController = null;
     let retryTimer = null;
     let retryAttempts = 0;
-    const shown = { ema: true, emaAll: false, band: false, bandMid: false, ob: false, large: true, ...initialShown };
+    const shown = { ema: true, emaAll: false, emaLong: true, htfEma: true, htf: 0, band: false, bandMid: false, ob: false,
+                    large: true,
+                    ...initialShown };
     let obOptions = FlowIndicators.normalizeObOptions(initialObOptions);
 
     // ---------- 容器: 图表本身 + 左上角的周期下拉框和主图指标图例 ----------
@@ -792,6 +819,8 @@
     // FlowWave带 的参数(带宽)是个按钮, 点一下按 BAND.kOptions 循环到下一档; 两张图共用, 交给页面去改。
     // 它后面还有「中线」开关(亮 = 显示), 和眼睛一样只管本图、记进显示开关。
     // EMA 的周期后面是画线范围按钮, 写着当前范围(「近100」/「全部」), 点一下切到另一种; 同样只管本图、记进显示开关。
+    // EMA 周期里的「100 200」本身也是按钮, 点一下显示/隐藏这两条长周期均线, 同样只管本图、记进显示开关。
+    // 大周期EMA 的名称后面是选大周期的下拉框, 选项随本图周期变(见 renderLegend), 选了只管本图、记进显示开关。
     const legendEl = document.createElement("div");
     legendEl.className = "main-legend";
     const legendRows = {};
@@ -804,9 +833,16 @@
       name.title = item.title;
       name.textContent = item.name;
       row.appendChild(name);
-      let params = null, mid = null, range = null;
+      let params = null, mid = null, range = null, select = null;
+      if (item.key === "htfEma") {
+        select = document.createElement("select");
+        select.className = "ml-tf";
+        select.title = "大周期: 比本图大、是本图周期整数倍的周期, 只管本图";
+        select.addEventListener("change", () => setHtf(Number(select.value)));
+        row.appendChild(select);
+      }
       if (item.params) {
-        params = document.createElement(item.key === "ema" ? "span" : "button");
+        params = document.createElement(item.key === "ema" || item.key === "htfEma" ? "span" : "button");
         params.className = "ml-params";
         row.appendChild(params);
       }
@@ -840,14 +876,28 @@
       eye.addEventListener("click", () => toggleShown(item.key));
       row.appendChild(eye);
       legendEl.appendChild(row);
-      legendRows[item.key] = { row, params, mid, range, eye };
+      legendRows[item.key] = { row, params, mid, range, select, eye };
     }
+    const emaLongBtn = document.createElement("button");   // 长周期那几个数字装在一个按钮里, 见 EMA_LONG_PERIODS
+    emaLongBtn.type = "button";
+    emaLongBtn.className = "ml-toggle ml-long";
+    emaLongBtn.addEventListener("click", () => toggleShown("emaLong"));
+    legendRows.ema.long = emaLongBtn;
     EMA_PERIODS.forEach((p, j) => {   // EMA 的周期按各自线色列出, 兼当色标
       const span = document.createElement("span");
       span.textContent = String(p);
       span.style.color = EMA_COLORS[j];
-      legendRows.ema.params.appendChild(span);
+      if (EMA_LONG_PERIODS.includes(p)) emaLongBtn.appendChild(span);
+      else legendRows.ema.params.appendChild(span);
     });
+    legendRows.ema.params.appendChild(emaLongBtn);
+    HTF_EMA_PERIODS.forEach((p) => {  // 大周期 EMA 的周期同样按线色列出(颜色同本图同周期数的 EMA)
+      const span = document.createElement("span");
+      span.textContent = String(p);
+      span.style.color = EMA_COLORS[EMA_PERIODS.indexOf(p)];
+      legendRows.htfEma.params.appendChild(span);
+    });
+    let htfOptionKey = null;   // 下拉框现有的选项(按本图周期), 变了才重建
     const largeReadout = document.createElement("span");
     largeReadout.className = "readout large-read";
     largeReadout.textContent = "等待行情";
@@ -938,6 +988,10 @@
       },
       crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
       timeScale: { borderColor: "#2a2e39", timeVisible: true, secondsVisible: tf < 60, rightOffset: RIGHT_OFFSET },
+      localization: {
+        // 后端时间戳已加 8 小时，按 UTC 格式化以保留北京时间。
+        timeFormatter: (time) => new Date(time * 1000).toISOString().slice(2, tf < 60 ? 19 : 16).replace("T", " "),
+      },
       rightPriceScale: { borderColor: "#2a2e39" },
     });
 
@@ -947,6 +1001,14 @@
       wickUpColor: "#d1d4dc", wickDownColor: "#4a4f5c",
       borderVisible: false,
     }, 0);
+
+    // 大周期 EMA 先建: 后建的 series 画在上面, 本图 EMA 的细线压在大周期的粗线上
+    const htfEmaSeries = HTF_EMA_PERIODS.map((p, j) =>
+      chart.addSeries(LightweightCharts.LineSeries, {
+        color: HTF_EMA_COLORS[j], lineWidth: HTF_EMA_WIDTH, lineType: LightweightCharts.LineType.WithSteps,
+        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+      }, 0));
+    applyHtfEmaVisibility();
 
     const emaSeries = EMA_PERIODS.map((p, j) =>
       chart.addSeries(LightweightCharts.LineSeries, {
@@ -1079,6 +1141,7 @@
 
     function derive() {
       derived = FlowIndicators.derive(bars, cfg, settings.bandK);
+      derived.htfEma = deriveHtfEma();
       derived.ob = obVisible() ? FlowIndicators.deriveObZones(bars, obOptions) : null;
     }
 
@@ -1231,6 +1294,10 @@
       candleSeries.update(candleOf(b));
       emaSeries.forEach((s, j) => {
         const v = derived.emaLines[j][i];
+        if (v != null) s.update({ time: b.time, value: v });
+      });
+      htfEmaSeries.forEach((s, j) => {
+        const v = derived.htfEma[j][i];
         if (v != null) s.update({ time: b.time, value: v });
       });
 
@@ -1389,25 +1456,111 @@
       bandSeries.applyOptions({ visible: bandShown(), midVisible: shown.bandMid });
     }
 
-    // EMA 按画线范围整体 setData: 默认只取最右边 EMA_DRAW_BARS 根, emaAll 打开时画全部
+    // EMA 与大周期 EMA 按画线范围整体 setData: 默认只取最右边 EMA_DRAW_BARS 根, emaAll 打开时画全部
     function renderEma() {
       if (!derived) return;   // 还没数据: 切范围只记状态, 数据到了 renderAll 会按它画
       const from = shown.emaAll ? 0 : Math.max(0, bars.length - EMA_DRAW_BARS);
-      emaSeries.forEach((s, j) =>
-        s.setData(bars.slice(from).map((b, k) => ({ time: b.time, value: derived.emaLines[j][from + k] }))
+      const draw = (seriesList, lines) => seriesList.forEach((s, j) =>
+        s.setData(bars.slice(from).map((b, k) => ({ time: b.time, value: lines[j][from + k] }))
           .filter((p) => p.value != null)));
+      draw(emaSeries, derived.emaLines);
+      draw(htfEmaSeries, derived.htfEma);
     }
 
     function emaShown() {
       return shown.ema && settings.view !== "footprint";
     }
 
-    function applyEmaVisibility() {
+    function applyEmaVisibility() {   // 长周期的两条还要看 emaLong
       const on = emaShown();
-      emaSeries.forEach((s) => s.applyOptions({ visible: on }));
+      emaSeries.forEach((s, j) =>
+        s.applyOptions({ visible: on && (shown.emaLong || !EMA_LONG_PERIODS.includes(EMA_PERIODS[j])) }));
     }
 
-    const APPLY_SHOWN = { ema: applyEmaVisibility, emaAll: renderEma,
+    // 本图实际画的大周期: 选过且比本图周期大就用它, 否则按 defaultHtf; 本图是 4h 时没有, 为 0。
+    // 切到不比所选大周期小的周期时不改记下的选择, 切回来照旧
+    function htfOf() {
+      return htfOptions(tf).includes(shown.htf) ? shown.htf : defaultHtf(tf);
+    }
+
+    // 大周期图的收盘价, 按大周期各存一份 Map(桶起点 → 收盘价), 给大周期 EMA 定分桶、给本图之前的桶播种(见 htfEma)。
+    // 向后端要来的是大周期图那一份快照(loadHtfHistory); 之后每次计算都把本图窗口里各桶的收盘价并进来,
+    // 窗口往右滑走的桶留着最终收盘价, 页面开着多久播种都接得上。没有(还在要、要不到)时只用本图的 K 线, 窗口左边一段在预热
+    const htfHistories = new Map();
+    const HTF_HISTORY_KEEP = 3000;   // 每个大周期最多留这么多根(EMA55 早就收敛), 免得页面开很久越攒越多
+
+    function deriveHtfEma() {
+      const htf = htfOf();
+      const closes = htfHistories.get(htf);
+      const known = closes ? [...closes].map(([time, close]) => ({ time, close })).sort((a, b) => a.time - b.time) : [];
+      const { lines, buckets } = FlowIndicators.htfEma(bars, htf, HTF_EMA_PERIODS, known);
+      if (closes) {
+        bars.forEach((b, i) => { if (b.close != null) closes.set(buckets[i], b.close); });   // 同一桶后面的覆盖前面的
+        for (const time of closes.keys()) {   // 先放进来的是快照(按时间排好), 再往后是本图的桶: 删最先放进来的就是删最早的
+          if (closes.size <= HTF_HISTORY_KEEP) break;
+          closes.delete(time);
+        }
+      }
+      return lines;
+    }
+
+    // 向后端要大周期的历史(同大周期图拿的快照, 只用收盘价)。本图每次连上推送(快照到了)、选了没有历史的大周期、
+    // 打开大周期EMA、切回 K 线时调; refresh: 已经有了也重要一次(断开重连后补上断开期间的桶)。
+    // 同一个大周期已经在要就不再发; 后端第一次要某个大周期要现合成, 等的时候先只用本图的 K 线画, 到了再整体重算
+    let htfLoad = null;              // 进行中的请求 {htf, controller}
+    let htfRetryTimer = null;
+    let htfRefresh = false;          // 推送断开过: 重连拿到快照后重要一次
+    async function loadHtfHistory(refresh = false, attempt = 0) {
+      const htf = htfOf();
+      if (!htfEmaShown() || (!refresh && htfHistories.has(htf)) || htfLoad?.htf === htf) return;
+      htfLoad?.controller.abort();
+      clearTimeout(htfRetryTimer);
+      const load = { htf, controller: new AbortController() };
+      htfLoad = load;
+      try {
+        const resp = await fetch(`/api/history?symbol=${encodeURIComponent(symbol)}&ltf=0&tf=${htf}`,
+                                 { signal: load.controller.signal });
+        const data = resp.ok ? await resp.json() : null;
+        if (htfLoad !== load) return;
+        htfLoad = null;
+        if (data?.pending) {         // 后端还没合成好: 过一会儿再要, 次数同本图加载
+          if (attempt < RETRY_MAX_ATTEMPTS) htfRetryTimer = setTimeout(() => loadHtfHistory(refresh, attempt + 1), RETRY_DELAY_MS);
+          return;
+        }
+        if (!Array.isArray(data?.bars) || !data.bars.length) return;
+        htfHistories.set(htf, new Map(data.bars.filter((b) => b.close != null).map((b) => [b.time, b.close])));
+        if (derived && htf === htfOf()) {
+          derived.htfEma = deriveHtfEma();
+          renderEma();
+        }
+      } catch (error) {
+        if (htfLoad === load) htfLoad = null;   // 要不到(名额满了、断网): 只用本图的 K 线, 下次重连再要
+      }
+    }
+
+    function htfEmaShown() {
+      return shown.htfEma && settings.view !== "footprint" && htfOf() > 0;
+    }
+
+    function applyHtfEmaVisibility() {
+      const on = htfEmaShown();
+      htfEmaSeries.forEach((s) => s.applyOptions({ visible: on }));
+    }
+
+    // 图例里选了大周期: 只重算大周期 EMA, 其他指标不受影响; 这个大周期还没有历史就去要
+    function setHtf(value) {
+      shown.htf = value;
+      if (derived) {
+        derived.htfEma = deriveHtfEma();
+        renderEma();
+      }
+      renderLegend();
+      onShownChange();
+      loadHtfHistory();
+    }
+
+    const APPLY_SHOWN = { ema: applyEmaVisibility, emaAll: renderEma, emaLong: applyEmaVisibility,
+                          htfEma: () => { applyHtfEmaVisibility(); loadHtfHistory(); },
                           band: applyBandVisibility, bandMid: applyBandVisibility, ob: refreshOb,
                           large: renderLargeTrades };
 
@@ -1848,11 +2001,29 @@
       mid.classList.toggle("on", shown.bandMid);
       mid.title = "中线 = 收盘价线性回归 21 根, 画成淡虚线(和 EMA 的实线分得开), 只管本图。" +
                   (shown.bandMid ? "现在显示, 点击隐藏" : "现在隐藏, 点击显示");
+      const long = legendRows.ema.long;                // 长周期开关: 亮 = 画, EMA 关着时同样不能点(开关状态保留)
+      long.disabled = !shown.ema;
+      long.classList.toggle("on", shown.emaLong);
+      long.title = `EMA${EMA_LONG_PERIODS.join(" / EMA")}, 只管本图。现在${shown.emaLong ? "显示, 点击隐藏" : "隐藏, 点击显示"}`;
       const range = legendRows.ema.range;              // EMA 的画线范围: 写当前范围, EMA 关着时同样不能点
       range.disabled = !shown.ema;
       range.textContent = shown.emaAll ? "全部" : `近${EMA_DRAW_BARS}`;
       range.title = `EMA 画线范围(数值都按全部历史计算), 只管本图。现在画${shown.emaAll ? "全部历史" : `最近 ${EMA_DRAW_BARS} 根 K 线`}, ` +
                     `点击改成${shown.emaAll ? `只画最近 ${EMA_DRAW_BARS} 根` : "画全部历史"}`;
+      const htfRow = legendRows.htfEma;                // 大周期的选项随本图周期变, 没有更大的周期(4h)这一行就不显示
+      const options = htfOptions(tf);
+      if (options.join() !== htfOptionKey) {
+        htfOptionKey = options.join();
+        htfRow.select.replaceChildren(...options.map((value) => {
+          const option = document.createElement("option");
+          option.value = String(value);
+          option.textContent = tfLabel(value);
+          return option;
+        }));
+      }
+      htfRow.select.value = String(htfOf());
+      htfRow.select.disabled = !shown.htfEma;          // 关着时同 EMA 的画线范围, 不能点
+      htfRow.row.hidden = !options.length;
       for (const key of Object.keys(legendRows)) {
         legendRows[key].row.classList.toggle("off", !shown[key]);
         legendRows[key].eye.title = shown[key] ? "隐藏" : "显示";
@@ -2126,6 +2297,8 @@
       const isFp = settings.view === "footprint";
       candleSeries.applyOptions({ visible: !isFp });
       applyEmaVisibility();
+      applyHtfEmaVisibility();
+      loadHtfHistory();        // 足迹图下不要大周期历史, 切回 K 线时补上
       fpSeries.applyOptions({ visible: isFp });
       applyBandVisibility();   // 足迹图下强制隐藏叠加带, 切回 K 线按开关恢复
       refreshOb();             // 足迹图下不算 OB, 切回 K 线现算
@@ -2309,6 +2482,7 @@
       socket.onclose = () => {
         if (generation !== wsGeneration) return;
         clearTimeout(watchdog);
+        htfRefresh = true;
         onStatus(false, "已断开, 重连补齐中…");
         reconnectTimer = setTimeout(() => {
           if (generation === wsGeneration) connectWs();
@@ -2338,6 +2512,8 @@
             if (msg.footprint) applyFootprint(msg.footprint, true);
             synced = true;
             onStatus(true, "已连接");
+            loadHtfHistory(htfRefresh);   // 断开重连的话大周期历史也重要一次, 补上断开期间的桶
+            htfRefresh = false;
           } else if (synced && msg.symbol === symbol && msg.tf === tf) {
             if (msg.type === "bars" && msg.ltf === ltf && msg.revision > barRevision) {
               onBars(msg.bars, msg.cfg);
@@ -2373,6 +2549,8 @@
       chart.timeScale().applyOptions({ secondsVisible: tf < 60 });
       fpSeries.setData([]);
       if (cfg) renderAll();
+      applyHtfEmaVisibility();   // 大周期的选项跟着本图周期变(4h 图没有大周期)
+      renderLegend();
       loadHistory();
       onTfChange();
     }
@@ -2410,9 +2588,10 @@
 
     // 数值摘要的原料: 原样交出去, 截哪一段、怎么取整由 ai-panel.js 决定。range 是可视的逻辑范围(bar 下标)。
     // ltf 是这些 bar 实际的拆分粒度(各图可能不同, 不能拿工具栏的选择代替); stale = 切了口径, 屏上还是旧口径的数据
+    // htf 是大周期 EMA 实际画的大周期(秒), 本图没有更大的周期时为 0
     function analysisInput() {
       const range = chart.timeScale().getVisibleLogicalRange();
-      return { tf, view: settings.view, shown: { ...shown }, bars, derived, cfg, ltf: barsLtf,
+      return { tf, view: settings.view, shown: { ...shown }, htf: htfOf(), bars, derived, cfg, ltf: barsLtf,
                stale: barsLtf !== ltf, range: range ? { from: range.from, to: range.to } : null };
     }
 
@@ -2505,6 +2684,6 @@
   }
 
   // 渲染类与时间换算一并导出, 测试直接检查
-  root.ChartView = { create, FootprintRenderer, BandRenderer, BandSeries, TF_CHOICES, tfLabel, localLtfOptions,
+  root.ChartView = { create, FootprintRenderer, BandRenderer, BandSeries, TF_CHOICES, tfLabel, localLtfOptions, htfOptions,
                      indexAtOrBefore, timeAtLogical, logicalAtTime, formatDuration, measureStats, measureLines };
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -298,15 +298,17 @@ class FeedTests(unittest.TestCase):
 
 
 class FakeVenue:
-    """假交易所: 成交表在内存里; 归档包只有 published_before 之前的日子, REST 可以设成被拒。"""
+    """假交易所: 成交表在内存里; 归档包只有 published_before 之前的日子, REST 可以设成被拒;
+    fail_once 里的 REST 段(按段起点)第一次取会超时, 再取正常。"""
 
     venue = "FAKE"
     archive_tz_ms = 0
 
-    def __init__(self, trades, published_before=None, blocked=False, channels=()):
+    def __init__(self, trades, published_before=None, blocked=False, channels=(), fail_once=()):
         self.trades = trades
         self.published_before = published_before
         self.blocked = blocked
+        self.fail_once = set(fail_once)
         self.channels = list(channels)
         self.calls = []
 
@@ -329,6 +331,9 @@ class FakeVenue:
         self.calls.append(("rest", start, end))
         if self.blocked:
             raise RestBlocked("HTTP 451")
+        if start in self.fail_once:
+            self.fail_once.discard(start)
+            raise FetchError("TimeoutError: The read operation timed out")
         # 故意多给一点段外的成交: 回填线程自己按时间和编号筛
         return self.trades[(self.trades.t >= start - 3000) & (self.trades.t < end + 3000)]
 
@@ -442,10 +447,46 @@ class BackfillTests(unittest.TestCase):
         self.assertGreaterEqual(spans[0][0], (self.before_ms - LARGE_HISTORY_MS) * 1_000_000)
         self.assertLess(spans[-1][1], self.before_ms * 1_000_000)
 
-    def test_failed_hole_is_not_judged_until_it_is_complete(self):
+    def test_partly_failed_hole_still_judges_what_it_fetched(self):
+        # REST 被拒: 归档日照样取到、整根 bar 照样落盘, 其中落在补判范围里的那几小时也要先判, 再报洞没补完
         venue = FakeVenue(self.trades, published_before=DAY0 + 2 * DAY_MS, blocked=True)
         _, results, _ = self.run_job(venue)
-        self.assertEqual([item for item in results if item[0] == "large"], [])
+        large = [item for item in results if item[0] == "large"]
+        self.assertEqual(len(large), 1)
+        spans = large[0][3]
+        self.assertGreaterEqual(spans[0][0], (self.before_ms - LARGE_HISTORY_MS) * 1_000_000)
+        self.assertLessEqual(spans[-1][1], (DAY0 + 2 * DAY_MS) * 1_000_000, "只判取到了的归档日")
+        self.assertEqual(results[-1][0], "done")
+        self.assertIn("REST", results[-1][4], "先交补判结果, 再报失败")
+
+    def test_large_trades_are_not_lost_when_a_failed_hole_is_retried(self):
+        # 回归: 某一段取失败时这一轮取到的成交以前不判, 重试时它们所在的 bar 已经完整落盘、被跳过不再下载,
+        # 里面的大单就永远判不到了。失败的段无论在 6 小时补判范围里还是远在范围外都一样
+        trades = self.trades.copy()
+        recent = trades[(trades.id < self.before_id) & (trades.t >= self.before_ms - 3_600_000)]
+        big = recent.id.iloc[[300, 500]].tolist()          # 洞右端往前约 35、18 分钟, 不在洞端点所在那一段
+        trades.loc[trades.id.isin(big), "qty"] = 500.0
+        for fail_at in ((self.before_ms // 3_600_000 - 2) * 3_600_000,   # 补判范围里的一小时
+                        DAY0 + 5 * 3_600_000):                            # 洞右端往前约 45 小时
+            with self.subTest(hours_before=round((self.before_ms - fail_at) / 3_600_000)):
+                venue = FakeVenue(trades, published_before=DAY0 + 2 * DAY_MS, fail_once={fail_at})
+                job, first, backfiller = self.run_job(venue)
+                self.assertIn("TimeoutError", first[-1][4])
+                # 管理线程把交来的整根 bar 写盘, 重试的 job.complete 就是它们(见 CryptoFeed.complete_starts)
+                complete = {tf: set() for tf in NATIVE_TFS}
+                for item in first:
+                    if item[0] == "bars":
+                        complete[item[2]].update(int(t) for t in item[3].index)
+                venue.calls.clear()
+                retry = backfiller.job(FAKE, None, None, self.before_id, self.before_ms, complete)
+                backfiller._fill(retry)
+                second = drain(backfiller.results)
+                self.assertIsNone(second[-1][4])
+                self.assertNotIn(("rest", 3_600_000 * ((self.before_ms - 3_600_000) // 3_600_000),
+                                  3_600_000 * (self.before_ms // 3_600_000)), venue.calls,
+                                 "大单所在的那一小时已完整落盘, 重试时不再下载")
+                judged = {i for item in first + second if item[0] == "large" for i in item[2]}
+                self.assertEqual(sorted(judged & set(big)), big)
 
 
 class FakeSpec:
