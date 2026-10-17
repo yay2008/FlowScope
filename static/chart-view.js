@@ -347,10 +347,10 @@
 
   // 主图 EMA 21/55/100/200(金/蓝/青/紫); 图例里的周期数字也按这个上色, 兼当色标
   const EMA_COLORS = ["#f0b90d", "#2962ff", "#009688", "#ab47bc"];
-  // EMA 默认只画最右边这么多根(图例里 EMA 后面的「近50 / 全部」切换, 记在显示开关 emaAll):
+  // EMA 默认只画最右边这么多根(图例里 EMA 后面的「近100 / 全部」切换, 记在显示开关 emaAll):
   // 计算仍用全部历史(数值不变), 只是更早的部分不画, 免得几条线铺满整段历史。
   // 新 bar 进来走 renderAll 整体重设, 窗口随之右移; updateLast 只改末根, 不会越出窗口。
-  const EMA_DRAW_BARS = 50;
+  const EMA_DRAW_BARS = 100;
 
   // 主图左上角图例: 名称(悬停看说明) + 参数 + 眼睛按钮
   const LEGEND_ITEMS = [
@@ -659,7 +659,7 @@
    *   symbol    合约代码(切合约是整页重载, 所以也不变)
    *   settings  页面的工具栏状态, 按引用共用, 组件只读
    *   shown     本图主图指标的初始显示开关 {ema, emaAll, band, bandMid, ob}, 之后由本图图例的眼睛按钮切换
-   *             (emaAll 是 EMA 画全部历史还是只画最近 EMA_DRAW_BARS 根, 由那一行的「近50 / 全部」按钮切换;
+   *             (emaAll 是 EMA 画全部历史还是只画最近 EMA_DRAW_BARS 根, 由那一行的「近100 / 全部」按钮切换;
    *             bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换)
    *   profiles  本图已画的成交量分布 [{from, to, rows, extend, visible}](页面记下来的, 不合法的条目丢掉)
    *   obOptions 本图 OB Zones 参数, 由 onObOptionsChange 通知页面保存
@@ -791,7 +791,7 @@
     // 主图指标图例: 每行 名称 + 参数 + 眼睛按钮, 眼睛只管本图。
     // FlowWave带 的参数(带宽)是个按钮, 点一下按 BAND.kOptions 循环到下一档; 两张图共用, 交给页面去改。
     // 它后面还有「中线」开关(亮 = 显示), 和眼睛一样只管本图、记进显示开关。
-    // EMA 的周期后面是画线范围按钮, 写着当前范围(「近50」/「全部」), 点一下切到另一种; 同样只管本图、记进显示开关。
+    // EMA 的周期后面是画线范围按钮, 写着当前范围(「近100」/「全部」), 点一下切到另一种; 同样只管本图、记进显示开关。
     const legendEl = document.createElement("div");
     legendEl.className = "main-legend";
     const legendRows = {};

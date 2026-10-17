@@ -363,7 +363,7 @@ body { display: flex; flex-direction: column; }
 .ml-name { font-weight: 600; cursor: default; }
 .ml-params { display: inline-flex; gap: 4px; color: #9598a1; }
 /* FlowWave带 的带宽是按钮(点一下切下一档), 外观与其他参数一致, 只在悬停时提示可点;
-   后面的「中线」开关同样是文字按钮: 亮 = 显示, 暗 = 隐藏。EMA 的「近50 / 全部」写着当前范围, 外观同参数 */
+   后面的「中线」开关同样是文字按钮: 亮 = 显示, 暗 = 隐藏。EMA 的「近100 / 全部」写着当前范围, 外观同参数 */
 button.ml-params, .ml-toggle, .ml-range {
   padding: 0;
   border: none;

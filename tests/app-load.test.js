@@ -1267,7 +1267,7 @@ test("FlowWave带 的「中线」开关: 默认不画, 带关着时不能点; �
   assert.equal(stubCharts[1].applied.at(-1).midVisible, false, "再点一下隐藏");
 });
 
-test("EMA 的「近50 / 全部」: 默认只画最右边 50 根, 点了画全部; 数值不变, 只管本图, 记进 localStorage, 重载后照旧", () => {
+test("EMA 的「近100 / 全部」: 默认只画最右边 100 根, 点了画全部; 数值不变, 只管本图, 记进 localStorage, 重载后照旧", () => {
   const storage = createLocalStorage();
   const context = runBrowser({ localStorage: storage });
   const rangeOf = (ctx, index) => findByClass(legendRow(ctx, index, "ema"), "ml-range");
@@ -1286,21 +1286,21 @@ test("EMA 的「近50 / 全部」: 默认只画最右边 50 根, 点了画全部
     c.renderAll();
   })()`, ctx);
 
-  assert.equal(rangeOf(context, 1).textContent, "近50", "默认只画最近 50 根");
+  assert.equal(rangeOf(context, 1).textContent, "近100", "默认只画最近 100 根");
   load(context);
   let lines = emaData();
   assert.equal(lines.length, 4, "主图有四条 EMA");
-  assert.ok(lines.every((d) => d.length === 50), "每条 EMA 只交给图表最右边 50 根");
+  assert.ok(lines.every((d) => d.length === 100), "每条 EMA 只交给图表最右边 100 根");
   const times = JSON.parse(vm.runInContext("JSON.stringify(charts[1].bars.map((b) => b.time))", context));
-  assert.deepEqual(lines[3].map((p) => p.time), times.slice(-50), "画的是最右边 50 根");
+  assert.deepEqual(lines[3].map((p) => p.time), times.slice(-100), "画的是最右边 100 根");
   const ema200 = JSON.parse(vm.runInContext("JSON.stringify(charts[1].derived.emaLines[3])", context));
-  assert.deepEqual(lines[3].map((p) => p.value), ema200.slice(-50), "数值仍是按全部历史算出来的");
+  assert.deepEqual(lines[3].map((p) => p.value), ema200.slice(-100), "数值仍是按全部历史算出来的");
 
   rangeOf(context, 1).handlers.click[0]();
   lines = emaData();
   assert.equal(rangeOf(context, 1).textContent, "全部");
   assert.ok(lines.every((d) => d.length === 300), "画全部历史");
-  assert.equal(rangeOf(context, 0).textContent, "近50", "另一张图不受影响");
+  assert.equal(rangeOf(context, 0).textContent, "近100", "另一张图不受影响");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")).map((s) => s.emaAll), [false, true]);
 
   clickEye(context, 1, "ema");
@@ -1313,7 +1313,7 @@ test("EMA 的「近50 / 全部」: 默认只画最右边 50 根, 点了画全部
   load(again);
   assert.ok(emaData().every((d) => d.length === 300), "重载后 series 也按记下的范围画");
   rangeOf(again, 1).handlers.click[0]();
-  assert.ok(emaData().every((d) => d.length === 50), "再点一下切回最近 50 根");
+  assert.ok(emaData().every((d) => d.length === 100), "再点一下切回最近 100 根");
 });
 
 test("点图例里的带宽按 1.5σ → 2σ → 2.5σ 循环, 两张图共用, 半宽按 k 线性变化; 顶部读数不再列带", () => {
