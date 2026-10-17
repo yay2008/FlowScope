@@ -440,12 +440,14 @@ class BackfillTests(unittest.TestCase):
         _, results, _ = self.run_job(FakeVenue(trades, published_before=DAY0 + 2 * DAY_MS))
         large = [item for item in results if item[0] == "large"]
         self.assertEqual(len(large), 1)
-        _, symbol, events, spans = large[0]
+        _, symbol, events, spans, relative, relative_spans = large[0]
         self.assertEqual((symbol, sorted(events)), ("FAKE.X", big))
         self.assertEqual(results[-1][0], "done", "先交补判结果, 再报洞补完")
         # 只判洞右端往前 6 小时: 更早的(包括 2 天前的归档日)不过检测器
         self.assertGreaterEqual(spans[0][0], (self.before_ms - LARGE_HISTORY_MS) * 1_000_000)
         self.assertLess(spans[-1][1], self.before_ms * 1_000_000)
+        self.assertFalse(set(events) & set(relative))
+        self.assertEqual(relative_spans, spans)
 
     def test_partly_failed_hole_still_judges_what_it_fetched(self):
         # REST 被拒: 归档日照样取到、整根 bar 照样落盘, 其中落在补判范围里的那几小时也要先判, 再报洞没补完

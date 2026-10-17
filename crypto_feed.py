@@ -1244,10 +1244,10 @@ class CryptoManager:
                     self._dirty.add(symbol)
             elif kind == "large":
                 # 回填补判的大额事件: 同合约各周期共用一个检测器, 并进一次即可
-                _, symbol, events, spans = result
+                _, symbol, events, spans, *relative = result
                 feed = next((self.feeds[(symbol, tf)] for tf in NATIVE_TFS if (symbol, tf) in self.feeds), None)
                 if feed is not None:
-                    feed.large_trades.absorb(events, spans)
+                    feed.large_trades.absorb(events, spans, *relative)
                     self._dirty.add(symbol)
             elif kind == "done":
                 _, symbol, before_id, edges, error = result

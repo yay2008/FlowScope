@@ -338,10 +338,10 @@ class Backfiller:
             # 有段失败也先判再报: 取到的段里整根的 bar 上面已经交去落盘, 重试时被跳过、不再下载, 不判就永远漏掉。
             # 重试时没取到的段补上了再单独判; 重复判到的成交按编号并进(absorb), 覆盖区间取并集。
             large = pd.concat(large_frames, ignore_index=True).drop_duplicates("id").sort_values("id")
-            events, spans = judge_history(job.symbol, large_trade_source(job.symbol),
-                                          large[["id", "price", "qty", "t", "sell"]].itertuples(index=False, name=None))
-            if events or spans:
-                self.results.put(("large", job.symbol, events, spans))
+            events, spans, relative, relative_spans = judge_history(job.symbol, large_trade_source(job.symbol),
+                large[["id", "price", "qty", "t", "sell"]].itertuples(index=False, name=None), include_relative=True)
+            if events or spans or relative or relative_spans:
+                self.results.put(("large", job.symbol, events, spans, relative, relative_spans))
         if failed is not None:
             with self._lock:
                 self.last_error = f"{job.symbol}: {failed}"

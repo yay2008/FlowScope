@@ -1,0 +1,229 @@
+<div id="crypto-tier-replay">
+  <h2>两层成交标记 · 历史回放</h2>
+  <div class="viz-controls">
+    <label class="form-label">品种<select id="tier-view" class="form-select"></select></label>
+    <label class="form-label">时段<select id="tier-window" class="form-select"></select></label>
+  </div>
+  <div class="tier-legend">
+    <button type="button" class="tier-key cursor-interaction" data-layer="large" aria-pressed="true"><span class="tier-dot tier-strong" aria-hidden="true"></span><span id="tier-large-label">大额成交</span></button>
+    <button type="button" class="tier-key cursor-interaction" data-layer="relative" aria-pressed="true"><span class="tier-dot tier-faint" aria-hidden="true"></span><span id="tier-relative-label">相对异常</span></button>
+    <span class="tier-direction"><span class="tier-buy" aria-hidden="true"></span>主动买<span class="tier-sell" aria-hidden="true"></span>主动卖</span>
+  </div>
+  <div id="tier-chart"></div>
+  <div id="tier-range-label" class="text-small tabular-nums" aria-live="polite"></div>
+  <div class="viz-row tier-playback">
+    <button class="btn" id="tier-prev" type="button">前一根</button>
+    <button class="btn btn-primary" id="tier-play" type="button">从头播放</button>
+    <button class="btn" id="tier-next" type="button">后一根</button>
+    <span id="tier-step-label" class="tabular-nums"></span>
+  </div>
+  <label class="form-label tier-scrubber">30秒逐根回放<input id="tier-step" class="form-range" type="range" min="1" max="60" value="60" step="1"></label>
+  <div id="tier-detail" class="text-small" aria-live="polite"></div>
+  <div class="tier-caption text-small text-muted">相对异常：超过 P99、低于原金额线，全部纳入。两层共用原大单尺寸基准。</div>
+  <div id="tier-tooltip" class="tooltip" role="tooltip" hidden></div>
+  <script id="tier-data" type="application/json">__PREVIEW_DATA__</script>
+</div>
+<style>
+#crypto-tier-replay{position:relative;min-width:0}
+#crypto-tier-replay h2{padding-right:96px}
+#crypto-tier-replay .tier-legend{display:flex;align-items:center;flex-wrap:wrap;gap:12px 18px;margin:14px 0 4px}
+#crypto-tier-replay .tier-key{display:inline-flex;align-items:center;gap:7px;background:transparent;border:0;padding:0;color:var(--foreground);font:inherit}
+#crypto-tier-replay .tier-key[aria-pressed="false"]{opacity:.4}
+#crypto-tier-replay .tier-dot{display:inline-block;width:11px;height:11px;border-radius:50%;box-sizing:border-box;border:1.8px solid var(--foreground)}
+#crypto-tier-replay .tier-strong{background:color-mix(in srgb,var(--foreground) 55%,transparent)}
+#crypto-tier-replay .tier-faint{background:transparent;opacity:.45;border-width:1.2px}
+#crypto-tier-replay .tier-direction{display:inline-flex;align-items:center;gap:6px}
+#crypto-tier-replay .tier-buy,#crypto-tier-replay .tier-sell{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green)}
+#crypto-tier-replay .tier-sell{background:var(--red);margin-left:6px}
+#crypto-tier-replay .tier-svg{display:block;max-width:100%;overflow:visible}
+#crypto-tier-replay .tier-svg text{font-size:12px;fill:var(--foreground);font-family:inherit}
+#crypto-tier-replay .tier-playback{margin-top:12px}
+#crypto-tier-replay .tier-scrubber{display:block;margin-top:8px}
+#crypto-tier-replay .tier-caption{margin-top:8px}
+#crypto-tier-replay #tier-detail{min-height:2.5em;margin-top:6px;overflow-wrap:anywhere}
+#crypto-tier-replay #tier-tooltip{position:absolute;z-index:5;pointer-events:none;background:var(--popover);color:var(--popover-foreground);padding:8px 10px;max-width:calc(100% - 24px);box-sizing:border-box;white-space:normal}
+#crypto-tier-replay #tier-tooltip[hidden]{display:none}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script>__LIVE_RENDERER__</script>
+<script>
+(() => {
+  const root=document.getElementById('crypto-tier-replay');
+  const q=id=>root.querySelector('#'+id);
+  const data=JSON.parse(q('tier-data').textContent);
+  const views=Object.keys(data.views).sort((a,b)=>(a.startsWith('AGG.')?0:1)-(b.startsWith('AGG.')?0:1)||a.localeCompare(b));
+  const names=name=>name.startsWith('AGG.')?name.slice(4)+' · 多所汇总':name.startsWith('BINANCE.')?name.split('.')[1].replace('USDT','')+' · Binance':name.split('.')[1].replace('-USDT-SWAP','')+' · OKX';
+  const viewSelect=q('tier-view'), windowSelect=q('tier-window'), stepInput=q('tier-step');
+  const chart=q('tier-chart'), detail=q('tier-detail'), tooltip=q('tier-tooltip');
+  const buttons={large:root.querySelector('[data-layer="large"]'),relative:root.querySelector('[data-layer="relative"]')};
+  const num=(value,digits=3)=>Number(value).toLocaleString('zh-CN',{maximumFractionDigits:digits});
+  const time=ms=>new Date(ms).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,hour:'2-digit',minute:'2-digit'});
+  let state={view:'AGG.BTC',sample:0,step:60,large:true,relative:true}, timer=null, previousMarks=new Map(), lastModel=null;
+  for(const name of views){const option=document.createElement('option');option.value=name;option.textContent=names(name);viewSelect.append(option);}
+
+  function buildChart(windowData, step, width, showLarge=true, showRelative=true){
+    width=Math.max(300,Math.round(width));
+    const height=422, frame={left:72,right:width-12,top:30,bottom:368};
+    const capacity=Math.max(7,Math.min(30,Math.floor((width-124)/21)));
+    const end=Math.max(1,Math.min(60,step)), begin=Math.max(0,end-capacity);
+    const rows=windowData.rows.slice(begin,end), unit=windowData.unit[end-1];
+    const total={large:{events:0,markers:0},relative:{events:0,markers:0}};
+    const volumes=(row,tier,side)=>row[(tier==='large'?4:6)+side];
+    const events=(row,tier,side)=>row[(tier==='large'?8:10)+side];
+    const notional=(row,tier,side)=>row[(tier==='large'?12:14)+side];
+    let maxRadius=3, upperPad=14, lowerPad=14;
+    const geometry=rows.map((row,i)=>{
+      const points=[];
+      for(const side of [0,1]){
+        const rLarge=events(row,'large',side)?FlowLargeTrades.radius(volumes(row,'large',side),unit):0;
+        const rRelative=events(row,'relative',side)?FlowLargeTrades.radius(volumes(row,'relative',side),unit):0;
+        for(const tier of ['large','relative']){
+          const count=events(row,tier,side);
+          total[tier].events+=count;if(count)total[tier].markers++;
+        }
+        // Reserve both positions even if a layer is hidden: toggling never moves the other layer.
+        const offsets={large:rLarge+6,relative:rLarge?rLarge*2+11+rRelative:rRelative+6};
+        const extent=Math.max(rLarge?offsets.large+rLarge:0,rRelative?offsets.relative+rRelative:0)+8;
+        if(side===0)upperPad=Math.max(upperPad,extent);else lowerPad=Math.max(lowerPad,extent);
+        maxRadius=Math.max(maxRadius,rLarge,rRelative);
+        for(const tier of ['large','relative']){
+          const r=tier==='large'?rLarge:rRelative;
+          if(r)points.push({tier,side,r,offset:offsets[tier],barIndex:begin+i,qty:volumes(row,tier,side),
+            notional:notional(row,tier,side),count:events(row,tier,side)});
+        }
+      }
+      return points;
+    });
+    const [lo,hi]=d3.extent(rows.flatMap(row=>[row[1],row[2]]));
+    const span=Math.max(hi-lo,hi*1e-5);
+    const usable=frame.bottom-frame.top-upperPad-lowerPad;
+    const domain=[lo-span*lowerPad/usable,hi+span*upperPad/usable];
+    if(hi===lo){domain[0]-=span*.5;domain[1]+=span*.5;}
+    const y=d3.scaleLinear().domain(domain).range([frame.bottom,frame.top]);
+    const x=d3.scaleLinear().domain([-.5,rows.length-.5]).range([frame.left+maxRadius+3,frame.right-maxRadius-3]);
+    const stepWidth=(frame.right-frame.left-maxRadius*2-6)/rows.length;
+    const candleWidth=Math.max(2,Math.min(8,stepWidth*.42));
+    const priceDigits=hi>=1000?0:hi>=1?2:5;
+    let grid='',candles='',dots='',axes='';
+    for(const value of y.ticks(5)){
+      const cy=y(value);
+      grid+=`<line x1="${frame.left}" x2="${frame.right}" y1="${cy}" y2="${cy}" stroke="var(--border)" stroke-opacity=".6"/>`;
+      axes+=`<text x="${frame.left-8}" y="${cy+4}" text-anchor="end" data-axis-tick="y">${num(value,priceDigits)}</text>`;
+    }
+    const tickCount=width<430?3:Math.min(5,rows.length);
+    const tickIndices=[...new Set(Array.from({length:tickCount},(_,i)=>Math.round(i*(rows.length-1)/Math.max(1,tickCount-1))))];
+    for(const i of tickIndices){
+      const cx=x(i),stamp=windowData.start_ms+(begin+i)*30000;
+      axes+=`<text x="${cx}" y="${frame.bottom+22}" text-anchor="middle" data-axis-tick="x">${time(stamp)}</text>`;
+    }
+    const marks=[];
+    rows.forEach((row,i)=>{
+      const cx=x(i),color=row[3]>=row[0]?'var(--green)':'var(--red)';
+      candles+=`<line x1="${cx}" x2="${cx}" y1="${y(row[1])}" y2="${y(row[2])}" stroke="${color}" stroke-opacity=".45"/><rect x="${cx-candleWidth/2}" y="${Math.min(y(row[0]),y(row[3]))}" width="${candleWidth}" height="${Math.max(1,Math.abs(y(row[0])-y(row[3])))}" fill="${color}" fill-opacity=".3"/>`;
+      for(const mark of geometry[i]){
+        if((mark.tier==='large'&&!showLarge)||(mark.tier==='relative'&&!showRelative))continue;
+        const sign=mark.side?1:-1;
+        mark.x=cx;mark.y=y(mark.side?row[2]:row[1])+sign*mark.offset;
+        mark.ms=windowData.start_ms+mark.barIndex*30000;
+        mark.key=mark.ms+'-'+mark.tier+'-'+mark.side;
+        marks.push(mark);
+        const color=mark.side?'var(--green)':'var(--red)',strong=mark.tier==='large';
+        dots+=`<g data-mark-key="${mark.key}"><circle data-tier="${mark.tier}" data-side="${mark.side}" cx="${mark.x}" cy="${mark.y}" r="${mark.r}" fill="${strong?color:'none'}" fill-opacity="${strong?.58:0}" stroke="${color}" stroke-width="${strong?1.8:1.2}" stroke-opacity="${strong?.95:.42}"/>`;
+        if(strong){
+          const a=Math.min(3.5,mark.r*.5);
+          dots+=`<path d="M${mark.x-a},${mark.y}h${a*2}${mark.side?`M${mark.x},${mark.y-a}v${a*2}`:''}" fill="none" stroke="${color}" stroke-width="1.2"/>`;
+        }
+        dots+='</g>';
+      }
+    });
+    const svg=`<svg class="tier-svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="30秒真实成交K线，大额成交为醒目填充圆点，相对异常为淡色空心圆点。买在下方，卖在上方。"><title>两层成交标记，圆点面积按成交数量缩放</title><desc>同一根K线、同一方向的两层各自汇总；同时出现时空心点排列在外侧。显示${rows.length}根已完成K线。</desc><rect data-chart-frame="" x="${frame.left}" y="${frame.top}" width="${frame.right-frame.left}" height="${frame.bottom-frame.top}" fill="none" stroke="var(--border)"/>${grid}${candles}${dots}${axes}<text class="axis-title" data-axis="y" x="${frame.left}" y="16">价格（USDT）</text><text class="axis-title" data-axis="x" x="${(frame.left+frame.right)/2}" y="413" text-anchor="middle">北京时间 · 30秒K线</text><rect data-chart-hit="" x="${frame.left}" y="${frame.top}" width="${frame.right-frame.left}" height="${frame.bottom-frame.top}" fill="transparent"/></svg>`;
+    return {svg,marks,frame,width,height,begin,end,total,unit,rows};
+  }
+
+  function selectedWindow(){return data.views[state.view][state.sample];}
+  function stopPlayback(){if(timer!==null){clearInterval(timer);timer=null;}updatePlayback();}
+  function updatePlayback(){q('tier-play').textContent=timer!==null?'暂停':state.step===60?'从头播放':'播放';q('tier-prev').disabled=state.step<=1;q('tier-next').disabled=state.step>=60;}
+  function save(){
+    const w=selectedWindow();
+    window.openai?.setWidgetState?.({modelContent:{view:state.view,window:w.label,time_beijing:w.date,
+      step:state.step,large_visible:state.large,relative_visible:state.relative},privateContent:{...state}})?.catch(()=>{});
+  }
+  function updateOptions(){
+    viewSelect.value=state.view;windowSelect.replaceChildren();
+    data.views[state.view].forEach((w,i)=>{const o=document.createElement('option');o.value=String(i);o.textContent=w.label+' · '+w.date;windowSelect.append(o);});
+    windowSelect.value=String(state.sample);
+  }
+  function detailFor(mark){
+    const layer=mark.tier==='large'?'大额成交':'相对异常',side=mark.side?'主动买':'主动卖';
+    return `${time(mark.ms)} · ${layer} · ${side} · ${num(mark.qty,5)} 币 · ${num(mark.notional,0)} USDT · ${mark.count} 个事件`;
+  }
+  function hideTooltip(){tooltip.hidden=true;}
+  function draw(){
+    if(typeof d3==='undefined'){detail.textContent='图形依赖未加载，请重新打开预览。';return;}
+    const w=selectedWindow(),width=chart.getBoundingClientRect().width||root.getBoundingClientRect().width||736;
+    const model=buildChart(w,state.step,width,state.large,state.relative);lastModel=model;
+    chart.innerHTML=model.svg;hideTooltip();
+    for(const tier of ['large','relative']){
+      buttons[tier].setAttribute('aria-pressed',String(state[tier]));
+      q('tier-'+tier+'-label').textContent=(tier==='large'?'大额成交':'相对异常')+` ${num(model.total[tier].events,0)}次 / ${model.total[tier].markers}点`;
+    }
+    q('tier-range-label').textContent=`${names(state.view)} · ${w.date.slice(0,5)} ${time(w.start_ms+model.begin*30000)}—${time(w.start_ms+model.end*30000)} · 当前视窗 ${model.rows.length} 根`;
+    q('tier-step-label').textContent=`${state.step} / 60 根`;
+    stepInput.value=String(state.step);updatePlayback();
+    const lastMarks=model.marks.filter(m=>m.barIndex===model.end-1);
+    detail.textContent=lastMarks.length?lastMarks.map(m=>`${m.tier==='large'?'大额':'异常'}${m.side?'买':'卖'} ${num(m.qty,3)}币`).join(' · '):'本根没有所选层级的成交标记';
+    const svg=chart.querySelector('svg'),hit=svg.querySelector('[data-chart-hit]');
+    function inspect(event,pin){
+      const box=svg.getBoundingClientRect(),px=event.clientX-box.left,py=event.clientY-box.top;
+      let nearest=null,distance=Infinity;
+      for(const mark of model.marks){
+        const d=Math.hypot(mark.x-px,mark.y-py);
+        if(d<Math.max(mark.r+6,20)&&d<distance){nearest=mark;distance=d;}
+      }
+      if(!nearest){hideTooltip();return;}
+      tooltip.textContent=detailFor(nearest);tooltip.hidden=false;
+      const rootBox=root.getBoundingClientRect(),tooltipBox=tooltip.getBoundingClientRect();
+      tooltip.style.left=Math.max(8,Math.min(event.clientX-rootBox.left+12,rootBox.width-tooltipBox.width-8))+'px';
+      tooltip.style.top=Math.max(0,event.clientY-rootBox.top-tooltipBox.height-12)+'px';
+      if(pin)detail.textContent=detailFor(nearest);
+    }
+    hit.addEventListener('pointermove',e=>inspect(e,false));hit.addEventListener('pointerleave',hideTooltip);hit.addEventListener('click',e=>inspect(e,true));
+    // Animate existing markers to their new positions, never animate the first frame.
+    const reduce=window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    if(previousMarks.size&&!reduce){
+      for(const circle of svg.querySelectorAll('[data-mark-key]')){
+        const key=circle.getAttribute('data-mark-key'),old=previousMarks.get(key),mark=model.marks.find(m=>m.key===key);
+        if(old&&circle.animate&&(old.x!==mark.x||old.y!==mark.y||old.r!==mark.r)){
+          circle.style.transformOrigin=`${mark.x}px ${mark.y}px`;
+          circle.animate([{transform:`translate(${old.x-mark.x}px,${old.y-mark.y}px) scale(${old.r/mark.r})`},{transform:'translate(0,0) scale(1)'}],{duration:180,easing:'ease-out'});
+        }
+      }
+    }
+    previousMarks=new Map(model.marks.map(m=>[m.key,m]));
+    // Drop optional x ticks if real text bounds collide after font substitution.
+    let previousRight=-Infinity;
+    for(const tick of svg.querySelectorAll('[data-axis-tick="x"]')){
+      const box=tick.getBBox();if(box.x<previousRight+4)tick.remove();else previousRight=box.x+box.width;
+    }
+  }
+  function changeStep(step){stopPlayback();state.step=Math.max(1,Math.min(60,step));draw();save();}
+  viewSelect.addEventListener('change',()=>{stopPlayback();state.view=viewSelect.value;state.sample=0;state.step=60;previousMarks.clear();updateOptions();draw();save();});
+  windowSelect.addEventListener('change',()=>{stopPlayback();state.sample=Number(windowSelect.value);state.step=60;previousMarks.clear();draw();save();});
+  stepInput.addEventListener('input',()=>{stopPlayback();state.step=Number(stepInput.value);draw();});stepInput.addEventListener('change',save);
+  q('tier-prev').addEventListener('click',()=>changeStep(state.step-1));q('tier-next').addEventListener('click',()=>changeStep(state.step+1));
+  q('tier-play').addEventListener('click',()=>{
+    if(timer!==null){stopPlayback();save();return;}
+    if(state.step>=60){state.step=1;previousMarks.clear();draw();}
+    timer=setInterval(()=>{state.step++;draw();if(state.step>=60){stopPlayback();save();}},700);updatePlayback();save();
+  });
+  for(const tier of ['large','relative'])buttons[tier].addEventListener('click',()=>{state[tier]=!state[tier];draw();save();});
+  function applySaved(saved){
+    const value=saved?.privateContent;if(!value||!data.views[value.view])return;
+    stopPlayback();state={view:value.view,sample:value.sample===1?1:0,step:Math.max(1,Math.min(60,Number(value.step)||60)),large:value.large!==false,relative:value.relative!==false};
+  }
+  applySaved(window.openai?.widgetState);updateOptions();draw();
+  new ResizeObserver(()=>draw()).observe(chart);
+  window.addEventListener('openai:set_globals',event=>{if(event.detail?.globals?.widgetState){applySaved(event.detail.globals.widgetState);updateOptions();draw();}});
+  window.FlowTierPreview={buildChart,data,getModel:()=>lastModel,getState:()=>({...state})};
+})();
+</script>

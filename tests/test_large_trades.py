@@ -483,6 +483,161 @@ class AggregationTests(unittest.TestCase):
         self.assertIsNone(full[0]["large"]["share"])
 
 
+class RelativeLayerTests(unittest.TestCase):
+    def test_relative_and_original_layers_share_p99_but_never_double_count(self):
+        d = detector("aggregate", minQty=0, minNotional=10000)
+        d.update([raw(i) for i in range(3)] + [raw(3, 50), raw(4, 100, -1), raw(5, 30, price=1000)])
+        self.assertEqual([e["qty"] for e in d.event_rows()], [100])
+        self.assertEqual([e["qty"] for e in d.relative.event_rows()], [50])
+        self.assertFalse(set(d.events) & set(d.relative.events))
+        self.assertEqual(qtys(d), [1, 1, 1, 50, 100, 30], "所有有效事件仍进入同一个基线")
+        values = bars(10, count=1)
+        decorate_bars(values, [d], 10)
+        main, relative = values[0]["large"], values[0]["largeRelative"]
+        self.assertEqual((main["count"], main["sell"], main["delta"], main["cvd"]), (1, 100, -100, -100))
+        self.assertEqual((relative["count"], relative["buy"], relative["delta"], relative["cvd"]), (1, 50, 50, 50))
+        self.assertIsNone(detector().relative, "期货不新增相对异常层")
+        no_floor = detector("trade", minQty=0, minNotional=0)
+        no_floor.update([raw(i) for i in range(3)] + [raw(3, 50)])
+        self.assertFalse(no_floor.relative.events)
+
+    def test_merged_event_promotes_from_hollow_to_original_without_changing_baseline(self):
+        d = detector("trade", minQty=0, minNotional=10000)
+        ms = BASE // 1_000_000
+        for i in range(1, 5):
+            d.trade(i, 100, 1, ms+i, False)
+        d.trade(5, 100, 60, ms+5, False)
+        self.assertEqual(list(d.relative.events), [5])
+        self.assertEqual(len(d.relative.event_rows()), 1)  # 先建缓存, 再跨过金额线。
+        d.trade(6, 100, 40, ms+5, False)
+        self.assertEqual(list(d.events), [5])
+        self.assertEqual(d.events[5]["qty"], 100)
+        self.assertEqual(d.relative.event_rows(), [])
+        self.assertEqual(qtys(d), [1, 1, 1, 1, 100])
+        d.trade(6, 100, 40, ms+5, False)
+        self.assertEqual(d.events[5]["qty"], 100, "重复推送不重复累计")
+
+    def test_revised_event_replays_both_layers_and_preserves_earlier_results(self):
+        rows = [raw(i) for i in range(4)] + [raw(4, 150), raw(5, 160)]
+        d = detector("trade", minQty=0, minNotional=10000)
+        d.update(rows)
+        d.update([raw(4, 50)])
+        fresh = detector("trade", minQty=0, minNotional=10000)
+        fresh.update(rows[:4] + [raw(4, 50), rows[5]])
+        self.assertEqual(d.events, fresh.events)
+        self.assertEqual(d.relative.events, fresh.relative.events)
+        self.assertEqual(list(d.relative.events), [BASE+4*NS])
+        d.update([raw(4, 1)])
+        self.assertFalse(d.relative.events, "撤回后空心标记不能残留")
+
+    def test_each_venue_and_timeframe_aggregate_layers_independently(self):
+        sources = [detector("aggregate", minQty=0, minNotional=10000), detector("trade", minQty=0, minNotional=10000)]
+        for d in sources:
+            d.update([raw(i) for i in range(-5, 32)])
+            d.update([raw(10, 60), raw(20, 120, -1)])
+        small, big = bars(10), bars(30, count=1)
+        decorate_bars(small, sources, 10)
+        decorate_bars(big, sources, 30)
+        for field in ("large", "largeRelative"):
+            s = big[0][field]
+            self.assertEqual(s["coverage"], "complete")
+            self.assertEqual(sum(b[field]["count"] for b in small), s["count"])
+            self.assertEqual(sum(b[field].get("delta", 0) for b in small), s["delta"])
+            self.assertEqual(small[-1][field]["cvd"], s["cvd"])
+        empty = next(b["largeRelative"] for b in small if not b["largeRelative"]["count"])
+        self.assertEqual(empty, {"count": 0, "coverage": "complete", "cvd": empty["cvd"]}, "空心层没事件的根只给次数、覆盖和 CVD")
+        self.assertIsNotNone(empty["cvd"])
+        self.assertIn("delta", next(b["large"] for b in small if not b["large"]["count"]), "原大单层照旧给全")
+        self.assertEqual((big[0]["large"]["buy"], big[0]["large"]["sell"]), (0, 240))
+        self.assertEqual(big[0]["largeRelative"]["buy"], 120, "两所各6000 USDT仍是空心, 相加后不能升层")
+        decorate_bars(big, [sources[0], detector("trade")], 30)
+        self.assertEqual(big[0]["largeRelative"]["coverage"], "partial")
+        self.assertIsNone(big[0]["largeRelative"]["share"])
+
+    def test_each_layer_has_its_own_retention_coverage_and_cvd(self):
+        d = detector("trade", minQty=0, minNotional=10000)
+        d.update([raw(i) for i in range(-5, 120)])
+        event = lambda t, qty: {"ns": BASE+t*NS, "price": 100, "qty": qty, "side": 1, "ratio": 20, "z": None, "threshold": 1}
+        with patch("large_trades.EVENT_CAP", 2):
+            d.absorb({t: event(t, 100) for t in (10, 20, 40)}, [],
+                     {t: event(t, 50) for t in (30, 50, 60)}, [])
+        self.assertEqual(sorted(d.events), [20, 40])
+        self.assertEqual(sorted(d.relative.events), [50, 60])
+        self.assertEqual((d.base_delta, d.relative.base_delta), (100, 50))
+        self.assertEqual(d.spans()[0][0], BASE+10*NS+1)
+        self.assertEqual(d.relative.spans()[0][0], BASE+30*NS+1)
+        values = bars(30, count=4)
+        decorate_bars(values, [d], 30)
+        self.assertEqual(values[0]["large"]["count"], 1)
+        self.assertEqual(values[0]["largeRelative"]["count"], 0)
+        self.assertEqual(values[-1]["large"]["cvd"], 300)
+        self.assertEqual(values[-1]["largeRelative"]["cvd"], 150)
+
+    def test_backfill_carries_both_layers_and_is_idempotent_without_touching_live_baseline(self):
+        ms = BASE // 1_000_000
+        history = [(i, 100, 50 if i == 250 else 150 if i == 280 else 1, ms+i*1000, False) for i in range(300)]
+        with patch.dict(os.environ, {"LARGE_TRADE_SETTINGS": "{}"}):
+            result = judge_history("TEST.X", "trade", history, include_relative=True)
+        events, spans, relative, relative_spans = result
+        self.assertEqual(list(events), [280])
+        self.assertEqual(list(relative), [250])
+        d = detector("trade", minQty=0, minNotional=10000)
+        d.update([raw(i) for i in range(400, 410)])
+        original = baseline(d)
+        d.absorb(*result)
+        first = (dict(d.events), dict(d.relative.events), d.spans(), d.relative.spans())
+        d.absorb(*result)
+        self.assertEqual((d.events, d.relative.events, d.spans(), d.relative.spans()), first)
+        self.assertEqual(baseline(d), original)
+        self.assertEqual(d.relative.spans()[0], relative_spans[0])
+        d.absorb({}, [], {280: {**events[280], "qty": 20}}, [])
+        self.assertEqual(d.events, events, "缺口边缘的不完整空心事件不能撤掉已确认原大单")
+        self.assertNotIn(280, d.relative.events)
+
+    def test_absorb_keeps_the_more_complete_merge_of_the_same_trade(self):
+        d = detector("trade", minQty=0, minNotional=10000)
+        ms = BASE // 1_000_000
+        for i in range(1, 5):
+            d.trade(i, 100, 1, ms+i, False)
+        d.trade(5, 100, 40, ms+5, False)
+        d.trade(6, 100, 20, ms+5, False)             # 同毫秒合并成 60 币, 仍不足金额线
+        full = dict(d.relative.events[5])
+        self.assertEqual(full["qty"], 60)
+        d.absorb({}, [], {5: {**full, "qty": 20}}, [])
+        self.assertEqual(d.relative.events[5], full, "只拿到一部分的补判不能把实时合并的量改小")
+        values = bars(30, count=1)
+        decorate_bars(values, [d], 30)
+        self.assertEqual((values[0]["largeRelative"]["buy"], values[0]["largeRelative"]["cvd"]), (60, 60))
+        d.absorb({5: {**full, "qty": 120}}, [], {}, [])
+        self.assertEqual((d.events[5]["qty"], d.relative.events), (120, {}), "合并得更全、跨过金额线的升为原大单")
+
+    def test_absorb_skips_results_older_than_either_layer_has_dropped(self):
+        d = detector("trade", minQty=0, minNotional=10000)
+        d.update([raw(i) for i in range(-5, 120)])
+        event = lambda t, qty: {"ns": BASE+t*NS, "price": 100, "qty": qty, "side": 1, "ratio": 20, "z": None, "threshold": 1}
+        with patch("large_trades.EVENT_CAP", 2):
+            d.absorb({t: event(t, 100) for t in (10, 20, 40)}, [], {}, [])
+            self.assertEqual((sorted(d.events), d.base_delta, d._events_floor), ([20, 40], 100, BASE+10*NS))
+            # 10 号已丢弃、净量折进原大单 CVD 起点; 重试时同一笔被判成空心, 不能再进空心层重复计
+            d.absorb({}, [], {10: event(10, 100), 15: event(15, 50)}, [(BASE, BASE+30*NS)])
+        self.assertEqual(sorted(d.relative.events), [15])
+        self.assertEqual(d.relative.base_delta, 0)
+        self.assertEqual(d.relative._history, [(BASE+10*NS+1, BASE+30*NS)], "丢弃时刻以前不再算空心层已覆盖")
+        version = d.version
+        d.absorb({10: event(10, 100)}, [(BASE, BASE+10*NS)])
+        self.assertEqual((sorted(d.events), d.base_delta, d.version), ([20, 40], 100, version), "原大单层也不重复并入")
+
+    def test_absorb_without_relative_results_leaves_the_hollow_coverage_alone(self):
+        d = detector("trade", minQty=0, minNotional=10000)
+        span = [(BASE, BASE+10*NS)]
+        d.absorb({}, span)
+        self.assertEqual((d.spans(), d.relative.spans()), (span, []), "这次没判空心层, 不能显示成已覆盖、零异常")
+        d.absorb({}, span, None, [(BASE, BASE+5*NS)])
+        self.assertEqual(d.relative.spans(), [(BASE, BASE+5*NS)], "只给空心区间也要并入")
+        d.absorb({}, [(BASE+20*NS, BASE+30*NS)], {}, None)
+        self.assertEqual(d.relative.spans(), [(BASE, BASE+5*NS), (BASE+20*NS, BASE+30*NS)], "只给空心事件时区间同原大单")
+
+
 class FeedIntegrationTests(unittest.TestCase):
     def test_futures_native_periods_and_rollup_share_detector_and_publish_revisions(self):
         import ingest
@@ -575,6 +730,23 @@ class FeedIntegrationTests(unittest.TestCase):
         self.assertEqual(detector.events, {7: event})
         self.assertEqual(detector.spans(), [(BASE - NS, BASE + NS)])
         self.assertIn(instrument.symbol, manager._dirty)
+
+        relative = {**event, "qty": 1, "ns": BASE+NS}
+        results.put(("large", instrument.symbol, {}, [], {9: relative}, [(BASE, BASE+2*NS)]))
+        manager._apply_results(0.0)
+        self.assertEqual(detector.relative.events, {9: relative})
+        self.assertEqual(detector.relative.spans(), [(BASE, BASE+2*NS)])
+        feed = manager.feeds[(instrument.symbol, 30)]
+        frame = pd.DataFrame(bars(30, count=1))
+        first, _ = feed._snapshot_message(0, frame, {}, 1, 0)
+        other, _ = feed._snapshot_message(5, frame, {}, 1, 0)
+        self.assertIs(first["bars"][0]["largeRelative"], other["bars"][0]["largeRelative"])
+        self.assertEqual(first["bars"][0]["largeRelative"]["count"], 1)
+        detector.absorb({9: {**relative, "qty": 120}}, [], {}, [])
+        revised, message = feed._snapshot_message(0, frame, {0: first}, 2, 0)
+        self.assertEqual(first["bars"][0]["largeRelative"]["count"], 1, "缓存不能就地修改旧快照")
+        self.assertEqual(revised["bars"][0]["largeRelative"]["count"], 0)
+        self.assertEqual(message["bars"][0]["largeRelative"]["count"], 0)
 
 
 if __name__ == "__main__":

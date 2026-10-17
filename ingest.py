@@ -428,11 +428,13 @@ class Feed:
         key = (tuple(sources), tuple(d.version for d in sources),
                tuple((r["time"], r.get("volume")) for r in recs))
         if self._large_cache is not None and self._large_cache[0] == key:
-            for rec, summary in zip(recs, self._large_cache[1]):
+            for rec, (summary, relative) in zip(recs, self._large_cache[1]):
                 rec["large"] = summary
+                if relative is not None:
+                    rec["largeRelative"] = relative
             return
         decorate_bars(recs, sources, self.tf)
-        self._large_cache = (key, [rec.get("large") for rec in recs])
+        self._large_cache = (key, [(rec.get("large"), rec.get("largeRelative")) for rec in recs])
 
     def _publish(self, ltf, bars, previous, revision):
         """合并历史、落盘、算 CVD, 返回 (该粒度的快照, 有变化时的增量消息或 None)。"""

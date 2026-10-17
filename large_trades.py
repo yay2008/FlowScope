@@ -4,8 +4,8 @@
 (一张吃单扫多档、吃多个挂单时交易所会拆成多条)。只保留本次采集(含回填补判)的检测结果,
 不从 OHLCV/买卖量历史反推大额事件。不同图表周期应共用一个 Detector。
 
-判定: 金额达到该品种的门槛(主条件, 各品种初始值见 large_trade_defaults.py), 且超过基线事件量的 P99
-(相对条件, 防止放量时满屏都是大单)。基线是最近 10 分钟交易时间的事件, 但不含最近 30 秒: 一阵密集大单
+判定: 金额达到该品种的门槛(主条件, 各品种初始值见 large_trade_defaults.py), 且超过基线事件量的 P99。
+加密另存超过 P99、但不足金额门槛的相对异常, 不混入原大单统计。基线是最近 10 分钟交易时间的事件, 但不含最近 30 秒: 一阵密集大单
 都和放量前的水平比, 不会被自己抬高的门槛压掉; 放量持续下去门槛照样跟上。相对均量的倍数与 Z 只供查看
 (实测超过 P99 的事件都远高于均量 1.5 倍, 原来的倍数条件从没挡掉过事件, 已去掉)。
 """
@@ -118,32 +118,87 @@ def _scan(entries, spans, open_span):
     return spans, open_span
 
 
-class LargeTradeDetector:
+def _merge_spans(live, history, floor):
+    merged = []
+    for lo, hi in sorted([*live, *history]):
+        if floor is not None:
+            if hi <= floor:
+                continue
+            lo = max(lo, floor + 1)
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(lo, hi) for lo, hi in merged]
+
+
+class _EventLayer:
+    """一层大额事件: 事件、CVD 起点(已丢弃事件的净量)、覆盖起点与回填补判的区间, 按事件数各自裁剪。
+    检测器本身就是原大单层, detector.relative 是加密另存的空心层(超过 P99 但不足金额线);
+    两层共用检测器的判定与实时覆盖, 各自保留事件, 空心层不会挤掉原大单。"""
+
+    def __init__(self, detector):
+        self.detector, self.source = detector, detector.source
+        self.events = {}       # key -> 已筛选事件; 不随图表窗口移动清零
+        self.base_delta = 0.0
+        self.since = None
+        self._history = []     # 回填补判来的区间
+        self._events_floor = None   # 已丢弃的最新一个事件的时刻
+        self._cache = self._spans = None
+
+    def event_rows(self):
+        if self._cache is None:
+            self._cache = sorted(self.events.values(), key=lambda e: e["ns"])
+        return self._cache
+
+    def collected(self):
+        """有原始记录(含预热)的时间段 (起, 止), 没有时 None。事件丢弃过的部分不算。"""
+        return self.detector._collected(self.since, self._events_floor)
+
+    def spans(self):
+        """已判定数据覆盖的时间段 [(起, 止)], 按时间排序: 当前原始记录(见 _scan)接在已裁掉部分之后,
+        再并上回填补判的区间; 相接的合并, 事件已丢弃的部分去掉。"""
+        if self._spans is None:
+            self._spans = _merge_spans(self.detector._live_coverage(), self._history, self._events_floor)
+        return self._spans
+
+    def _trim(self):
+        """事件太多时丢掉最早的(按时间), 其净量折进 CVD 起点; 那以前的 K 线不再算作已覆盖。"""
+        if len(self.events) <= EVENT_CAP + EVENT_CAP // 20:   # 攒一点再裁, 不必每来一个事件就排序
+            return
+        ordered = sorted(self.events.items(), key=lambda item: item[1]["ns"])
+        for key, event in ordered[:-EVENT_CAP]:
+            del self.events[key]
+            self.base_delta += event["qty"] * event["side"]
+            self._events_floor = event["ns"] if self._events_floor is None else max(self._events_floor, event["ns"])
+        self._cache = self._spans = None
+
+
+class LargeTradeDetector(_EventLayer):
     def __init__(self, symbol, source="snapshot", settings=None):
         self.symbol, self.source = symbol, source
+        super().__init__(self)
         self.settings = _settings_or_default(symbol, source) if settings is None else settings
         # key -> (时间ns, 价格, 量, 方向, 重置基线, 可用, 与上一条之间没丢数据)
         self.raw = {}
-        self.events = {}       # key -> 已筛选事件; 不随图表窗口移动清零
         self.readiness = {}    # key -> (时间ns, 已判定, 与上一条之间没丢数据); 随 raw 裁剪
-        self.base_delta = 0.0
-        self.since = None
         self.version = 0       # 每次有记录变化加一, 供按版本复用汇总结果
         # 每手对应的标的数量: 加密的量已是币, 期货等报价里的合约乘数(Feed 拿到后设置)
         self.multiplier = None if source == "snapshot" else 1.0
         self._last_crypto = None
         self._run = None        # 加密: 正在合并的事件 (key, 时间ns, 方向)
-        self._cache = None
         self._window = deque()  # 基线 (交易时钟, 量)
         self._lagged = deque()  # 还在滞后期里的 (交易时钟, 量), 到期才进基线
         self._sorted = []
         self._sum = self._sum2 = 0.0
         self._clock, self._last_ns = 0, None
-        self._spans = None
-        # 已裁掉的原始记录留下的覆盖区间与扫描状态; 回填补判来的区间; 已丢弃的最新一个事件的时刻
+        # 已裁掉的原始记录留下的覆盖区间与扫描状态; 实时覆盖(两层共用)
         self._archived, self._archived_open = [], False
-        self._history = []
-        self._events_floor = None
+        self._live_spans = None
+        self.relative = _EventLayer(self) if source != "snapshot" else None
+
+    def _layers(self):
+        return (self,) if self.relative is None else (self, self.relative)
 
     def config(self):
         return {**self.settings, "source": self.source, "label": SOURCE_LABELS[self.source],
@@ -214,21 +269,20 @@ class LargeTradeDetector:
         floor = self.settings["minNotional"]
         # 合约乘数未知时不能判断金额门槛, 宁可不报。
         rich = floor <= 0 or (self.multiplier is not None and price * qty * self.multiplier >= floor)
-        if qty > threshold and qty >= self.settings["minQty"] and rich:
-            self.events[key] = {"ns": ns, "price": price, "qty": qty, "side": side,
-                                "ratio": ratio, "z": z, "threshold": threshold}
-            self._cache = None
+        # 合并事件可能从空心层跨过金额线进入原大单层; 两层始终互斥。
+        for layer in self._layers():
+            if layer.events.pop(key, None) is not None:
+                layer._cache = None
+        if qty > threshold and qty >= self.settings["minQty"]:
+            layer = self if rich else self.relative
+            if layer is not None:
+                layer.events[key] = {"ns": ns, "price": price, "qty": qty, "side": side,
+                                     "ratio": ratio, "z": z, "threshold": threshold}
+                layer._cache = None
 
     def _trim_events(self):
-        """事件太多时丢掉最早的(按时间), 其净量折进 CVD 起点; 那以前的 K 线不再算作已覆盖。"""
-        if len(self.events) <= EVENT_CAP + EVENT_CAP // 20:   # 攒一点再裁, 不必每来一个事件就排序
-            return
-        ordered = sorted(self.events.items(), key=lambda item: item[1]["ns"])
-        for key, event in ordered[:-EVENT_CAP]:
-            del self.events[key]
-            self.base_delta += event["qty"] * event["side"]
-            self._events_floor = event["ns"] if self._events_floor is None else max(self._events_floor, event["ns"])
-        self._cache = self._spans = None
+        for layer in self._layers():
+            layer._trim()
 
     def update(self, rows):
         """已按 key 排序的原始记录。重复不计, 修订从该记录起重放, 保留此前的统计基线。"""
@@ -241,8 +295,7 @@ class LargeTradeDetector:
         old_last = next(reversed(self.raw)) if self.raw else None
         earliest = min(key for key, _ in changes)
         self.raw.update(changes)
-        if self.since is None:
-            self.since = min(row[0] for _, row in changes)
+        self._begin(min(row[0] for _, row in changes))
         replay = old_last is not None and earliest <= old_last
         if replay:
             self.raw = dict(sorted(self.raw.items()))
@@ -253,8 +306,9 @@ class LargeTradeDetector:
                 if key >= earliest:
                     break
                 self._process(key, row, judge=False)
-            self.events = {key: value for key, value in self.events.items() if key < earliest}
-            self._cache = None
+            for layer in self._layers():
+                layer.events = {key: value for key, value in layer.events.items() if key < earliest}
+                layer._cache = None
         tail = ((key, row) for key, row in self.raw.items() if key >= earliest) if replay else changes
         for key, row in tail:
             self._process(key, row)
@@ -263,10 +317,15 @@ class LargeTradeDetector:
     def _append(self, key, row):
         """update 的快速路径: key 比已有的都大(加密成交编号只增不减), 不必查重、不会重放。"""
         self.raw[key] = row
-        if self.since is None:
-            self.since = row[0]
+        self._begin(row[0])
         self._process(key, row)
         self._settle()
+
+    def _begin(self, ns):
+        """本次采集的第一条记录: 两层的覆盖起点都从这里算。"""
+        for layer in self._layers():
+            if layer.since is None:
+                layer.since = ns
 
     def _settle(self):
         # 原始记录要能在修订重放时重建当前基线, 另外多留一段; 再早的只留下覆盖区间。攒够一批再裁。
@@ -278,7 +337,9 @@ class LargeTradeDetector:
             self.raw = {key: self.raw[key] for key in keys[-limit:]}
             self.readiness = {key: self.readiness[key] for key in keys[-limit:]}
         self._trim_events()
-        self._spans = None
+        self._live_spans = None
+        for layer in self._layers():
+            layer._spans = None
         self.version += 1
 
     def sync_futures(self, frame, changed_ns=None, initial=False):
@@ -350,69 +411,91 @@ class LargeTradeDetector:
             self._judge(key, ns, vwap, total, side)
         self.version += 1
 
-    def absorb(self, events, spans):
+    def absorb(self, events, spans, relative_events=None, relative_spans=None):
         """并入回填补判的结果: 洞里(本次运行开始前或断线期间)的事件 {成交编号: 事件} 与已判定区间。
-        它们只参与展示和 CVD, 不动实时基线。"""
-        if not events and not spans:
+        它们只参与展示和 CVD, 不动实时基线。
+
+        加密另带空心层的事件与区间; 两个都不给表示这次没判空心层, 它的覆盖不变, 只给事件时区间同原大单。
+        同一编号以量大的为准(合并得更全: 缺口边缘、重试时可能只拿到合并事件的一部分), 放进它判在的那层,
+        两层始终互斥。早于任一层已丢弃事件时刻的不再并入: 那以前的净量已折进 CVD 起点, 再并就重复计。"""
+        layers = self._layers()
+        batches = [(self, events, spans)]
+        if self.relative is not None and (relative_events is not None or relative_spans is not None):
+            batches.append((self.relative, relative_events or {}, spans if relative_spans is None else relative_spans))
+        floors = [layer._events_floor for layer in layers if layer._events_floor is not None]
+        floor = max(floors) if floors else None
+        changed = False
+        for target, batch, covered in batches:
+            if floor is not None:
+                batch = {key: event for key, event in batch.items() if event["ns"] > floor}
+                covered = [(max(lo, floor + 1), hi) for lo, hi in covered if hi > floor]
+            if not batch and not covered:
+                continue
+            for key, event in batch.items():
+                current = next((layer.events[key] for layer in layers if key in layer.events), None)
+                if current is not None and current["qty"] > event["qty"]:
+                    continue
+                for layer in layers:
+                    layer.events.pop(key, None)
+                target.events[key] = event
+            target._history = sorted([*target._history, *(tuple(span) for span in covered)])
+            starts = [lo for lo, _ in covered] + [event["ns"] for event in batch.values()]
+            target.since = min(starts) if target.since is None else min(target.since, *starts)
+            changed = True
+        if not changed:
             return
-        self.events.update(events)
-        self._history = sorted([*self._history, *(tuple(span) for span in spans)])
-        starts = [lo for lo, _ in spans] + [event["ns"] for event in events.values()]
-        self.since = min(starts) if self.since is None else min(self.since, *starts)
+        for layer in layers:
+            layer._cache = layer._spans = None
         self._trim_events()
-        self._cache = self._spans = None
         self.version += 1
 
-    def event_rows(self):
-        if self._cache is None:
-            self._cache = sorted(self.events.values(), key=lambda e: e["ns"])
-        return self._cache
-
-    def collected(self):
-        """有原始记录(含预热)的时间段 (起, 止), 没有时 None。事件丢弃过的部分不算。"""
-        if self.since is None or not self.raw:
+    def _collected(self, since, floor):
+        if since is None or not self.raw:
             return None
-        start = self.since if self._events_floor is None else max(self.since, self._events_floor + 1)
+        start = since if floor is None else max(since, floor + 1)
         return start, next(reversed(self.raw.values()))[0]
 
-    def spans(self):
-        """已判定数据覆盖的时间段 [(起, 止)], 按时间排序: 当前原始记录(见 _scan)接在已裁掉部分之后,
-        再并上回填补判的区间; 相接的合并, 事件已丢弃的部分去掉。"""
-        if self._spans is None:
+    def _live_coverage(self):
+        """实时采集(含已裁掉的原始记录)覆盖的时间段, 两层共用。"""
+        if self._live_spans is None:
             live, _ = _scan((self.readiness[key] for key in sorted(self.readiness)),
                             [list(span) for span in self._archived], self._archived_open)
-            merged = []
-            for lo, hi in sorted([*(tuple(span) for span in live), *self._history]):
-                if self._events_floor is not None:
-                    if hi <= self._events_floor:
-                        continue
-                    lo = max(lo, self._events_floor + 1)
-                if merged and lo <= merged[-1][1] + 1:
-                    merged[-1][1] = max(merged[-1][1], hi)
-                else:
-                    merged.append([lo, hi])
-            self._spans = [(lo, hi) for lo, hi in merged]
-        return self._spans
+            self._live_spans = [(lo, hi) for lo, hi in live]
+        return self._live_spans
 
 
-def judge_history(symbol, source, trades):
+def judge_history(symbol, source, trades, *, include_relative=False):
     """回填线程用: 按编号顺序把一段历史成交 (编号, 价, 量, 毫秒, 是否主动卖) 过一遍独立的检测器
-    (编号接不上处重新预热), 返回可交给 absorb 的 (事件, 覆盖区间)。"""
+    (编号接不上处重新预热), 返回可交给 absorb 的 (事件, 覆盖区间)。
+    include_relative=True 时另外返回 (相对异常事件, 相对异常覆盖区间)。"""
     detector = LargeTradeDetector(symbol, source)
     for identity, price, qty, ms, sell in trades:
         detector.trade(identity, price, qty, ms, sell)
-    return dict(detector.events), detector.spans()
+    result = (dict(detector.events), detector.spans())
+    if include_relative:
+        relative = detector.relative
+        # 两层独立裁剪, 回填时也保留各自真正覆盖的区间。
+        return (*result, dict(relative.events) if relative else {}, relative.spans() if relative else [])
+    return result
 
 
 def decorate_bars(bars, detectors, tf):
-    """向行情 JSON 附加独立的原始成交统计, 不受 FlowMeter 买卖口径影响。
+    """向行情 JSON 附加独立的原始成交统计, 不受 FlowMeter 买卖口径影响: 原大单进 large, 加密空心层进 largeRelative。
 
-    K 线、事件与覆盖区间都按时间排序, 每个数据源用指针各扫一遍。
+    K 线、事件与覆盖区间都按时间排序, 每个数据源用指针各扫一遍。空心层没有事件的根只给
+    {count: 0, coverage, cvd}, 省掉一串零(前端读明细前补齐, 见 FlowLargeTrades.relativeOf)。
     """
     if not bars:
         return
     starts = [int(b["time"]) * NS for b in bars]
     ends = [min(t + tf * NS, starts[i+1] if i+1 < len(starts) else t + tf*NS) for i,t in enumerate(starts)]
+    _decorate_layer(bars, detectors, starts, ends, "large")
+    relative = [d.relative for d in detectors if d.relative is not None]
+    if relative:
+        _decorate_layer(bars, relative, starts, ends, "largeRelative", compact=True)
+
+
+def _decorate_layer(bars, detectors, starts, ends, field, compact=False):
     summaries = [{"buy": 0.0, "sell": 0.0, "unknown": 0.0, "count": 0, "maxQty": 0.0,
                   "maxRatio": 0.0, "maxZ": None, "cvd": 0.0} for _ in bars]
     coverage = [[] for _ in bars]
@@ -471,4 +554,4 @@ def decorate_bars(bars, detectors, tf):
         # 未采集/预热不是零成交, 累计值也不应在这些区间画成确定读数。
         if quality in {"missing", "warming"}:
             s["cvd"] = None
-        bar["large"] = s
+        bar[field] = {"count": 0, "coverage": quality, "cvd": s["cvd"]} if compact and not s["count"] else s

@@ -112,10 +112,17 @@ let stubCharts = [];
 // 模拟交易叠加画到图上的价格线(两张图合在一起)
 let createdPriceLines = [];
 
+// 成交标记插件挂到 series 上的图元: 和库一样有标记时才给边距(库按 bar 间距算, 这里固定, 测试可改)
+class SeriesMarkersPrimitive {
+  markers = [];
+  margins = { above: 40, below: 40 };
+  autoscaleInfo() { return this.markers.length ? { priceRange: null, margins: { ...this.margins } } : null; }
+}
+
 function createChartStub() {
   // paneElement: 主图窗格的 DOM, 默认没有(和库画出第一帧之前一样); 划线测试自己摆一个
   const record = { applied: [], series: [], markers: [], crosshair: [], crosshairHandlers: [], primitives: [],
-                   stretch: [], paneElement: null };
+                   stretch: [], paneElement: null, paneHeight: 300 };
   stubCharts.push(record);
   // addSeries(类型, 选项, 窗格) / addCustomSeries(自定义视图, 选项, 窗格)
   const series = (type, seriesOptions = {}, pane = 0) => {
@@ -126,7 +133,10 @@ function createChartStub() {
       setData(data) { entry.data = data; }, update() {}, setMarkers() {},
       applyOptions(options) { record.applied.push(options); entry.applied.push(options); },
       createPriceLine(options) { createdPriceLines.push(options); return { applyOptions() {} }; }, removePriceLine() {},
-      priceScale() { return { applyOptions(options) { entry.scale.push(options); } }; },
+      priceScale() {
+        return { applyOptions(options) { entry.scale.push(options); },
+                 options: () => ({ scaleMargins: { top: 0.2, bottom: 0.1 }, ...Object.assign({}, ...entry.scale) }) };
+      },
       setVisibleRange() {}, coordinateToPrice(y) { return 4000 + y; }, priceToCoordinate() { return 0; },
       attachPrimitive(primitive) { record.primitives.push(primitive); }, detachPrimitive() {},
     };
@@ -152,7 +162,7 @@ function createChartStub() {
     priceScale: () => ({ applyOptions() {}, width: () => 60 }),
     panes: () => Array.from({ length: 4 }, (_, index) => ({
       setHeight() {}, setStretchFactor(factor) { record.stretch.push([index, factor]); }, paneIndex: () => index,
-      getHTMLElement: () => (index === 0 ? record.paneElement : null),
+      getHTMLElement: () => (index === 0 ? record.paneElement : null), getHeight: () => record.paneHeight,
     })),
     subscribeClick() {}, unsubscribeClick() {},
     subscribeCrosshairMove(fn) { record.crosshairHandlers.push(fn); },
@@ -259,7 +269,11 @@ function runBrowser(options = {}) {
       CandlestickSeries: "CandlestickSeries",
       LineSeries: "LineSeries",
       HistogramSeries: "HistogramSeries",
-      createSeriesMarkers: (series) => ({ setMarkers(markers) { series._record.markers.push(markers); } }),
+      createSeriesMarkers: (series) => {
+        const primitive = new SeriesMarkersPrimitive();
+        series.attachPrimitive(primitive);
+        return { setMarkers(markers) { primitive.markers = markers; series._record.markers.push(markers); } };
+      },
     },
   };
   context.window = context;
@@ -1028,6 +1042,126 @@ test("大额成交: WebSocket 更新时两侧各自变大小, 对冲仍保留两
   assert.equal(tooltip.hidden, true, "光标没动、圆点随行情消失: 不等重绘就收起明细");
 });
 
+test("加密两层: HTTP、WS和修订共用显示强弱, 当前根不影响过去, 空心升级不双计且统计完整", async () => {
+  const symbol = "AGG.ZEC", bars = obBars();
+  const full = (buy, sell, coverage = "complete") => ({ buy, sell, count: (buy > 0) + (sell > 0),
+    unknown: 0, delta: buy - sell, cvd: 999, maxQty: Math.max(buy, sell), maxRatio: 10, maxZ: 5, share: .2, coverage });
+  bars.forEach((b, i) => { b.large = full(i + 1, (i + 1) * 2); b.largeRelative = full(0, 0); });
+  bars[109].large = full(10, 80, "partial");
+  bars[109].largeRelative = full(25, 15, "partial");
+  const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50, volumeDigits: 3,
+    colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] },
+    largeTrades: [{ symbol: "BINANCE.ZECUSDT.P", source: "aggregate", minNotional: 38000, minQty: 0,
+      quantile: .99, windowSec: 600, lagSec: 30, warmup: 200, label: "交易所聚合成交" },
+      { symbol: "OKX.ZEC-USDT-SWAP", source: "trade", minNotional: 31000, minQty: 0,
+        quantile: .99, windowSec: 600, lagSec: 30, warmup: 200, label: "交易所逐笔" }] };
+  const sockets = [];
+  const context = runBrowser({ search: "?symbol=" + symbol, fetch: url => String(url).startsWith("/api/history")
+    ? Promise.resolve(jsonResponse({ symbol, cfg, bars, ltf: 0 })) : stubFetch(url) });
+  context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
+  await new Promise(resolve => setImmediate(resolve));
+  const p = stubCharts[1].primitives.find(item => item.constructor.name === "Primitive");
+  stubCharts[1].timeScale.setVisibleLogicalRange({ from: 90, to: 110 });
+  const latest = () => p.geometry().filter(m => m.bar.time === bars[109].time);
+  const first = latest();
+  assert.equal(first.length, 4);
+  assert(first.filter(m => m.tier === "large").every(m => !m.style.highlighted));
+  assert(first.filter(m => m.tier === "relative").every(m => m.style === null), "空心层不参与亮度");
+  assert(first.every(m => m.tier !== "large" || m.strength.samples === 109));
+  // 矮窗格(60px, 库默认 scaleMargins 上 20% 下 10%)里按库的映射量: 可见区 90~109 每个圆点外沿都不出窗格。
+  // 90~99 根的低点就是可见区最低价, 下方要留; 109 根带空心点但离两头极值都远, 不该把边距撑到它的外沿那么大
+  stubCharts[1].paneHeight = 60;
+  const visible = bars.slice(90, 110), top = Math.max(...visible.map(b => b.high)), bottom = Math.min(...visible.map(b => b.low));
+  const inside = (m) => p.geometry().filter(mark => mark.bar.time >= bars[90].time).every(mark => {
+    const perPrice = (60 * (1 - .2 - .1) - m.above - m.below) / (top - bottom), extent = mark.offset + mark.r + 2;
+    return mark.side === "buy" ? 6 + m.below + (mark.bar.low - bottom) * perPrice >= extent - 1e-9
+      : 12 + m.above + (top - mark.bar.high) * perPrice >= extent - 1e-9;
+  });
+  const margins = p.autoscaleInfo(90, 109).margins;
+  assert(inside(margins), "自动价格轴为外侧圆点保留空间, 不在极值处切掉标记");
+  assert(margins.below > 0 && !inside({ ...margins, below: margins.below - 1 }), "只留刚好够的");
+  const outer = Math.max(...first.map(m => m.offset + m.r + 2));
+  assert(margins.above < outer - 12 && margins.below < outer - 6, "中间那根的空心点不占边距");
+  // 库对同一 series 只认最后一个给出边距的图元(5.2.1), 按挂上的先后合并
+  const seriesMargins = (from, to) => stubCharts[1].primitives.reduce((m, item) => item.autoscaleInfo?.(from, to)?.margins ?? m, null);
+  const paperMarks = stubCharts[1].primitives.find(item => item.constructor.name === "SeriesMarkersPrimitive");
+  paperMarks.autoscaleInfo = () => ({ priceRange: null, margins: { above: 1, below: 20 } });   // 有 B/S 时插件要的
+  const merged = { ...seriesMargins(90, 109) };
+  assert.equal(merged.below, 20, "有 B/S 标记时不压掉 B/S 要的边距");
+  assert(merged.above >= margins.above && inside(merged), "B/S 占了边距、比例变小, 大单圆点照样放得下");
+  stubCharts[1].paneHeight = 300;
+  const read = findByClass(legendRow(context, 1, "large"), "readout large-read");
+  assert.match(read.textContent, /Δ -70 · CVD \+999 · 部分 · 空心 2次/);
+  const socket = sockets.find(s => new URL(s.url).searchParams.get("tf") === "30");
+  socket.onmessage({ data: JSON.stringify({ type: "snapshot", symbol, tf: 30, ltf: 0, revision: 0, cfg, bars }) });
+  const older = JSON.stringify(p.geometry().filter(m => m.bar.time < bars[109].time).map(m => [m.bar.time, m.side, m.strength, m.style]));
+  const send = (revision, updates) => socket.onmessage({ data: JSON.stringify({ type: "bars", symbol, tf: 30, ltf: 0, revision, bars: updates }) });
+  send(1, [{ ...bars[109], large: full(1000, 80, "partial"), largeRelative: full(0, 15, "partial") }]);
+  const next = latest();
+  assert.equal(next.length, 3, "从空心转为原大单后不能留下同侧旧空心");
+  const buy = next.find(m => m.side === "buy" && m.tier === "large");
+  assert(buy.style.highlighted);
+  assert.equal(buy.strength.samples, 109);
+  const oldSell = first.find(m => m.side === "sell" && m.tier === "large");
+  const newSell = next.find(m => m.side === "sell" && m.tier === "large");
+  assert.equal(oldSell.r, newSell.r, "末根更新不重定全图尺寸单位");
+  assert.deepEqual(oldSell.style, newSell.style, "买侧增长不改变卖侧显示");
+  assert.equal(JSON.stringify(p.geometry().filter(m => m.bar.time < bars[109].time).map(m => [m.bar.time, m.side, m.strength, m.style])), older);
+  assert.match(read.textContent, /Δ \+920 · CVD \+999/);
+  const hollow = next.find(m => m.tier === "relative");
+  stubCharts[1].crosshairHandlers.forEach(fn => fn({ time: bars[109].time, paneIndex: 0, point: hollow }));
+  const tooltip = findByClass(chartEl(context, 1), "large-tooltip");
+  assert.match(tooltip.textContent, /相对异常（空心）/);
+  assert.match(tooltip.textContent, /<38,000 USDT 且 >基线 P99/);
+  assert(tooltip.textContent.includes("买 0 / 卖 15"));
+  send(2, [{ ...bars[10], large: full(1e5, 22) }]);
+  const afterRevision = latest().find(m => m.side === "buy" && m.tier === "large");
+  assert(afterRevision.strength.rank < buy.strength.rank, "历史修订后按新历史重算, 不沿用过期缓存");
+  const readBeforeToggle = read.textContent;
+  clickEye(context, 1, "large");
+  assert.equal(p.geometry().length, 0);
+  assert.equal(p.autoscaleInfo(90, 109), null, "隐藏后不保留空白边距");
+  assert.deepEqual({ ...seriesMargins(90, 109) }, { above: 1, below: 20 }, "隐藏大单后 B/S 标记照样有边距");
+  clickEye(context, 1, "large");
+  assert.equal(latest().length, 3);
+  assert.equal(read.textContent, readBeforeToggle, "显示开关不影响读数");
+  viewSetter(context)("footprint");assert.equal(p.geometry().length, 0);
+  viewSetter(context)("candle");assert.equal(latest().length, 3);
+});
+
+test("期货也按亮度: 实心同一画法, 弱的整体变淡, 末根实时更新时重算", async () => {
+  const symbol = "KQ.m@SHFE.fu", bars = obBars();
+  const full = (buy, sell) => ({ buy, sell, count: (buy > 0) + (sell > 0), unknown: 0, delta: buy - sell, cvd: 0,
+    maxQty: Math.max(buy, sell), maxRatio: 10, maxZ: 5, share: .2, coverage: "complete" });
+  bars.forEach((b, i) => { b.large = full(i + 1, (i + 1) * 2); });
+  bars[109].large = full(5, 300);
+  const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+    colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] },
+    largeTrades: [{ symbol: "SHFE.fu2611", source: "snapshot", minNotional: 2600000, minQty: 0, multiplier: 10,
+      quantile: .99, windowSec: 1800, lagSec: 0, warmup: 200, label: "期货快照估算" }] };
+  const sockets = [];
+  const context = runBrowser({ fetch: url => String(url).startsWith("/api/history")
+    ? Promise.resolve(jsonResponse({ symbol, cfg, bars, ltf: 0 })) : stubFetch(url) });
+  context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
+  await new Promise(resolve => setImmediate(resolve));
+  const p = stubCharts[1].primitives.find(item => item.constructor.name === "Primitive");
+  stubCharts[1].timeScale.setVisibleLogicalRange({ from: 90, to: 110 });
+  const latest = (side) => p.geometry().find(m => m.bar.time === bars[109].time && m.side === side);
+  assert.equal(latest("buy").strength.samples, 109);
+  assert(!latest("buy").style.highlighted && latest("buy").style.opacity < 1, "买 5 比过去一小时都小, 淡化");
+  assert(latest("sell").style.highlighted, "卖 300 超过过去一小时, 照常显示");
+  stubCharts[1].crosshairHandlers.forEach(fn => fn({ time: bars[109].time, paneIndex: 0, point: latest("buy") }));
+  const tooltip = findByClass(chartEl(context, 1), "large-tooltip");
+  assert.match(tooltip.textContent, /实心亮度/);
+  assert.match(tooltip.textContent, /买侧 历史分位 \d/);
+  assert.doesNotMatch(tooltip.textContent, /空心|同一毫秒/);
+  const socket = sockets.find(s => new URL(s.url).searchParams.get("tf") === "30");
+  socket.onmessage({ data: JSON.stringify({ type: "snapshot", symbol, tf: 30, ltf: 0, revision: 0, cfg, bars }) });
+  socket.onmessage({ data: JSON.stringify({ type: "bars", symbol, tf: 30, ltf: 0, revision: 1,
+    bars: [{ ...bars[109], large: full(1000, 300) }] }) });
+  assert(latest("buy").style.highlighted, "末根买量涨上去后重算为照常显示");
+});
+
 test("FlowWave带 眼睛按钮: 打开后带可见, 切足迹图强制隐藏, 切回来按开关恢复", () => {
   const context = runBrowser();
   const applied = stubCharts[1].applied;
@@ -1121,8 +1255,9 @@ test("WaveTrend 已删除: 图例有大额成交、OB Zones、EMA、大周期EMA
   assert.equal(vm.runInContext("'wt' in charts[1].derived", context), false, "不再计算 WaveTrend");
   assert.ok(stubCharts[1].markers.every((list) => list.length === 0), "没有成交时 K 线上一个标记都没有");
   assert.deepEqual(stubCharts[1].primitives.map((p) => p.constructor.name),
-    ["ObZonesPrimitive", "Primitive", "SessionEndPrimitive", "SessionEndPrimitive", "MeasurePrimitive", "VolumeProfilePrimitive"],
-    "订单块、大额成交、截止标记、测量工具与成交量分布, 没有 WaveTrend 标记");
+    ["ObZonesPrimitive", "SessionEndPrimitive", "SessionEndPrimitive", "SeriesMarkersPrimitive", "Primitive",
+      "MeasurePrimitive", "VolumeProfilePrimitive"],
+    "订单块、截止标记、成交标记、大额成交(挂在成交标记之后才能合并边距)、测量工具与成交量分布, 没有 WaveTrend 标记");
 
   setView("footprint");
   assert.equal(legendOf(context, 1).hidden, true, "足迹图下主图指标全部隐藏, 图例收起");

@@ -912,6 +912,11 @@
     // 圆点尺寸单位: 整体重画(新 bar、补历史、切周期)时按本图已加载的大额量重算, 末根实时更新时不变,
     // 以免一根 K 线的变化让所有圆点跟着缩放。
     let largeMarkerUnit = null;
+    let largeStrength = [];
+    const largeStrengthMemo = new Map();   // 已收盘根的亮度(见 FlowLargeTrades.strengths), 换周期清空
+    // 每根的圆点(FlowLargeTrades.markers): 跟尺寸单位、亮度一起更新, 绘制、悬停命中和价格轴边距共用, 不每次现算
+    let largePoints = [];
+    const pointsAt = (i) => FlowLargeTrades.markers(bars[i], largeMarkerUnit, largeStrength[i]);
     const obReadout = document.createElement("span");
     obReadout.className = "readout ob-read";
     obReadout.title = "当前有效的多/空区域数量。新建信号对应最新一根 K 线, 未收盘时可能撤回。";
@@ -1023,8 +1028,7 @@
 
     const obPrimitive = new ObZonesPrimitive(obGeometry, () => obOptions);
     candleSeries.attachPrimitive(obPrimitive);
-    const largePrimitive = new FlowLargeTrades.Primitive(largeGeometry);
-    candleSeries.attachPrimitive(largePrimitive);
+    const largePrimitive = new FlowLargeTrades.Primitive(largeGeometry, largeMargins);   // 挂在成交标记插件之后, 见下
 
     // 足迹图 series (pane 0, 默认隐藏; 视图切到足迹图时显示, tickSize 由 /api/footprint 下发)
     const fpSeries = chart.addCustomSeries(new FootprintSeries(), { visible: false, tickSize: 1 }, 0);
@@ -1111,7 +1115,14 @@
     // 模拟交易叠加: 成交标记(买在下方红色「B」/ 卖在上方绿色「S」, 不画箭头)与持仓均价、止盈止损、挂单价格线, 挂在 K 线上。
     // 数据来自页面右侧交易面板的轮询, 由页面通过 setPaperState 交进来。止盈止损线、挂单线可以拖, 右键可以挂单
     // (见「划线止盈止损与挂单」)。
+    // 库对同一 series 的图元边距不逐侧取大, 只认最后一个给出边距的(5.2.1: s?.margins&&(r=s.margins))。
+    // 截下标记插件挂上的图元, 大单图元挂在它后面、由 largeMargins 与它逐侧取大; 否则一有 B/S 就把大单留的边距冲掉。
+    let paperMarkerPrimitive = null;
+    const attachPrimitive = candleSeries.attachPrimitive;
+    candleSeries.attachPrimitive = (primitive) => attachPrimitive.call(candleSeries, paperMarkerPrimitive = primitive);
     const candleMarkers = LightweightCharts.createSeriesMarkers(candleSeries, []);
+    candleSeries.attachPrimitive = attachPrimitive;
+    candleSeries.attachPrimitive(largePrimitive);
     let paperMarkerList = [];
     let candleMarkerKey = "";
     let paperState = null;
@@ -1277,6 +1288,8 @@
       renderBand();
       renderObZones();
       largeMarkerUnit = FlowLargeTrades.sizeUnit(bars, cfg?.largeTrades, bars.at(-1)?.close);
+      largeStrength = FlowLargeTrades.strengths(bars, cfg?.largeTrades, tf, largeStrengthMemo);
+      largePoints = bars.map((_, i) => pointsAt(i));
       renderLargeTrades();
       renderPaperOverlays();   // bar 集合变了(补历史/修订), 成交标记要重新对齐到 bar
       applyCandleMarkers(true);   // 所有 series 都设完了, 标记按最终时间轴重算序号(见 applyCandleMarkers)
@@ -1317,12 +1330,50 @@
       renderLw();            // 同上
       renderBand();          // 同上: 回归通道只影响末尾若干根, 但一样整体重建最省心
       renderObZones();
+      if (cfg?.largeTrades?.length) largeStrength[i] = FlowLargeTrades.strengthAt(bars, i, tf);
+      largePoints[i] = pointsAt(i);
       refreshReadout();
       refreshProfiles();     // 区间含最新一根的分布跟着变
       renderLargeTrades();
     }
 
-    // 每根 K 线买卖各画一个点：大额买在最低价下方画绿点，大额卖在最高价上方画红点，大小按该侧大额量。
+    // 主图可见区 [lo, hi] 里画着的价格范围, 和库自动缩放算的一样: K 线高低、画着的 EMA 与大周期 EMA、回归带上下轨
+    function mainPaneRange(lo, hi) {
+      let bottom = Infinity, top = -Infinity;
+      const take = (v) => { if (v != null) { bottom = Math.min(bottom, v); top = Math.max(top, v); } };
+      const lines = !derived ? [] : [...derived.emaLines.filter((_, j) => emaLineShown(j)), ...(htfEmaShown() ? derived.htfEma : [])];
+      const emaFrom = shown.emaAll ? 0 : Math.max(0, bars.length - EMA_DRAW_BARS);
+      const band = bandShown() ? derived?.band : null;
+      for (let i = lo; i <= hi; i++) {
+        take(bars[i].high);
+        take(bars[i].low);
+        if (i >= emaFrom) for (const line of lines) take(line[i]);
+        if (band) { take(band.up[i]); take(band.dn[i]); }
+      }
+      return [bottom, top];
+    }
+
+    // 价格轴给两层圆点留出像素空间, 只留真会画出窗格的那部分(见 FlowLargeTrades.axisMargins);
+    // 只读量、半径和窗格高度, 不读坐标, 避免自动缩放递归。与成交标记插件要的边距逐侧取大(见 paperMarkerPrimitive);
+    // 没有圆点时返回 null, 库沿用插件的。
+    function largeMargins(from, to) {
+      if (!shown.large || settings.view === "footprint" || !FlowLargeTrades.cryptoConfigs(cfg?.largeTrades)) return null;
+      const lo = Math.max(0, Math.floor(from)), hi = Math.min(bars.length - 1, Math.ceil(to));
+      if (lo > hi) return null;
+      const [bottom, top] = mainPaneRange(lo, hi);
+      const items = [];
+      for (let i = lo; i <= hi; i++) {
+        for (const point of largePoints[i] ?? []) {
+          const below = point.side === "buy";
+          items.push({ edge: below ? "below" : "above", gap: below ? bars[i].low - bottom : top - bars[i].high,
+            extent: point.offset + point.r + 2 });
+        }
+      }
+      return FlowLargeTrades.axisMargins(items, top - bottom, chart.panes()[0].getHeight(),
+        candleSeries.priceScale().options().scaleMargins, paperMarkerPrimitive?.autoscaleInfo?.(from, to)?.margins);
+    }
+
+    // 原大单与空心层每根、每侧各一个点; 实心位置不变, 同侧空心放在外侧。
     function largeGeometry() {
       if (!shown.large || settings.view === "footprint") return [];
       const ts = chart.timeScale();
@@ -1331,21 +1382,24 @@
       const marks = [];
       for (let i = Math.max(0, Math.floor(range.from) - 1); i <= Math.min(bars.length - 1, Math.ceil(range.to) + 1); i++) {
         const b = bars[i];
-        const sides = FlowLargeTrades.sideVolumes(b.large);
-        if (!sides.length) continue;
+        const points = largePoints[i] ?? [];
+        if (!points.length) continue;
         const x = ts.logicalToCoordinate(i);
         if (x == null) continue;
-        for (const [side, qty] of sides) {
-          const r = FlowLargeTrades.radius(qty, largeMarkerUnit);
+        for (const point of points) {
+          const { side, offset } = point;
           const y = candleSeries.priceToCoordinate(side === "buy" ? b.low : b.high);
           if (y == null) continue;
-          marks.push({ x, y: y + (side === "buy" ? 1 : -1) * (r + 6), r, side, bar: b });
+          marks.push({ ...point, x, y: y + (side === "buy" ? 1 : -1) * offset, bar: b, strengths: largeStrength[i] });
         }
       }
       return marks;
     }
     function renderLargeTrades() {
-      if (largeMarkerUnit == null) largeMarkerUnit = FlowLargeTrades.sizeUnit(bars, cfg?.largeTrades, bars.at(-1)?.close);
+      if (largeMarkerUnit == null) {   // 价格、乘数还不知道时单位是 null, 数据到了补上, 所有圆点跟着重算
+        largeMarkerUnit = FlowLargeTrades.sizeUnit(bars, cfg?.largeTrades, bars.at(-1)?.close);
+        if (largeMarkerUnit != null) largePoints = bars.map((_, i) => pointsAt(i));
+      }
       largePrimitive.refresh();
       // 数据变了而光标没动: 在这里按新数据重新命中, 不在图表库的绘制回调里读写 DOM。
       showLargeTooltip(largeHoverParam);
@@ -1358,7 +1412,7 @@
         ? largePrimitive.hit(param.point) : null;
       largeTooltip.hidden = !mark;
       if (!mark) return;
-      const text = FlowLargeTrades.details(mark.bar, cfg?.largeTrades, cfg?.volumeDigits ?? 0);
+      const text = FlowLargeTrades.details(mark.bar, cfg?.largeTrades, cfg?.volumeDigits ?? 0, mark.strengths, mark.tier);
       if (text !== largeTooltip.textContent || !largeTooltipSize) {
         largeTooltip.textContent = text;
         largeTooltipSize = [largeTooltip.offsetWidth, largeTooltip.offsetHeight];
@@ -1471,10 +1525,12 @@
       return shown.ema && settings.view !== "footprint";
     }
 
-    function applyEmaVisibility() {   // 长周期的两条还要看 emaLong
-      const on = emaShown();
-      emaSeries.forEach((s, j) =>
-        s.applyOptions({ visible: on && (shown.emaLong || !EMA_LONG_PERIODS.includes(EMA_PERIODS[j])) }));
+    function emaLineShown(j) {   // 长周期的两条还要看 emaLong
+      return emaShown() && (shown.emaLong || !EMA_LONG_PERIODS.includes(EMA_PERIODS[j]));
+    }
+
+    function applyEmaVisibility() {
+      emaSeries.forEach((s, j) => s.applyOptions({ visible: emaLineShown(j) }));
     }
 
     // 本图实际画的大周期: 选过且比本图周期大就用它, 否则按 defaultHtf; 本图是 4h 时没有, 为 0。
@@ -1608,7 +1664,8 @@
       const vol = (v) => fmt(v, cfg?.volumeDigits ?? 0);
       largeReadout.textContent = (cfg?.largeTrades?.some((c) => c.source === "snapshot") ? "估算 · " : "") +
         FlowLargeTrades.readout(b.large, cfg?.volumeDigits ?? 0);
-      largeReadout.title = FlowLargeTrades.details(b, cfg?.largeTrades, cfg?.volumeDigits ?? 0);
+      if (b.largeRelative) largeReadout.textContent += " · " + FlowLargeTrades.relativeReadout(b.largeRelative);
+      largeReadout.title = FlowLargeTrades.details(b, cfg?.largeTrades, cfg?.volumeDigits ?? 0, largeStrength[i]);
       // 涨跌对上一根收盘(第一根对本根开盘), 红涨绿跌
       const base = i > 0 ? bars[i - 1].close : b.open;
       const change = b.close - base;
@@ -2543,6 +2600,8 @@
       setProfilePhase("off");   // 画了一半的作罢; 画好的按时间记, 新周期的数据到了按它重算
       bars = [];
       barsLtf = null;
+      largeStrengthMemo.clear();
+      largePoints = [];
       fpBars = [];
       barRevision = -1;
       fpRevision = -1;
