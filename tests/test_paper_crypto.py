@@ -280,6 +280,8 @@ class FakeCrypto:
         self.touched.append((symbol, tuple(kinds)))
 
     def quote(self, symbol):
+        if symbol != BTC.symbol:
+            raise AssertionError(f"不应获取 {symbol} 的盘口")
         return self.raw
 
 
@@ -296,14 +298,84 @@ class ServiceTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_state_quotes_and_refuses_aggregates(self):
+    def test_state_quotes_the_selected_contract(self):
         state = self.service.state(BTC.symbol)
         self.assertEqual((state["mode"], state["leverage"], state["error"]), ("crypto", 10, None))
         self.assertEqual(state["quote"]["ask"], 100.1)
         self.assertIn((BTC.symbol, ("book", "mark", "ticker")), self.crypto.touched)
-        self.assertIn("多所汇总", self.service.state("AGG.BTC")["error"])
-        with self.assertRaisesRegex(OrderError, "多所汇总"):
+
+    def test_aggregate_uses_binance_book_and_shares_positions_trades_and_leverage(self):
+        self.crypto.raw["book"]["asks"] = [[100.1, 1.0], [100.2, 4.0]]
+        self.crypto.raw["mark"]["markPrice"] = 102.0
+        self.service.set_leverage("AGG.BTC", 20)
+        filled = self.service.place(order("buy", 2.0) | {"symbol": "AGG.BTC"})
+        self.assertEqual((filled["symbol"], filled["contract"], filled["status"]),
+                         ("AGG.BTC", BTC.symbol, "filled"))
+        self.assertAlmostEqual(filled["fillPrice"], 100.15)
+        state = self.service.state("AGG.BTC")
+        self.assertEqual((state["symbol"], state["contract"], state["error"], state["leverage"]),
+                         ("AGG.BTC", BTC.symbol, None, 20))
+        self.assertEqual(state["quote"]["contract"], BTC.symbol)
+        self.assertEqual((state["quote"]["qtyStep"], state["quote"]["priceTick"]),
+                         (BTC.step_size, BTC.tick_size))
+        self.assertAlmostEqual(state["positions"][0]["floatPnl"], 3.7)
+        self.assertAlmostEqual(state["positions"][0]["margin"], 10.2)
+
+        self.service.place(order("sell", 0.5))                 # 单所页面减同一份仓
+        aggregate, single = self.service.state("AGG.BTC"), self.service.state(BTC.symbol)
+        for key in ("positions", "orders", "contractTrades", "leverage"):
+            self.assertEqual(aggregate[key], single[key])
+        self.assertEqual(len(aggregate["positions"]), 1)
+        self.assertEqual(aggregate["positions"][0]["qty"], 1.5)
+        self.assertEqual([trade["contract"] for trade in aggregate["contractTrades"]], [BTC.symbol] * 2)
+        self.assertTrue(all(symbol == BTC.symbol for symbol, _ in self.crypto.touched))
+        with open(self.path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(list(saved["positions"]), [BTC.symbol])
+        self.assertEqual(saved["leverage"], {BTC.symbol: 20})
+
+        restored = CryptoPaperService(lambda: self.crypto, PaperStore(lambda: self.path), clock=lambda: NOW)
+        self.assertEqual(restored.state("AGG.BTC")["contractTrades"], aggregate["contractTrades"])
+        flattened = restored.flatten("AGG.BTC")
+        self.assertEqual((flattened["contract"], flattened["qty"], flattened["fillPrice"]),
+                         (BTC.symbol, 1.5, 100.0))
+        self.assertEqual(restored.state(BTC.symbol)["positions"], [])
+
+    def test_aggregate_orders_amend_cancel_and_match_on_the_binance_cycle(self):
+        resting = self.service.place(order("buy", 1.0, "limit", 99.0) | {"symbol": "AGG.BTC"})
+        self.assertEqual(self.service.amend(resting["id"], 99.5)["price"], 99.5)
+        cancelled = self.service.place(order("sell", 1.0, "limit", 105.0) | {"symbol": "AGG.BTC"})
+        self.assertEqual(self.service.cancel(cancelled["id"])["status"], "cancelled")
+        triggered = self.service.place(order("buy", 1.0, "stop", 101.0) | {"symbol": "AGG.BTC"})
+        self.crypto.raw["ticker"]["last"] = 101.0
+        self.crypto.raw["book"].update(bids=[[100.9, 5.0]], asks=[[101.0, 5.0]])
+        self.service.on_cycle(self.crypto)
+        self.assertEqual((triggered["status"], triggered["fillPrice"]), ("filled", 101.0))
+        self.assertEqual(resting["status"], "open")
+        self.crypto.raw["ticker"]["last"] = 99.0
+        self.crypto.raw["book"].update(bids=[[98.9, 5.0]], asks=[[99.0, 5.0]])
+        self.service.on_cycle(self.crypto)
+        self.assertEqual((resting["status"], resting["fillPrice"]), ("filled", 99.5))
+        state = self.service.state("AGG.BTC")
+        self.assertEqual((state["positions"][0]["contract"], state["positions"][0]["qty"]), (BTC.symbol, 2.0))
+        self.assertTrue(all(symbol == BTC.symbol for symbol, _ in self.crypto.touched))
+
+    def test_aggregate_still_requires_a_binance_contract_valid_quantity_and_fresh_depth(self):
+        state = self.service.state("AGG.UNKNOWN")
+        self.assertIsNone(state["contract"])
+        self.assertIsNone(state["quote"])
+        self.assertIn("BINANCE.UNKNOWNUSDT.P", state["error"])
+        with self.assertRaisesRegex(OrderError, "不支持"):
+            self.service.place(order("buy", 1.0) | {"symbol": "AGG.UNKNOWN"})
+        with self.assertRaisesRegex(OrderError, "整数倍"):
+            self.service.place(order("buy", 0.0015) | {"symbol": "AGG.BTC"})
+        with self.assertRaisesRegex(OrderError, "五档"):
+            self.service.place(order("buy", 6.0) | {"symbol": "AGG.BTC"})
+        self.crypto.raw["book"]["received"] = time.time() - 60
+        self.assertFalse(self.service.state("AGG.BTC")["quote"]["open"])
+        with self.assertRaisesRegex(OrderError, "盘口"):
             self.service.place(order("buy", 1.0) | {"symbol": "AGG.BTC"})
+        self.assertEqual(self.service.state("AGG.BTC")["positions"], [])
 
     def test_orders_persist_and_resting_orders_fill_on_the_cycle(self):
         resting = self.service.place(order("sell", 1.0, "limit", 101.0))
@@ -329,10 +401,10 @@ class ServiceTests(unittest.TestCase):
         with open(self.path, encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["orders"][0]["price"], 99.5)
 
-    def test_stops_set_through_the_service_fire_on_the_cycle(self):
-        self.service.place(order("sell", 1.0))                            # 空 1 @100
-        result = self.service.set_stops(BTC.symbol, 95.0, None)
-        self.assertEqual((result["tp"], result["sl"]), (95.0, None))
+    def test_aggregate_stops_set_through_the_service_fire_on_the_binance_cycle(self):
+        self.service.place(order("sell", 1.0) | {"symbol": "AGG.BTC"})    # 空 1 @100
+        result = self.service.set_stops("AGG.BTC", 95.0, None)
+        self.assertEqual((result["contract"], result["tp"], result["sl"]), (BTC.symbol, 95.0, None))
         self.crypto.raw["ticker"] = {"last": 95.0}
         self.crypto.raw["book"] = {"bids": [[95.0, 5.0]], "asks": [[95.1, 5.0]], "received": time.time()}
         self.service.on_cycle(self.crypto)
@@ -408,6 +480,25 @@ class RoutingTests(unittest.TestCase):
             asyncio.run(server.paper_flatten(BTC.symbol))                        # 没有持仓
         asyncio.run(server.paper_order(order("buy", 1.0)))
         self.assertEqual(server.paper_stops({"symbol": BTC.symbol, "tp": None, "sl": 90})["sl"], 90.0)
+
+    def test_aggregate_requests_keep_the_chart_symbol_and_trade_the_binance_contract(self):
+        symbol = "AGG.BTC"
+        state = asyncio.run(server.paper_state(symbol))
+        self.assertEqual((state["symbol"], state["contract"], state["error"]), (symbol, BTC.symbol, None))
+        server.paper_leverage(symbol, 3)
+        filled = asyncio.run(server.paper_order(order("buy", 1.0) | {"symbol": symbol}))
+        self.assertEqual(filled["contract"], BTC.symbol)
+        state = asyncio.run(server.paper_state(symbol))
+        self.assertEqual((state["leverage"], state["contractTrades"][0]["contract"]), (3, BTC.symbol))
+        stops = server.paper_stops({"symbol": symbol, "tp": None, "sl": 90})
+        self.assertEqual((stops["contract"], stops["sl"]), (BTC.symbol, 90.0))
+        placed = asyncio.run(server.paper_order(order("sell", 1.0, "limit", 105.0) | {"symbol": symbol}))
+        self.assertEqual(server.paper_amend(placed["id"], {"price": 104.0})["price"], 104.0)
+        self.assertEqual(server.paper_cancel(placed["id"])["status"], "cancelled")
+        flattened = asyncio.run(server.paper_flatten(symbol))
+        self.assertEqual((flattened["contract"], flattened["status"]), (BTC.symbol, "filled"))
+        self.assertEqual(asyncio.run(server.paper_state(BTC.symbol))["positions"], [])
+        self.assertEqual(server.paper_reset(cash=300, symbol=symbol)["account"]["initialCash"], 300.0)
 
 
 if __name__ == "__main__":

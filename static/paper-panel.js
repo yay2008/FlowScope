@@ -348,6 +348,10 @@
       const status = quote ? (quote.open ? open : `${closed} · ${quote.reason}`) : "行情未就绪";
       els.contract.textContent = `${state.contract || state.symbol} · ${status}`;
       els.contract.title = quote ? `${quote.name}  报价时间 ${quote.datetime || "—"}` : "";
+      if (isCrypto() && state.contract && state.symbol.startsWith("AGG.")) {
+        els.contract.textContent = `币安撮合 · ${els.contract.textContent}`;
+        els.contract.title = `多所汇总行情，模拟交易使用币安盘口，与币安合约共用持仓。${els.contract.title}`;
+      }
       els.contract.classList.toggle("closed", !(quote && quote.open));
       els.ask.textContent = price(quote && quote.ask);
       els.askVol.textContent = quote && quote.askVolume != null ? amount(quote.askVolume) : "";
@@ -364,7 +368,7 @@
       const quote = state.quote;
       const mode = isCrypto() ? `crypto:${state.symbol}` : "futures";
       els.panel.classList.toggle("crypto", isCrypto());
-      // 多所汇总这类不能交易的代码没有报价: 不显示单位与杠杆
+      // 无法解析交易合约时没有报价: 不显示单位与杠杆
       if (els.qtyLabel) els.qtyLabel.textContent = isCrypto() ? (unit() ? `数量(${unit()})` : "数量") : "手数";
       if (els.leverageRow) els.leverageRow.hidden = !(isCrypto() && quote);
       if (isCrypto() && quote) {
@@ -673,7 +677,7 @@
       postStops(tp, sl);
     }
 
-    // 发实际合约: 主连的持仓记在当时的标的月份合约上。成功后先把结果写进本地数据、重画面板和图上的线,
+    // 发实际合约: 主连用标的月份, 多所汇总用币安合约。成功后先把结果写进本地数据、重画面板和图上的线,
     // 不等下一次轮询(划线松手后线不会先跳回旧价位)。
     function postStops(tp, sl) {
       const text = (value) => (value != null ? price(value) : "不设");

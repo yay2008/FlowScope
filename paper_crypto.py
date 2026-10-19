@@ -21,6 +21,7 @@
 - 估值(浮动盈亏、保证金、强平)按标记价格, 没有标记价格时用最新价。
 - 止盈止损同期货账户(规则见 paper.py): 按**最新价**触发, 触发后按五档盘口市价平掉全部持仓, 吃不够就每轮重试;
   下单时也能带, 成交后挂到持仓上。
+- 多所汇总保留图表代码, 模拟交易映射到对应的币安 USDT 永续, 与币安单所视图共用持仓与杠杆。
 """
 from __future__ import annotations
 
@@ -575,10 +576,10 @@ class CryptoPaperService:
             return {**copy.deepcopy(self._book_now().to_dict()), "saveError": self.save_error}
 
     def _tradable(self, symbol: str):
-        """合约 -> Instrument; 多所汇总与不认识的代码不能交易。"""
+        """图表代码 -> 实际交易合约与 Instrument; 多所汇总默认用币安合约。"""
         value = validate_symbol(symbol)
         if venue_of(value) == "AGG":
-            raise OrderError("多所汇总不能交易, 请切到单个交易所的合约下单")
+            value = f"BINANCE.{value.removeprefix('AGG.')}USDT.P"
         instrument = self._manager().instrument(value)
         if instrument is None:
             raise OrderError(f"不支持的加密合约 {value}")
@@ -592,26 +593,27 @@ class CryptoPaperService:
     def state(self, symbol: str) -> dict:
         """页面数据: 账户、持仓、委托、成交、资金费, 以及当前合约的盘口与杠杆。"""
         value = validate_symbol(symbol)
+        contract = value
         error = quote = instrument = None
         try:
-            value, instrument = self._tradable(value)
-            quote = self._quote(value, instrument)
+            contract, instrument = self._tradable(value)
+            quote = self._quote(contract, instrument)
         except OrderError as exc:
             error = str(exc)
         with self._lock:
             book = self._book_now()
             mark = quote and (quote.get("markPrice") or quote.get("last"))
             if mark:
-                book.marks[value] = mark
+                book.marks[contract] = mark
             open_orders = [order for order in book.orders if order["status"] == "open"]
             finished = [order for order in book.orders if order["status"] != "open"][-10:]
-            maker, taker = FEES.get(venue_of(value), FEES["BINANCE"])
+            maker, taker = FEES.get(venue_of(contract), FEES["BINANCE"])
             return {**book.summary(), "mode": "crypto", "symbol": value,
-                    "contract": value if instrument is not None else None,
-                    "quote": quote, "leverage": book.leverage_of(value),
+                    "contract": contract if instrument is not None else None,
+                    "quote": quote, "leverage": book.leverage_of(contract),
                     "fee": {"mode": "crypto", "maker": maker, "taker": taker}, "feeSource": None,
                     "orders": open_orders + finished[::-1], "trades": book.trades[-50:][::-1],
-                    "contractTrades": [trade for trade in book.trades if trade["contract"] == value][-500:],
+                    "contractTrades": [trade for trade in book.trades if trade["contract"] == contract][-500:],
                     "fundings": book.fundings[-20:][::-1],
                     "error": error or self.save_error}
 

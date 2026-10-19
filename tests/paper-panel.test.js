@@ -54,6 +54,26 @@ test("价格线只画当前合约的持仓均价、止盈止损与挂单(限价�
   assert.deepEqual(priceLines(null), []);
 });
 
+test("多所汇总图按实际币安合约显示持仓、挂单和成交标记, 划线沿用币安精度", () => {
+  const contract = "BINANCE.BTCUSDT.P";
+  const state = { mode: "crypto", symbol: "AGG.BTC", contract,
+    quote: { last: 100, priceTick: 0.1, priceDecs: 1 },
+    positions: [{ contract, qty: 0.5, avgPrice: 100.1, sl: 95 },
+                { contract: "OKX.BTC-USDT-SWAP", qty: 2, avgPrice: 103 }],
+    orders: [{ id: "CO1", contract, status: "open", type: "limit", side: "buy", qty: 0.1, price: 99 },
+             { id: "CO2", contract: "OKX.BTC-USDT-SWAP", status: "open", price: 98 }],
+    contractTrades: [{ contract, side: "buy", time: 1031 }],
+  };
+  assert.deepEqual(priceLines(state).map(({ kind, price }) => ({ kind, price })),
+                   [{ kind: "avg", price: 100.1 }, { kind: "sl", price: 95 }, { kind: "order", price: 99 }]);
+  assert.deepEqual(dragTargets(state), [{ from: "sl", price: 95 }, { from: "order:CO1", price: 99 },
+                                        { from: "avg", price: 100.1 }]);
+  assert.deepEqual(dragLine(state, "avg", 104.04),
+                   { kind: "tp", price: 104, color: TP_COLOR, title: "止盈 +1.95" });
+  assert.deepEqual(buildMarkers(state.contractTrades, bars).map(({ time, text }) => ({ time, text })),
+                   [{ time: 1030, text: "B" }]);
+});
+
 test("划线: 能拖的是止盈、止损、当前合约的挂单和均价线(均价线最后); 没有持仓也能拖挂单", () => {
   const orders = [{ id: "O7", contract: "SHFE.fu2611", status: "open", type: "limit", side: "buy", qty: 1, price: 2990 },
                   { id: "O8", contract: "SHFE.fu2609", status: "open", type: "limit", side: "buy", qty: 1, price: 2900 }];
