@@ -2,6 +2,7 @@
 (function (root) {
   "use strict";
   const COLORS = { buy: "#30cf9b", sell: "#ff6978" };
+  const MIN_RADIUS_OPTIONS = [0, 8, 16];   // 0 = 全部, 其余为最小显示半径(px)
   const QUALITY = { complete: "完整", partial: "部分覆盖", warming: "基线预热中", missing: "未采集" };
   const finite = (v) => typeof v === "number" && Number.isFinite(v);
   function number(v, digits = 2) {
@@ -101,13 +102,15 @@
     return { opacity: .18 + .22 * level, highlighted: false };
   }
   // 空心层(加密相对异常)套在同侧实心外面, 不参与亮度。
-  function markers(bar, unit, strength) {
+  function markers(bar, unit, strength, minRadius = 0) {
     const result = [], large = new Map(sideVolumes(bar?.large)), relative = new Map(sideVolumes(bar?.largeRelative));
     for (const side of SIDES) {
-      const rLarge = large.has(side) ? radius(large.get(side), unit) : 0;
+      let rLarge = large.has(side) ? radius(large.get(side), unit) : 0;
+      if (rLarge < minRadius) rLarge = 0;   // 隐藏的实心点不占空心点内侧的空间
       for (const [tier, volumes] of [["large", large], ["relative", relative]]) {
         if (!volumes.has(side)) continue;
         const qty = volumes.get(side), r = radius(qty, unit), score = tier === "large" ? strength?.[side] : null;
+        if (r < minRadius) continue;   // 只筛显示, 尺寸基准和成交统计仍使用全部数据
         result.push({ side, tier, qty, r, strength: score,
           offset: tier === "large" ? r + 6 : rLarge ? rLarge * 2 + 11 + r : r + 6,
           style: tier === "large" ? markerStyle(score) : null });
@@ -253,7 +256,7 @@
       });
     }
   }
-  const api = { COLORS, QUALITY, sideVolumes, floorUnit, sizeUnit, radius, cryptoConfigs, strengthAt, strengths,
+  const api = { COLORS, QUALITY, MIN_RADIUS_OPTIONS, sideVolumes, floorUnit, sizeUnit, radius, cryptoConfigs, strengthAt, strengths,
     markerStyle, markers, axisMargins, readout, relativeReadout, details, Primitive };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.FlowLargeTrades = api;

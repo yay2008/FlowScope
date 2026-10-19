@@ -811,6 +811,11 @@ const legendRow = (context, index, key) =>
   findAll(chartEl(context, index), (node) => node.className === "ml-item" && node.getAttribute("data-key") === key)[0];
 const eyeOf = (context, index, key) => findByClass(legendRow(context, index, key), "ml-eye");
 const clickEye = (context, index, key) => eyeOf(context, index, key).handlers.click[0]();
+const selectLargeSize = (context, index, value) => {
+  const select = findByClass(legendRow(context, index, "large"), "ml-size");
+  select.value = String(value);
+  select.handlers.change[0]();
+};
 const bandKOf = (context, index) => findByClass(legendRow(context, index, "band"), "ml-params");   // 带宽按钮
 const viewSetter = (context) => (value) =>
   context.document.getElementById("view").handlers.change[0]({ target: { value } });
@@ -947,6 +952,8 @@ test("OB Zones: 图元按实际价格坐标绘制、裁掉画外区域, 两条�
 test("大额成交: 买卖两侧各画一个点, 大小按该侧量, 对冲不抵消, 只有未知方向不画, 悬停保留买卖明细", () => {
   const storage = createLocalStorage();
   const context = runBrowser({ localStorage: storage });
+  selectLargeSize(context, 0, 0);
+  selectLargeSize(context, 1, 0);
   const bars = obBars();
   bars[99].large = { buy: 80, sell: 40, unknown: 25, buyScale: 4, sellScale: 2, count: 2,
     delta: 40, cvd: 60, maxQty: 80, maxRatio: 12, maxZ: 4, share: .6, coverage: "complete" };
@@ -984,6 +991,7 @@ test("大额成交: 买卖两侧各画一个点, 大小按该侧量, 对冲不�
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")).map((s) => s.large), [true, false]);
   const again = runBrowser({ localStorage: storage });
   feedObBars(again, bars);
+  assert.equal(findByClass(legendRow(again, 0, "large"), "ml-size").value, "0", "手动选择全部后刷新仍保留");
   stubCharts[0].timeScale.setVisibleLogicalRange({ from: 90, to: 110 });
   const a = stubCharts[0].primitives.find((item) => item.constructor.name === "Primitive");
   const b = stubCharts[1].primitives.find((item) => item.constructor.name === "Primitive");
@@ -995,13 +1003,85 @@ test("大额成交: 买卖两侧各画一个点, 大小按该侧量, 对冲不�
   assert.equal(a.geometry().length, 8);
 });
 
-test("大额成交: WebSocket 更新时两侧各自变大小, 对冲仍保留两点, 无大额买卖时移除, 旧历史显示未采集", async () => {
+test("大额成交尺寸筛选: 两侧两层包含半径边界, 隐藏点不悬停和占边距, 统计与大小不变, 左右图独立保存", () => {
+  const storage = createLocalStorage();
+  const context = runBrowser({ localStorage: storage, search: "?symbol=BINANCE.BTCUSDT.P" });
+  const bars = obBars();
+  const full = (buy, sell) => ({ buy, sell, unknown: 0, count: (buy > 0) + (sell > 0), delta: buy - sell,
+    cvd: 999, maxQty: Math.max(buy, sell), maxRatio: 10, maxZ: 5, share: .2, coverage: "complete" });
+  bars[90].large = full(20, 0);
+  bars[99].large = full(80, 319);
+  bars[99].largeRelative = full(320, 500);
+  bars[100].large = full(320, 500);
+  bars[100].largeRelative = full(79, 80);
+  feedObBars(context, bars);
+  vm.runInContext(`charts.forEach(c => {
+    c.cfg.largeTrades = [{ source: "aggregate", minQty: 20, minNotional: 0 }];
+    c.renderAll();
+  })`, context);
+  stubCharts[1].timeScale.setVisibleLogicalRange({ from: 90, to: 110 });
+  const p = stubCharts[1].primitives.find(item => item.constructor.name === "Primitive");
+  const selectOf = (ctx, i) => findByClass(legendRow(ctx, i, "large"), "ml-size");
+  const select = selectOf(context, 1), rawBefore = JSON.stringify(bars);
+  assert.equal(select.value, "8");
+  assert(p.geometry().every(m => m.r >= 8), "默认只显示半径至少 8px 的圆圈");
+  selectLargeSize(context, 1, 0);
+  const before = p.geometry();
+  assert.deepEqual(select.children.map(o => o.textContent), ["全部", "半径 ≥8px", "半径 ≥16px"]);
+  assert.equal(before.length, 9);
+  const small = before.find(m => m.bar.time === bars[90].time);
+  stubCharts[1].crosshairHandlers.forEach(fn => fn({ time: bars[90].time, paneIndex: 0, point: small }));
+  const tooltip = findByClass(chartEl(context, 1), "large-tooltip");
+  const read = findByClass(legendRow(context, 1, "large"), "readout large-read");
+  const readBefore = [read.textContent, read.title];
+  assert.equal(tooltip.hidden, false);
+  const sizes = marks => Array.from(marks, m => [m.bar.time, m.side, m.tier, m.r]);
+  for (const threshold of [8, 16, 0, 16]) {
+    select.value = String(threshold);
+    select.handlers.change[0]();
+    assert.deepEqual(sizes(p.geometry()), sizes(before.filter(m => m.r >= threshold)));
+    assert.deepEqual([read.textContent, read.title], readBefore, "筛掉圆点仍保留完整读数和明细");
+    assert.equal(selectOf(context, 0).value, "8", "另一张图不变");
+    if (threshold) {
+      assert.equal(tooltip.hidden, true, "原来悬停的小圈立即隐藏明细");
+      assert.equal(p.hit(small), null);
+      stubCharts[1].paneHeight = 60;
+      assert.equal(p.autoscaleInfo(90, 90), null, "已筛掉的小圈不占价格轴边距");
+    }
+  }
+  const relative = p.geometry().filter(m => m.bar.time === bars[99].time);
+  assert.equal(relative.length, 2);
+  assert(relative.every(m => m.tier === "relative" && m.offset === m.r + 6), "实心被筛掉后空心贴近 K 线");
+  assert.equal(JSON.stringify(bars), rawBefore);
+  assert.equal(JSON.parse(storage.getItem("flowscope.chartShown"))[1].largeMinRadius, 16);
+  clickEye(context, 1, "large");
+  assert.equal(select.disabled, true);
+  clickEye(context, 1, "large");
+  assert.equal(select.disabled, false);
+  assert.equal(select.value, "16");
+  viewSetter(context)("footprint");
+  assert.equal(p.geometry().length, 0);
+  viewSetter(context)("candles");
+  assert.deepEqual(sizes(p.geometry()), sizes(before.filter(m => m.r >= 16)));
+  vm.runInContext("charts[1].setTf(60)", context);
+  assert.equal(select.value, "16", "切周期保留选择");
+  const again = runBrowser({ localStorage: storage, search: "?symbol=SHFE.fu2611" });
+  assert.equal(selectOf(again, 0).value, "8");
+  assert.equal(selectOf(again, 1).value, "16", "刷新和切合约后恢复选择");
+  storage.setItem("flowscope.chartShown", JSON.stringify([{ largeMinRadius: 9 }, { largeMinRadius: true }]));
+  const invalid = runBrowser({ localStorage: storage });
+  assert.equal(selectOf(invalid, 0).value, "8");
+  assert.equal(selectOf(invalid, 1).value, "8", "非法旧值退回半径至少 8px");
+});
+
+test("大额成交: WebSocket 更新时两侧各自变大小, 对冲仍保留两点, 无大额买卖时移除, 尺寸筛选实时生效", async () => {
   const bars = obBars();
   const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
     colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
   const sockets = [];
   const context = runBrowser({ fetch: (url) => String(url).startsWith("/api/history")
     ? Promise.resolve(jsonResponse({ cfg, bars, ltf: 0 })) : stubFetch(url) });
+  selectLargeSize(context, 1, 0);
   context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
   await new Promise((resolve) => setImmediate(resolve));
   const socket = sockets.find((s) => new URL(s.url).searchParams.get("tf") === "30");
@@ -1040,6 +1120,17 @@ test("大额成交: WebSocket 更新时两侧各自变大小, 对冲仍保留两
   send(4, 0, 0);
   assert.equal(p.geometry().length, 0);
   assert.equal(tooltip.hidden, true, "光标没动、圆点随行情消失: 不等重绘就收起明细");
+  const select = findByClass(legendRow(context, 1, "large"), "ml-size");
+  select.value = "16";
+  select.handlers.change[0]();
+  send(5, 319, 320);
+  assert.deepEqual(Array.from(p.geometry(), m => [m.side, m.r]), [["sell", 16]], "达到半径 16px 时实时出现");
+  stubCharts[1].crosshairHandlers.forEach(fn => fn({ time: bars[109].time, paneIndex: 0, point: pair().sell }));
+  assert.equal(tooltip.hidden, false);
+  send(6, 320, 319);
+  assert.deepEqual(Array.from(p.geometry(), m => [m.side, m.r]), [["buy", 16]]);
+  assert.equal(tooltip.hidden, true, "修订后跌回门槛下立即消失, 不残留悬停");
+  assert.match(read.textContent, /Δ \+1/);
 });
 
 test("加密两层: HTTP、WS和修订共用显示强弱, 当前根不影响过去, 空心升级不双计且统计完整", async () => {
@@ -1058,6 +1149,7 @@ test("加密两层: HTTP、WS和修订共用显示强弱, 当前根不影响过�
   const sockets = [];
   const context = runBrowser({ search: "?symbol=" + symbol, fetch: url => String(url).startsWith("/api/history")
     ? Promise.resolve(jsonResponse({ symbol, cfg, bars, ltf: 0 })) : stubFetch(url) });
+  selectLargeSize(context, 1, 0);
   context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
   await new Promise(resolve => setImmediate(resolve));
   const p = stubCharts[1].primitives.find(item => item.constructor.name === "Primitive");
@@ -1142,6 +1234,7 @@ test("期货也按亮度: 实心同一画法, 弱的整体变淡, 末根实时�
   const sockets = [];
   const context = runBrowser({ fetch: url => String(url).startsWith("/api/history")
     ? Promise.resolve(jsonResponse({ symbol, cfg, bars, ltf: 0 })) : stubFetch(url) });
+  selectLargeSize(context, 1, 0);
   context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
   await new Promise(resolve => setImmediate(resolve));
   const p = stubCharts[1].primitives.find(item => item.constructor.name === "Primitive");
@@ -1308,8 +1401,8 @@ test("EMA 眼睛按钮: 四条均线一起隐藏, 两张图的开关按左右各
   assert.deepEqual(applied.slice(-4).map((o) => o.visible), [false, false, false, false]);
   assert.equal(eyeOf(context, 1, "ema").title, "显示");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown")),
-                   [{ ema: true, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false, bandMid: false, ob: false, large: true },
-                    { ema: false, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false, bandMid: false, ob: false, large: true }]);
+                   [{ ema: true, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false, bandMid: false, ob: false, large: true, largeMinRadius: 8 },
+                    { ema: false, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false, bandMid: false, ob: false, large: true, largeMinRadius: 8 }]);
 
   // 切合约是整页重载: 新页面的两张图各按记下的状态画(删掉 WaveTrend 之前记的 wt 忽略掉)
   storage.setItem("flowscope.chartShown", JSON.stringify([
@@ -1355,7 +1448,7 @@ test("两张图选同一个周期时开关各管各的, 重载后不串; 切周�
   select.handlers.change[0]();
   assert.deepEqual(offFlags(again, 0), [true, true], "切周期后本图开关不变");
   assert.deepEqual(JSON.parse(storage.getItem("flowscope.chartShown"))[0],
-                   { ema: false, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false, bandMid: false, ob: false, large: true });
+                   { ema: false, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false, bandMid: false, ob: false, large: true, largeMinRadius: 8 });
 });
 
 test("图例里的带宽只在本图打开 FlowWave带 时能点", () => {

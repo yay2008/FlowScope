@@ -382,8 +382,8 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
 /* EMA 周期里的「100 200」: 数字保留各自线色, 整组是一个开关(暗 = 不画这两条) */
 .ml-long { display: inline-flex; gap: 4px; }
 .ml-range { color: #9598a1; }
-/* 大周期EMA 选大周期的下拉框: 外观同参数文字, 只在悬停时显出边框 */
-.ml-tf {
+/* 大周期EMA 与大额圆圈尺寸的下拉框: 外观同参数文字, 只在悬停时显出边框 */
+.ml-tf, .ml-size {
   padding: 0 1px;
   border: 1px solid transparent;
   border-radius: 3px;
@@ -392,11 +392,11 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
   font: inherit;
   cursor: pointer;
 }
-.ml-tf:hover:not(:disabled) { border-color: #2a2e39; background: rgba(30, 34, 45, 0.85); }
-.ml-tf:disabled { cursor: default; }
-.ml-tf option { background: #1e222d; color: #d1d4dc; }
+.ml-tf:hover:not(:disabled), .ml-size:hover:not(:disabled) { border-color: #2a2e39; background: rgba(30, 34, 45, 0.85); }
+.ml-tf:disabled, .ml-size:disabled { cursor: default; }
+.ml-tf option, .ml-size option { background: #1e222d; color: #d1d4dc; }
 .ml-item.off .ml-name, .ml-item.off .ml-params, .ml-item.off .ml-toggle, .ml-item.off .ml-range,
-.ml-item.off .ml-tf, .ml-item.off .vp-read { opacity: 0.4; }
+.ml-item.off .ml-tf, .ml-item.off .ml-size, .ml-item.off .vp-read { opacity: 0.4; }
 /* 成交量分布那一行的 POC / VAH / VAL 读数: 读数样式, 但不撑满整行 */
 .main-legend .vp-read { flex: 0 1 auto; }
 .ml-eye {

@@ -678,13 +678,14 @@
    *   tf        初始主周期(秒), 之后由左上角的下拉框切换(setTf)
    *   symbol    合约代码(切合约是整页重载, 所以也不变)
    *   settings  页面的工具栏状态, 按引用共用, 组件只读
-   *   shown     本图主图指标的初始显示开关 {ema, emaAll, emaLong, htfEma, htfEmaAll, htf, band, bandMid, ob, large},
-   *             之后由本图图例的眼睛按钮切换
+   *   shown     本图主图指标的初始显示选项 {ema, emaAll, emaLong, htfEma, htfEmaAll, htf, band, bandMid, ob, large, largeMinRadius},
+   *             之后由本图图例的控件切换
    *             (emaAll 是 EMA 画全部历史还是只画最近 EMA_DRAW_BARS 根, 由那一行的「近100 / 全部」按钮切换;
    *             emaLong 是画不画 EMA100/200, 由那一行周期里的「100 200」切换;
    *             htfEmaAll 同 emaAll, 管大周期 EMA, 由大周期EMA 那一行自己的「近100 / 全部」切换;
    *             htf 是大周期 EMA 选的大周期(秒), 由那一行的下拉框切换, 0 或不比本图周期大时按 defaultHtf 取默认;
-   *             bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换)
+   *             bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换;
+   *             largeMinRadius 是大额圆圈最小显示半径, 0 = 全部, 由那一行的下拉框选择)
    *   profiles  本图已画的成交量分布 [{from, to, rows, extend, visible}](页面记下来的, 不合法的条目丢掉)
    *   obOptions 本图 OB Zones 参数, 由 onObOptionsChange 通知页面保存
    * 回调(都可省略):
@@ -692,7 +693,7 @@
    *   onSuiteSetting(key, value) 用户在本图 FlowMeter 窗格选了模式(key = "mode")或阈值(key = "threshtype");
    *                             两张图共用, 由页面写进 settings 再调各图的 renderSuite
    *   onConfig()                拿到服务端下发的 cfg(本周期合法的拆分粒度以它为准)
-   *   onShownChange()           用户点了本图图例的眼睛按钮(新状态用 shown() 取)
+   *   onShownChange()           用户改了本图图例的显示选项(新状态用 shown() 取)
    *   onBandK(k)                用户点了本图图例里的带宽, k 是循环到的下一档(两张图共用, 由页面写进 settings
    *                             再调各图的 rebuildBand)
    *   onCrosshair(time, price)  本图十字光标动了(用户移动, 或光标停着时本图数据变了); 移出图表时
@@ -731,8 +732,9 @@
     let retryTimer = null;
     let retryAttempts = 0;
     const shown = { ema: true, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false,
-                    bandMid: false, ob: false, large: true,
+                    bandMid: false, ob: false, large: true, largeMinRadius: 8,
                     ...initialShown };
+    if (!FlowLargeTrades.MIN_RADIUS_OPTIONS.includes(shown.largeMinRadius)) shown.largeMinRadius = 8;
     let obOptions = FlowIndicators.normalizeObOptions(initialObOptions);
 
     // ---------- 容器: 图表本身 + 左上角的周期下拉框和主图指标图例 ----------
@@ -841,6 +843,20 @@
         select.addEventListener("change", () => setHtf(Number(select.value)));
         row.appendChild(select);
       }
+      if (item.key === "large") {
+        select = document.createElement("select");
+        select.className = "ml-size";
+        select.title = "圆圈最小半径（像素）：实心、空心都按此筛选；仅影响本图显示，成交统计保持完整";
+        select.setAttribute("aria-label", "大额成交圆圈最小半径");
+        for (const value of FlowLargeTrades.MIN_RADIUS_OPTIONS) {
+          const option = document.createElement("option");
+          option.value = String(value);
+          option.textContent = value ? `半径 ≥${value}px` : "全部";
+          select.appendChild(option);
+        }
+        select.addEventListener("change", () => setLargeMinRadius(Number(select.value)));
+        row.appendChild(select);
+      }
       if (item.params) {
         params = document.createElement(item.key === "ema" || item.key === "htfEma" ? "span" : "button");
         params.className = "ml-params";
@@ -916,7 +932,7 @@
     const largeStrengthMemo = new Map();   // 已收盘根的亮度(见 FlowLargeTrades.strengths), 换周期清空
     // 每根的圆点(FlowLargeTrades.markers): 跟尺寸单位、亮度一起更新, 绘制、悬停命中和价格轴边距共用, 不每次现算
     let largePoints = [];
-    const pointsAt = (i) => FlowLargeTrades.markers(bars[i], largeMarkerUnit, largeStrength[i]);
+    const pointsAt = (i) => FlowLargeTrades.markers(bars[i], largeMarkerUnit, largeStrength[i], shown.largeMinRadius);
     const obReadout = document.createElement("span");
     obReadout.className = "readout ob-read";
     obReadout.title = "当前有效的多/空区域数量。新建信号对应最新一根 K 线, 未收盘时可能撤回。";
@@ -1342,6 +1358,15 @@
       }
       return marks;
     }
+    function setLargeMinRadius(value) {
+      if (!FlowLargeTrades.MIN_RADIUS_OPTIONS.includes(value)) return;
+      shown.largeMinRadius = value;
+      largePoints = bars.map((_, i) => pointsAt(i));
+      renderLargeTrades();
+      renderLegend();
+      onShownChange();
+    }
+
     function renderLargeTrades() {
       if (largeMarkerUnit == null) {   // 价格、乘数还不知道时单位是 null, 数据到了补上, 所有圆点跟着重算
         largeMarkerUnit = FlowLargeTrades.sizeUnit(bars, cfg?.largeTrades, bars.at(-1)?.close);
@@ -1996,6 +2021,8 @@
 
     function renderLegend() {
       legendEl.hidden = settings.view === "footprint";   // 足迹图下主图指标都强制隐藏, 图例也收起
+      legendRows.large.select.value = String(shown.largeMinRadius);
+      legendRows.large.select.disabled = !shown.large;
       legendRows.ob.params.textContent = `${obOptions.zLen} / ${obOptions.maxAge}`;
       for (const [key, input] of Object.entries(obInputs)) {
         if (input.type === "checkbox") input.checked = obOptions[key];
