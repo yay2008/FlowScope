@@ -352,9 +352,10 @@
   // EMA 默认只画最右边这么多根(图例里 EMA 后面的「近100 / 全部」切换, 记在显示开关 emaAll):
   // 计算仍用全部历史(数值不变), 只是更早的部分不画, 免得几条线铺满整段历史。
   // 新 bar 进来走 renderAll 整体重设, 窗口随之右移; updateLast 只改末根, 不会越出窗口。
+  // 大周期 EMA 也按本图的这么多根截, 但有自己的「近100 / 全部」(显示开关 htfEmaAll), 与 EMA 互不影响。
   const EMA_DRAW_BARS = 100;
   // 大周期 EMA 21/55 沿用本图 EMA21/EMA55 的颜色, 画成粗的半透明阶梯线(大周期每根走完才跳一格): 同色 = 同一个周期数,
-  // 粗而淡 = 更大的周期, 本图 EMA 的细线压在上面也看得清。画线范围同 EMA(「近100 / 全部」)
+  // 粗而淡 = 更大的周期, 本图 EMA 的细线压在上面也看得清。
   const HTF_EMA_COLORS = ["rgba(240, 185, 13, 0.45)", "rgba(41, 98, 255, 0.55)"];
   const HTF_EMA_WIDTH = 3;
 
@@ -381,7 +382,7 @@
       title: "在本图上画更大周期的 EMA 21 / 55: 粗的半透明线, 颜色同本图的 EMA21 / EMA55, 大周期在后面的下拉框里选。" +
              "本图 K 线按大周期分桶, 本图之前的部分接着大周期图的历史算。只在大周期每根走完时更新: " +
              "每根显示最近一根已收盘的大周期 bar 的 EMA, 画成阶梯(相当于大周期图的 EMA 往右挪一根), 历史与实时一致、不会事后重画。" +
-             `画线范围跟着 EMA 那一行的「近${EMA_DRAW_BARS} / 全部」。` },
+             `画多长由后面的「近${EMA_DRAW_BARS} / 全部」切换(按本图 K 线根数, 与 EMA 那一行的各管各的)。` },
     { key: "band", name: "FlowWave带", params: true,
       title: "FlowWave 的回归通道: 中线 = 收盘价线性回归 21 根(默认不画, 点后面的「中线」显示成淡虚线), 上下轨 = 中线 ±k 倍回归残差标准差(k 点后面的「2σ」切换)。平时只有两条淡轨线; wt2 超买(大于80)时中线到上轨之间染红、上轨加粗, 超卖(小于20)时中线到下轨之间染绿、下轨加粗, 上色段的起点就是首次越界。轨道是真实价格, 可当动态支撑压力看。" },
   ];
@@ -680,10 +681,11 @@
    *   tf        初始主周期(秒), 之后由左上角的下拉框切换(setTf)
    *   symbol    合约代码(切合约是整页重载, 所以也不变)
    *   settings  页面的工具栏状态, 按引用共用, 组件只读
-   *   shown     本图主图指标的初始显示开关 {ema, emaAll, emaLong, htfEma, htf, band, bandMid, ob, large},
+   *   shown     本图主图指标的初始显示开关 {ema, emaAll, emaLong, htfEma, htfEmaAll, htf, band, bandMid, ob, large},
    *             之后由本图图例的眼睛按钮切换
    *             (emaAll 是 EMA 画全部历史还是只画最近 EMA_DRAW_BARS 根, 由那一行的「近100 / 全部」按钮切换;
    *             emaLong 是画不画 EMA100/200, 由那一行周期里的「100 200」切换;
+   *             htfEmaAll 同 emaAll, 管大周期 EMA, 由大周期EMA 那一行自己的「近100 / 全部」切换;
    *             htf 是大周期 EMA 选的大周期(秒), 由那一行的下拉框切换, 0 或不比本图周期大时按 defaultHtf 取默认;
    *             bandMid 是 FlowWave带 的中线, 由那一行的「中线」按钮切换)
    *   profiles  本图已画的成交量分布 [{from, to, rows, extend, visible}](页面记下来的, 不合法的条目丢掉)
@@ -731,8 +733,8 @@
     let loadController = null;
     let retryTimer = null;
     let retryAttempts = 0;
-    const shown = { ema: true, emaAll: false, emaLong: true, htfEma: true, htf: 0, band: false, bandMid: false, ob: false,
-                    large: true,
+    const shown = { ema: true, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false,
+                    bandMid: false, ob: false, large: true,
                     ...initialShown };
     let obOptions = FlowIndicators.normalizeObOptions(initialObOptions);
 
@@ -820,7 +822,8 @@
     // 它后面还有「中线」开关(亮 = 显示), 和眼睛一样只管本图、记进显示开关。
     // EMA 的周期后面是画线范围按钮, 写着当前范围(「近100」/「全部」), 点一下切到另一种; 同样只管本图、记进显示开关。
     // EMA 周期里的「100 200」本身也是按钮, 点一下显示/隐藏这两条长周期均线, 同样只管本图、记进显示开关。
-    // 大周期EMA 的名称后面是选大周期的下拉框, 选项随本图周期变(见 renderLegend), 选了只管本图、记进显示开关。
+    // 大周期EMA 的名称后面是选大周期的下拉框, 选项随本图周期变(见 renderLegend), 选了只管本图、记进显示开关;
+    // 周期后面同 EMA 也有画线范围按钮, 与 EMA 那一行的各管各的。
     const legendEl = document.createElement("div");
     legendEl.className = "main-legend";
     const legendRows = {};
@@ -846,11 +849,11 @@
         params.className = "ml-params";
         row.appendChild(params);
       }
-      if (item.key === "ema") {
+      if (item.key === "ema" || item.key === "htfEma") {
         range = document.createElement("button");
         range.className = "ml-range";
         range.type = "button";
-        range.addEventListener("click", () => toggleShown("emaAll"));
+        range.addEventListener("click", () => toggleShown(`${item.key}All`));
         row.appendChild(range);
       }
       if (item.key === "band") {
@@ -1283,6 +1286,7 @@
       derive();
       candleSeries.setData(bars.map(candleOf));
       renderEma();
+      renderHtfEma();
       renderSuite();
       renderLw();
       renderBand();
@@ -1341,13 +1345,15 @@
     function mainPaneRange(lo, hi) {
       let bottom = Infinity, top = -Infinity;
       const take = (v) => { if (v != null) { bottom = Math.min(bottom, v); top = Math.max(top, v); } };
-      const lines = !derived ? [] : [...derived.emaLines.filter((_, j) => emaLineShown(j)), ...(htfEmaShown() ? derived.htfEma : [])];
-      const emaFrom = shown.emaAll ? 0 : Math.max(0, bars.length - EMA_DRAW_BARS);
+      const lines = !derived ? [] : derived.emaLines.filter((_, j) => emaLineShown(j));
+      const htfLines = derived && htfEmaShown() ? derived.htfEma : [];
+      const emaFrom = emaDrawFrom(shown.emaAll), htfFrom = emaDrawFrom(shown.htfEmaAll);
       const band = bandShown() ? derived?.band : null;
       for (let i = lo; i <= hi; i++) {
         take(bars[i].high);
         take(bars[i].low);
         if (i >= emaFrom) for (const line of lines) take(line[i]);
+        if (i >= htfFrom) for (const line of htfLines) take(line[i]);
         if (band) { take(band.up[i]); take(band.dn[i]); }
       }
       return [bottom, top];
@@ -1510,15 +1516,26 @@
       bandSeries.applyOptions({ visible: bandShown(), midVisible: shown.bandMid });
     }
 
-    // EMA 与大周期 EMA 按画线范围整体 setData: 默认只取最右边 EMA_DRAW_BARS 根, emaAll 打开时画全部
-    function renderEma() {
-      if (!derived) return;   // 还没数据: 切范围只记状态, 数据到了 renderAll 会按它画
-      const from = shown.emaAll ? 0 : Math.max(0, bars.length - EMA_DRAW_BARS);
-      const draw = (seriesList, lines) => seriesList.forEach((s, j) =>
+    // EMA 与大周期 EMA 按各自的画线范围整体 setData: 默认只取最右边 EMA_DRAW_BARS 根, emaAll / htfEmaAll 打开时画全部
+    function emaDrawFrom(all) {
+      return all ? 0 : Math.max(0, bars.length - EMA_DRAW_BARS);
+    }
+
+    function drawEmaLines(seriesList, lines, all) {
+      const from = emaDrawFrom(all);
+      seriesList.forEach((s, j) =>
         s.setData(bars.slice(from).map((b, k) => ({ time: b.time, value: lines[j][from + k] }))
           .filter((p) => p.value != null)));
-      draw(emaSeries, derived.emaLines);
-      draw(htfEmaSeries, derived.htfEma);
+    }
+
+    function renderEma() {
+      if (!derived) return;   // 还没数据: 切范围只记状态, 数据到了 renderAll 会按它画
+      drawEmaLines(emaSeries, derived.emaLines, shown.emaAll);
+    }
+
+    function renderHtfEma() {
+      if (!derived) return;
+      drawEmaLines(htfEmaSeries, derived.htfEma, shown.htfEmaAll);
     }
 
     function emaShown() {
@@ -1587,7 +1604,7 @@
         htfHistories.set(htf, new Map(data.bars.filter((b) => b.close != null).map((b) => [b.time, b.close])));
         if (derived && htf === htfOf()) {
           derived.htfEma = deriveHtfEma();
-          renderEma();
+          renderHtfEma();
         }
       } catch (error) {
         if (htfLoad === load) htfLoad = null;   // 要不到(名额满了、断网): 只用本图的 K 线, 下次重连再要
@@ -1608,7 +1625,7 @@
       shown.htf = value;
       if (derived) {
         derived.htfEma = deriveHtfEma();
-        renderEma();
+        renderHtfEma();
       }
       renderLegend();
       onShownChange();
@@ -1616,7 +1633,7 @@
     }
 
     const APPLY_SHOWN = { ema: applyEmaVisibility, emaAll: renderEma, emaLong: applyEmaVisibility,
-                          htfEma: () => { applyHtfEmaVisibility(); loadHtfHistory(); },
+                          htfEma: () => { applyHtfEmaVisibility(); loadHtfHistory(); }, htfEmaAll: renderHtfEma,
                           band: applyBandVisibility, bandMid: applyBandVisibility, ob: refreshOb,
                           large: renderLargeTrades };
 
@@ -2062,11 +2079,15 @@
       long.disabled = !shown.ema;
       long.classList.toggle("on", shown.emaLong);
       long.title = `EMA${EMA_LONG_PERIODS.join(" / EMA")}, 只管本图。现在${shown.emaLong ? "显示, 点击隐藏" : "隐藏, 点击显示"}`;
-      const range = legendRows.ema.range;              // EMA 的画线范围: 写当前范围, EMA 关着时同样不能点
-      range.disabled = !shown.ema;
-      range.textContent = shown.emaAll ? "全部" : `近${EMA_DRAW_BARS}`;
-      range.title = `EMA 画线范围(数值都按全部历史计算), 只管本图。现在画${shown.emaAll ? "全部历史" : `最近 ${EMA_DRAW_BARS} 根 K 线`}, ` +
-                    `点击改成${shown.emaAll ? `只画最近 ${EMA_DRAW_BARS} 根` : "画全部历史"}`;
+      // EMA 与大周期 EMA 的画线范围: 写当前范围, 各自那一行关着时同样不能点
+      for (const [key, name] of [["ema", "EMA"], ["htfEma", "大周期 EMA"]]) {
+        const range = legendRows[key].range;
+        const all = shown[`${key}All`];
+        range.disabled = !shown[key];
+        range.textContent = all ? "全部" : `近${EMA_DRAW_BARS}`;
+        range.title = `${name} 画线范围(数值都按全部历史计算), 只管本图。现在画${all ? "全部历史" : `最近 ${EMA_DRAW_BARS} 根 K 线`}, ` +
+                      `点击改成${all ? `只画最近 ${EMA_DRAW_BARS} 根` : "画全部历史"}`;
+      }
       const htfRow = legendRows.htfEma;                // 大周期的选项随本图周期变, 没有更大的周期(4h)这一行就不显示
       const options = htfOptions(tf);
       if (options.join() !== htfOptionKey) {

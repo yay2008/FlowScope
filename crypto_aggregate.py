@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import math
 import time
 
 import numpy as np
@@ -18,7 +19,8 @@ import pandas as pd
 
 import ingest
 from crypto_feed import IDLE_RECOMPUTE_SEC, VENUE_NAMES, large_trade_source, rollup_bases, venue_of
-from indicator import BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, VOLUME_ROUND, finalize_bars, ltf_options
+from indicator import (BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, TZ_SHIFT_S, VOLUME_ROUND, finalize_bars,
+                       ltf_options)
 from ingest import feed_key
 
 PREFIX = "AGG."
@@ -48,6 +50,10 @@ class AggregateFeed(ingest.Feed):
         # 成分合约还没采集时的占位: 只提供参数说明, 没有记录, 汇总里该所按未覆盖算。
         self._large_missing = {part: ingest.LargeTradeDetector(part, large_trade_source(part))
                                for part in components}
+        # ltf -> (各家历史文件, 各自上次同步完时的版本, 自己的历史文件, 它的版本), 见 sync_history
+        self._synced = {}
+        # ltf -> (轮次, 各家 Feed, 各家这一粒度的历史文件, 算完时各自的版本, 各家窗口的起点), 见 _parts_since
+        self._part_marks = {}
 
     def _new_large_detector(self):
         """大额事件来自各成分合约自己的检测器(见 recompute), 汇总不自建。"""
@@ -63,7 +69,11 @@ class AggregateFeed(ingest.Feed):
         return self._empty_footprint(demand)
 
     def sync_history(self, manager):
-        """各交易所历史文件里都完整的 bar, 相加后写进汇总自己的历史文件(只补没有或不一样的)。"""
+        """各交易所历史文件里都完整的 bar, 相加后写进汇总自己的历史文件(只补没有或不一样的)。
+
+        只核对上次同步之后各家或自己的历史文件改到的那段(第一次全部核对): 更早的各根两边都没动过,
+        上次核对完就是一致的。历史有十几万根, 每 30 秒全部核对一遍要好几秒。
+        """
         for ltf in ltf_options(self.tf):
             stores = []
             for symbol in self.components:
@@ -72,14 +82,20 @@ class AggregateFeed(ingest.Feed):
                     return
                 store = feed._store(ltf)
                 store.refresh()
-                stores.append(store.values)
-            times = set(stores[0]).intersection(*stores[1:])
+                stores.append(store)
             mine = self._store(ltf)
             mine.refresh()
+            since = self._sync_since(ltf, stores, mine)
+            if since == float("inf"):
+                continue
+            times = stores[0].confirmed_times(since)
+            for store in stores[1:]:
+                times = np.intersect1d(times, store.confirmed_times(since), assume_unique=True)
+            tables = [store.values for store in stores]
             rows = []
-            for t in sorted(times):
-                buy = round(sum(values[t][0] for values in stores), VOLUME_ROUND)
-                sell = round(sum(values[t][1] for values in stores), VOLUME_ROUND)
+            for t in times.tolist():
+                buy = round(sum(values[t][0] for values in tables), VOLUME_ROUND)
+                sell = round(sum(values[t][1] for values in tables), VOLUME_ROUND)
                 if mine.values.get(t) != (buy, sell):
                     rows.append((t, buy, sell))
             if rows:
@@ -88,25 +104,48 @@ class AggregateFeed(ingest.Feed):
                 frame["buyLegacy"], frame["sellLegacy"] = frame["buy"], frame["sell"]
                 frame["coverage"], frame["hasBaseline"] = "complete", True
                 mine.save_completed(frame, final=True)
+            self._synced[ltf] = (tuple(stores), tuple(store.revision for store in stores), mine, mine.revision)
         self.last_sync = time.monotonic()
 
-    def _component_frame(self, manager, symbol, ltf):
+    def _sync_since(self, ltf, stores, mine):
+        """上次同步这一粒度之后, 各家与自己的历史文件最早改到哪(inf 都没改; 没同步过或换了文件 -inf)。"""
+        state = self._synced.get(ltf)
+        if (state is None or state[2] is not mine or len(state[0]) != len(stores)
+                or any(old is not new for old, new in zip(state[0], stores))):
+            return float("-inf")
+        since = float("inf")
+        for store, revision in [*zip(stores, state[1]), (mine, state[3])]:
+            moved = store.changed_since(revision)
+            if moved is not None:
+                since = min(since, moved)
+        return since
+
+    def _component_frame(self, manager, symbol, ltf, since=None):
+        """一家的窗口(合并过它自己的历史) -> (按 time 索引的 bars 或 None, 它窗口各根的时间或 None)。"""
         feed = manager.feeds.get(feed_key(symbol, self.tf))
         if feed is None or not feed.loaded:
-            return None
-        bars = feed.trades.frame(ltf)
+            return None, None
+        bars, window = feed.trades.frame_since(ltf, since)
         if bars.empty:
-            return None
+            return None, window
         store = feed._store(ltf)
         store.refresh()
-        return store.merge(bars).set_index("time")
+        return store.merge(bars).set_index("time"), window
 
     def combine(self, manager, ltf) -> pd.DataFrame:
         """各交易所的当前窗口 -> 汇总的 bars 表(BAR_COLUMNS); 第一个交易所没有数据时为空表。"""
-        frames = [self._component_frame(manager, symbol, ltf) for symbol in self.components]
+        return self.combine_since(manager, ltf)[0]
+
+    def combine_since(self, manager, ltf, since=None):
+        """同 combine, 另返回窗口各根的时间(取第一个交易所的)与各家窗口的起点(没有窗口为 None)。
+        since 给了只出这以后的几根: 每根只取决于各家同一时间的那根还在不在它的窗口里、是什么。"""
+        parts = [self._component_frame(manager, symbol, ltf, since) for symbol in self.components]
+        frames = [frame for frame, _ in parts]
+        window = parts[0][1]
+        starts = [int(part[0]) if part is not None and len(part) else None for _, part in parts]
         primary = frames[0]
         if primary is None:
-            return pd.DataFrame(columns=BAR_COLUMNS)
+            return pd.DataFrame(columns=BAR_COLUMNS), window, starts
         times = primary.index
         parts = [frame.reindex(times) if frame is not None else pd.DataFrame(index=times) for frame in frames]
         df = primary[["open", "high", "low", "close"]].copy()
@@ -123,7 +162,43 @@ class AggregateFeed(ingest.Feed):
         df["unknown"] = np.where(df["buy"].notna(), 0.0, np.nan)
         df["buyLegacy"], df["sellLegacy"] = df["buy"], df["sell"]
         df = finalize_bars(df.reset_index())
-        return df[BAR_COLUMNS]
+        return df[BAR_COLUMNS], window, starts
+
+    def _starts_moved(self, ltf, starts, window):
+        """第一家以外各家的窗口起点与上一轮不同时, 汇总窗口里从哪根起受影响(None 不受影响)。
+
+        汇总的一根要看别家同一时间那根在不在它自己的窗口里: 别家窗口往前滑(或往回伸)时, 起点两次位置之间
+        那几根进出了它的窗口, 而这不算它的成交有改动。第一家的窗口就是汇总的窗口, 滑出去的由拼接去掉。
+        """
+        mark = self._part_marks.get(ltf)
+        floor = None
+        for before, now in zip(mark[4][1:], starts[1:]):
+            if before == now:
+                continue
+            if before is None or now is None:
+                return float("-inf")
+            if max(before, now) > window[0]:
+                edge = max(min(before, now), int(window[0]))
+                floor = edge if floor is None else min(floor, edge)
+        return floor
+
+    def _parts_since(self, ltf, parts, changed):
+        """这一粒度能不能只算尾部(同 Feed._tail_since): 再算上各家这一粒度的历史文件在上一轮之后改到的地方
+        (合并各家窗口时用了它们)。各家 Feed 换了、还没读回历史, 都整窗口重算。"""
+        mark = self._part_marks.get(ltf)
+        if (mark is None or mark[0] != self._round - 1 or len(mark[1]) != len(parts)
+                or any(feed is None or not feed.loaded or old is not feed for old, feed in zip(mark[1], parts))):
+            return None
+        since = changed
+        for old, feed, revision in zip(mark[2], parts, mark[3]):
+            store = feed._store(ltf)
+            if store is not old:
+                return None
+            store.refresh()
+            moved = store.changed_since(revision)
+            if moved is not None:
+                since = min(since, moved)
+        return self._tail_since(ltf, since)
 
     def recompute(self, manager, broadcast):
         self._large_sources = [detector for symbol in self.components
@@ -134,13 +209,34 @@ class AggregateFeed(ingest.Feed):
             ltfs = [ltf for ltf, expires in self._requested.items() if expires >= now]
             demand_version = self._demand_version
             previous = dict(self.snapshots)
+        self._start_round()
+        parts = [manager.feeds.get(feed_key(symbol, self.tf)) for symbol in self.components]
+        # 各家逐笔成交窗口从上一轮到现在最早改到哪根(展示秒), 见 _parts_since
+        changed = min((feed.trades.changes.take(self) if feed is not None else float("-inf") for feed in parts),
+                      default=float("-inf"))
+        if math.isfinite(changed):
+            changed = changed // 1000 + TZ_SHIFT_S
         snapshots, messages = {}, []
         revision = self.revision + 1
         for ltf in ltfs:
-            bars = self.combine(manager, ltf)
+            since = self._parts_since(ltf, parts, changed)
+            bars, window, starts = self.combine_since(manager, ltf, since)
+            if since is not None and not bars.empty:
+                moved = self._starts_moved(ltf, starts, window)
+                if moved is not None and moved < since:
+                    since = int(moved) if moved > window[0] else None
+                    bars, window, starts = self.combine_since(manager, ltf, since)
+            if since is not None and bars.empty:
+                since = None                     # 不该发生: 上一轮的最后一根总在尾部里
+                bars, window, starts = self.combine_since(manager, ltf)
             if bars.empty:
                 continue
-            snapshots[ltf], message = self._publish(ltf, bars, previous, revision)
+            tail = None if since is None else (since, window, lambda ltf=ltf: self.combine(manager, ltf))
+            snapshots[ltf], message = self._publish(ltf, bars, previous, revision, tail)
+            if all(feed is not None for feed in parts):
+                stores = tuple(feed._store(ltf) for feed in parts)
+                self._part_marks[ltf] = (self._round, tuple(parts), stores, tuple(store.revision for store in stores),
+                                         starts)
             if message:
                 messages.append(message)
         with self._state_lock:

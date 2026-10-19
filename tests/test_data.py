@@ -253,6 +253,35 @@ class DataTests(unittest.TestCase):
                 store.save_completed(bars, final=True)
                 self.assertEqual(path.stat().st_size, size)
 
+    def test_index_grows_at_the_tail_exactly_like_a_full_rebuild(self):
+        """实时走完的 bar 都比已有的晚: 索引只接在末尾, 与整表重建逐位相同; 写到中间的才整表重建。"""
+        arrays = ("times", "sums", "display_times", "display_buy", "display_sell", "display_sums", "display_codes")
+
+        def rows(times, coverage):
+            frame = pd.DataFrame({"time": times, "buy": [0.1 * (t % 7) + 1 / 3 for t in times],
+                                  "sell": [0.7 * (t % 5) + 1 / 7 for t in times], "unknown": 0.,
+                                  "buyLegacy": 1., "sellLegacy": 1., "coverage": coverage, "hasBaseline": True})
+            return frame.assign(delta=frame.buy - frame.sell)
+
+        with tempfile.TemporaryDirectory() as folder:
+            store = HistoryStore(Path(folder) / "v3.csv")
+            store.save_completed(rows([1000, 1010, 1020], "complete"), final=True)
+            store.with_cvd(rows([1000], "complete"))            # 先把索引建好
+            for times, coverage in [([1030, 1040], "complete"), ([1050], "partial"), ([1060, 1070], "complete")]:
+                store.save_completed(rows(times, coverage), final=True)
+                self.assertFalse(store._dirty)
+                self.assertEqual([row[0] for row in store._tail], times)
+                store._ensure_index()
+                grown = {name: getattr(store, name).tobytes() for name in arrays}
+                store._dirty = True
+                store._ensure_index()
+                for name in arrays:
+                    self.assertEqual(grown[name], getattr(store, name).tobytes(), name)
+            store.save_completed(rows([1015], "complete"), final=True)   # 插到中间
+            self.assertTrue(store._dirty)
+            self.assertEqual(store.confirmed_times(1040).tolist(), [1040, 1060, 1070])
+            self.assertEqual(store.with_cvd(rows([1080], "complete")).cvdConfirmed.notna().tolist(), [True])
+
     def test_failed_second_append_keeps_successful_batch_indexed(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "v3.csv"

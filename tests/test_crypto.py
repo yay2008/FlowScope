@@ -297,6 +297,94 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(self.feed([(1, 100.0, 1.0, BASE + 1000, False)]).footprint_snapshot()["bars"], [])
 
 
+class TailRecomputeTests(unittest.TestCase):
+    """重算只算尾部(见 ingest.Feed._tail_since / _records): 每一轮的窗口、快照、推送与写出的文件,
+    都要和每轮整窗口重算的一模一样; 洞、回填、裁窗口、没成交的空 bar、大额事件都走一遍。"""
+
+    SETTINGS = json.dumps({"*": {"warmup": 20, "minNotional": 300.0, "windowSec": 60, "lagSec": 1}})
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.patches = [patch.dict(os.environ, {"LARGE_TRADE_SETTINGS": self.SETTINGS}),
+                        patch.object(crypto_feed, "TRIM_SLACK", 3), patch.object(ingest, "SNAPSHOT_BARS", 4)]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in self.patches:
+            item.stop()
+        self.temp.cleanup()
+
+    def make(self, name, tf):
+        folder = os.path.join(self.temp.name, f"{name}{tf}")
+        os.makedirs(folder)
+        with patch.object(ingest, "DATA_DIR", folder):
+            feed = CryptoFeed(BTC, tf)
+            feed.trades.max_bars = 6
+            feed.load_history()
+            feed.request(ltf=5, demand=True)
+        return feed, folder
+
+    @staticmethod
+    def recompute(feed, folder, full=False):
+        if full:                       # 整窗口重算: 不让它接上一轮的中间结果
+            feed._tail_marks.clear()
+            feed._record_state.clear()
+        feed.request(ltf=5)            # 同管理线程每轮续一次, 不然跑得慢时拆分粒度会过期
+        messages = []
+        with patch.object(ingest, "DATA_DIR", folder):
+            feed.recompute(messages.append)
+        return messages
+
+    def test_tail_recompute_matches_full_recompute_every_round(self):
+        for tf in NATIVE_TFS:
+            with self.subTest(tf=tf):
+                tail, tail_dir = self.make("tail", tf)
+                full, full_dir = self.make("full", tf)
+                calls = []
+                frame_since = tail.trades.frame_since
+                tail.trades.frame_since = lambda ltf=0, since=None: (calls.append(since), frame_since(ltf, since))[1]
+                seen = set()
+                trade_id, t, price = 1, BASE + 500, 100.0
+                for step in range(45):
+                    if step == 18:
+                        trade_id += 6               # 断线: 中间几笔没收到, 留一个洞
+                    t += 45_000 if step % 13 == 6 else 700 + (step * 997) % 2600   # 隔一阵一长段没成交
+                    for _ in range(step % 4):
+                        price = round(price + ((step * 7919) % 13 - 6) * 0.1, 1)
+                        qty = round(0.001 + ((step * 104729) % 97) / 40.0, 3)
+                        trade = (trade_id, price, qty, t, (trade_id * 31) % 3 == 0)
+                        for feed in (tail, full):
+                            feed.trades.add(*trade)
+                        trade_id += 1
+                        t += 37
+                    if step in (20, 27):            # 洞两端缺的成交插回窗口; 回填: 窗口中间几根整根写盘
+                        start = (t - 4 * tf * 1000) // (tf * 1000) * tf * 1000
+                        bars = aggregate_trades(make_trades(start, 6, step_ms=tf * 500, first_id=10**6),
+                                                tf, ltf_options(tf), start, start + 3 * tf * 1000)
+                        for feed, folder in ((tail, tail_dir), (full, full_dir)):
+                            with patch.object(ingest, "DATA_DIR", folder):
+                                if step == 27:
+                                    feed.apply_backfill(bars)
+                                else:
+                                    self.assertTrue(feed.trades.insert([], feed.trades.holes[-1][2]))
+                    got = self.recompute(tail, tail_dir)
+                    want = self.recompute(full, full_dir, full=True)
+                    self.assertEqual(json.dumps(got, sort_keys=True), json.dumps(want, sort_keys=True), step)
+                    self.assertEqual(json.dumps(tail.snapshots, sort_keys=True),
+                                     json.dumps(full.snapshots, sort_keys=True), step)
+                    for ltf, (_, frame) in full.latest.items():
+                        pd.testing.assert_frame_equal(tail.latest[ltf][1], frame)
+                    seen.update(full.latest[0][1]["time"].tolist() if 0 in full.latest else [])
+                for name in sorted(os.listdir(full_dir)):
+                    with open(os.path.join(full_dir, name), "rb") as a, open(os.path.join(tail_dir, name), "rb") as b:
+                        self.assertEqual(a.read(), b.read(), name)
+                tails = [since for since in calls if since is not None]
+                self.assertGreater(len(tails), len(calls) // 2, "大部分轮次应当只算尾部")
+                self.assertGreater(len(seen), len(full.latest[0][1]), "窗口往前滑过")
+                self.assertTrue(tail.large_trades.event_rows() or tail.large_trades.relative.event_rows())
+
+
 class FakeVenue:
     """假交易所: 成交表在内存里; 归档包只有 published_before 之前的日子, REST 可以设成被拒;
     fail_once 里的 REST 段(按段起点)第一次取会超时, 再取正常。"""

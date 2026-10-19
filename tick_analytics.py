@@ -89,6 +89,19 @@ class TickAnalytics:
         boundary = tick_bar_start(self.changed_ns, self.bar_ns)
         return boundary, self.frame[self._buckets() >= boundary]
 
+    def dirty_from(self, ltf):
+        """接下来这次 aggregate(ltf) 与上一次相比, 从哪根 bar 的起点(ns)起可能不同: 没变 inf, 都可能变 -inf。
+
+        与 aggregate 同一套判断: 隔了不止一次更新(或还没算过、换了窗口)就整段重算, 否则只重算变化快照所在
+        bar 起的尾部, 更早的 bar 沿用缓存。
+        """
+        cached, version = self._aggregates.get(ltf, (None, -1))
+        if cached is None or version < self.version - 1:
+            return float("-inf")
+        if version == self.version:
+            return float("inf")
+        return tick_bar_start(self.changed_ns, self.bar_ns)
+
     def aggregate(self, ltf, first_bar_ns):
         cached, version = self._aggregates.get(ltf, (None, -1))
         if cached is None or version < self.version - 1:

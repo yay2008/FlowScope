@@ -230,6 +230,45 @@ class DetectionTests(unittest.TestCase):
                          "裁掉的记录照样算已采集, 不能显示成未采集")
         self.assertTrue(all(v["large"]["cvd"] is not None for v in values))
 
+    def test_incremental_coverage_and_tail_summary_match_a_full_rescan(self):
+        """实时覆盖接着上次往后扫、汇总二分跳过窗口之前的事件, 结果都与从头算一遍相同;
+        改动记录给出的最早时刻之前结束的 K 线, 汇总不变。"""
+        ms = BASE // 1_000_000
+        reader = type("Reader", (), {})()          # 读者只被弱引用, 实际是 Feed
+        with patch("large_trades.RAW_SLACK", 40), patch("large_trades.EVENT_CAP", 6):
+            d = detector("trade", minQty=0, minNotional=0, windowSec=60, warmup=10)
+            self.assertEqual(d.changes.take(reader), float("-inf"), "第一次来取: 全部重算")
+            previous = None
+            for i in range(1, 2600):
+                if i % 97 == 0:
+                    continue                                   # 漏号: 覆盖断开、重新预热
+                t = ms + i * 400 + (30_000 if i % 250 == 0 else 0)
+                d.trade(i, 100, 30 if i % 23 == 0 else 1 + i % 3, t, i % 2 == 0)
+                if i % 100:
+                    continue
+                incremental = d.spans()
+                d._live_scan = None
+                d._live_spans = None
+                for layer in d._layers():
+                    layer._spans = None
+                self.assertEqual(incremental, d.spans(), i)
+                values = bars(30, count=12 + i // 75)   # 窗口一直从头算起
+                whole = [dict(v) for v in values]
+                decorate_bars(whole, [d], 30)
+                tail = [dict(v) for v in values[-3:]]
+                decorate_bars(tail, [d], 30)
+                self.assertEqual(whole[-3:], tail, i)
+                since = d.changes.take(reader)
+                if previous is not None and since > float("-inf"):
+                    cutoff = since // NS + TZ_SHIFT_S - 30
+                    old = {v["time"]: v for v in previous}
+                    for v in whole:
+                        if v["time"] < cutoff and v["time"] in old:
+                            self.assertEqual(v, old[v["time"]], (i, v["time"]))
+                previous = whole
+        self.assertLess(len(d.raw), 1000, "原始记录裁过")
+        self.assertIsNotNone(d._events_floor, "事件裁过")
+
     def test_absorbed_history_is_shown_without_touching_the_live_baseline(self):
         ms = BASE // 1_000_000
         env = '{"TEST.X": {"warmup": 3, "lagSec": 0, "minNotional": 0}}'

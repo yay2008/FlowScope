@@ -340,6 +340,7 @@ class RollupMixin:
             ltfs = [ltf for ltf, expires in self._requested.items() if expires >= now]
             demand_version = self._demand_version
             previous = dict(self.snapshots)
+        self._start_round()      # 大额汇总只重算检测器改到的那几根(见 ingest.Feed._records)
         base = self.base()
         snapshots, messages = {}, []
         revision = self.revision + 1

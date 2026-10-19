@@ -1,4 +1,6 @@
 import asyncio
+import json
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ from indicator import (CFG, BAR_NS, TZ_SHIFT_S, build_bars, build_footprint, spl
                        _classify_ticks)
 from tick_analytics import TickAnalytics
 from test_data import BASE, boundary_ticks, ticks, klines
+from test_period import Clock
 
 
 def full_bars(data, ltf=0):
@@ -292,6 +295,120 @@ class FeedTests(unittest.TestCase):
         with patch.object(server, "manager", manager):
             asyncio.run(exercise())
 
+
+
+class FuturesTailTests(unittest.TestCase):
+    """期货也只算尾部(见 Feed._kline_changes / _tail_since): SDK 原地改末根 K 线、追加 tick 和 K 线,
+    每一轮的窗口、快照、推送、足迹与写出的文件都要和每轮整窗口重算的一模一样。"""
+
+    SETTINGS = '{"*": {"warmup": 15, "windowSec": 60, "lagSec": 2, "minQty": 3, "minNotional": 0}}'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.clock = Clock()                     # 需求按时间过期: 两个 Feed 要在同一轮过期
+        self.patches = [patch.dict(os.environ, {"LARGE_TRADE_SETTINGS": self.SETTINGS}),
+                        patch.object(ingest, "SNAPSHOT_BARS", 15), patch.object(ingest.time, "monotonic", self.clock)]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in self.patches:
+            item.stop()
+        self.temp.cleanup()
+
+    @staticmethod
+    def tick(state, roll=False):
+        state["id"] += 1
+        state["t"] += 1_500_000_000
+        state["price"] += (state["id"] * 7919) % 3 - 1
+        before = 0.0 if roll else state["volume"]
+        state["volume"] = ((0.0 if roll else state["volume"]) + (state["id"] * 104729) % 9 * (state["id"] % 4 > 0)
+                           + (60 if state["id"] % 61 == 0 else 0))      # 偶尔一笔大成交(间隔超过基线的时间窗)
+        bid = state["price"] - state["id"] % 2
+        return {"id": state["id"], "datetime": float(state["t"]), "last_price": state["price"],
+                "ask_price1": bid + 1, "bid_price1": bid, "volume": state["volume"]}, state["volume"] - before
+
+    @staticmethod
+    def apply(candles, tick, dv):
+        start = float((int(tick["datetime"]) - 1) // 10**10 * 10**10)
+        last = candles.index[-1]
+        price = tick["last_price"]
+        if candles.at[last, "datetime"] == start:
+            candles.loc[last, ["high", "low", "close", "volume"]] = [
+                max(candles.at[last, "high"], price), min(candles.at[last, "low"], price), price,
+                candles.at[last, "volume"] + dv]
+            return candles
+        row = pd.DataFrame([{"datetime": start, "open": price, "high": price, "low": price, "close": price,
+                             "volume": dv}])
+        return pd.concat([candles, row], ignore_index=True).tail(40).reset_index(drop=True)
+
+    def test_tail_recompute_matches_full_recompute_every_round(self):
+        state = {"id": 0, "t": 1_800_000_000 * 10**9, "price": 3000.0, "volume": 500.0}
+        i = pd.Series(range(-40, 0), dtype=float)
+        candles = pd.DataFrame({"datetime": (1_800_000_000 + i * 10) * 10**9, "open": 3000.0 + i % 5,
+                                "high": 3003.0, "low": 2997.0, "close": 3001.0, "volume": 20.0 + i % 3})
+        window = []
+        for _ in range(150):
+            tick, dv = self.tick(state)
+            window.append(tick)
+            candles = self.apply(candles, tick, dv)
+        quote = SimpleNamespace(price_tick=1.0, volume_multiple=None)
+        feeds = {}
+        for name in ("tail", "full"):
+            folder = os.path.join(self.temp.name, name)
+            os.makedirs(folder)
+            with patch.object(ingest, "DATA_DIR", folder):
+                feed = ingest.Feed(server.DEFAULT_SYMBOL, 10)
+                feed.quote = quote
+                feed._store(0)
+            feeds[name] = (feed, folder)
+        tails = []
+        publish = feeds["tail"][0]._publish
+        feeds["tail"][0]._publish = lambda ltf, bars, previous, revision, tail=None: (
+            tails.append(tail is not None), publish(ltf, bars, previous, revision, tail))[1]
+        for step in range(70):
+            self.clock.advance(61 if step == 30 else 1.5)    # 隔一阵没人要足迹图: 它的需求过期, 又回到只算尾部
+            if step == 35:                       # 断线重连: tick 窗口整个换掉, 与旧窗口不重叠
+                state["id"] += 30
+                window = []
+            for _ in range(1 if step != 35 else 150):
+                tick, dv = self.tick(state, roll=step == 50)
+                window.append(tick)
+                candles = self.apply(candles, tick, dv)
+            window = window[-150:]
+            if step == 10:
+                quote.volume_multiple = 10       # 合约乘数后到
+            if step % 17 == 8:
+                candles.loc[candles.index[-3], "volume"] += 1     # SDK 修订了前面一根
+            if step == 60:                       # 别处往历史文件写了窗口中间几根
+                part = candles.iloc[-12:-9]
+                rows = pd.DataFrame({"time": (part.datetime // 10**9 + TZ_SHIFT_S).astype("int64"),
+                                     "buy": part.volume, "sell": 0.0, "delta": part.volume, "unknown": 0.0,
+                                     "buyLegacy": part.volume, "sellLegacy": 0.0, "coverage": "complete",
+                                     "hasBaseline": True})
+                for feed, _ in feeds.values():
+                    feed._store(0).save_completed(rows, final=True)
+            got = {}
+            for name, (feed, folder) in feeds.items():
+                feed.ticks = pd.DataFrame(window)
+                feed.klines = candles
+                if 20 <= step < 25:
+                    feed.request(footprint=True)
+                if name == "full":
+                    feed._tail_marks.clear()
+                    feed._record_state.clear()
+                messages = []
+                with patch.object(ingest, "DATA_DIR", folder):
+                    feed.recompute(messages.append)
+                got[name] = (json.dumps([messages, feed.snapshots, feed.footprint], sort_keys=True), feed.latest[0][1])
+            self.assertEqual(got["tail"][0], got["full"][0], step)
+            pd.testing.assert_frame_equal(got["tail"][1], got["full"][1])
+        tail_dir, full_dir = feeds["tail"][1], feeds["full"][1]
+        for name in sorted(os.listdir(full_dir)):
+            with open(os.path.join(full_dir, name), "rb") as a, open(os.path.join(tail_dir, name), "rb") as b:
+                self.assertEqual(a.read(), b.read(), name)
+        self.assertGreater(sum(tails), len(tails) // 2, "大部分轮次应当只算尾部")
+        self.assertTrue(feeds["tail"][0].large_trades.event_rows(), "大额事件也走过")
 
 
 class StaticFilesTests(unittest.TestCase):

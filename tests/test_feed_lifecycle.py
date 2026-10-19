@@ -247,6 +247,23 @@ class FeedLifecycleTests(unittest.TestCase):
         self.assertEqual(self.manager.failed_feeds, {})
         self.assertEqual(len(api.quote_calls), 1)
 
+    def test_unwatched_feeds_recompute_at_most_every_idle_interval(self):
+        """数据一直在变: 有页面在看的(含在看的大周期合成用的 30s)每轮都算, 没人看的最多每 IDLE_RECOMPUTE_SEC 一次。"""
+        quiet, viewed, base = self.feed("SHFE.quiet"), self.feed("SHFE.viewed"), self.feed("SHFE.base")
+        rollup = self.manager.ensure("SHFE.base", 60)
+        rollup.recompute = Mock(side_effect=lambda broadcast: setattr(rollup, "snapshots", {0: {"bars": []}}))
+        for feed in (quiet, viewed, base, rollup):
+            feed.data_changing = lambda api: True
+        self.manager.add_client(object(), "SHFE.viewed", 0, tf=30)
+        self.manager.add_client(object(), "SHFE.base", 0, tf=60)
+        api = ScriptedApi(self.manager, self.clock, [self.advance(1)] * 12)
+        self.manager._run_api(api)
+        self.assertEqual(viewed.recompute.call_count, 12)
+        self.assertEqual(base.recompute.call_count, 12)
+        self.assertEqual(rollup.recompute.call_count, 12)
+        self.assertEqual(quiet.recompute.call_count, 3, "第一轮(还没有快照)、之后每 5 秒一次")
+        self.assertTrue(quiet.pending, "攒着的改动下一次到点再算")
+
     def test_lower_candle_subscription_failure_can_recover(self):
         feed = self.feed()
         feed.request(ltf=5)

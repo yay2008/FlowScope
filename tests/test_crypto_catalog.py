@@ -1,5 +1,6 @@
 """加密合约的选择器分组、自选与报价、常驻采集, 以及多所汇总(合成、历史、报价)。"""
 import asyncio
+import json
 import os
 import tempfile
 import time
@@ -173,6 +174,73 @@ class AggregateTests(unittest.TestCase):
         agg.sync_history(self.manager)
         self.assertEqual(len(agg._store(0).values), 2)
         self.assertEqual(len(agg._store(5).values), 2)
+
+    def test_history_sync_only_rechecks_what_changed_but_still_repairs_it(self):
+        self.manager.ensure("AGG.BTC", 30)
+        self.manager._sync(time.monotonic())
+        trades = pd.DataFrame({"id": range(1, 25), "price": 100.0, "qty": 0.5,
+                               "t": [BASE + i * 5000 + 1000 for i in range(24)], "sell": [i % 3 == 0 for i in range(24)]})
+        bars = aggregate_trades(trades, 30, ltf_options(30), BASE, BASE + 120000)
+        for symbol in (BTC, OKX_BTC):
+            self.manager.feeds[(symbol, 30)].apply_backfill(bars)
+        agg = self.manager.aggregates.feeds[("AGG.BTC", 30)]
+        agg.sync_history(self.manager)
+        store = agg._store(0)
+        first = (BASE // 1000) + 8 * 3600
+        right = store.values[first]
+        # 汇总自己的文件被改了一根(比如实时窗口写进去的), 下一次合成照样改回来
+        store.save_completed(pd.DataFrame({"time": [first], "buy": [9.0], "sell": [9.0], "delta": [0.0],
+                                           "unknown": [0.0], "buyLegacy": [9.0], "sellLegacy": [9.0],
+                                           "coverage": ["complete"], "hasBaseline": [True]}), final=True)
+        self.assertEqual(agg._sync_since(0, [self.manager.feeds[(s, 30)]._store(0) for s in (BTC, OKX_BTC)], store),
+                         first)
+        agg.sync_history(self.manager)
+        self.assertEqual(store.values[first], right)
+        self.assertEqual(agg._sync_since(0, [self.manager.feeds[(s, 30)]._store(0) for s in (BTC, OKX_BTC)], store),
+                         float("inf"), "都没改过: 下一次不用核对")
+
+    def test_tail_recompute_matches_full_recompute(self):
+        """汇总也只算尾部(见 AggregateFeed._parts_since): 每一轮的窗口、快照与推送和整窗口重算的一样。"""
+        feed = self.manager.ensure("AGG.BTC", 10)
+        self.manager._sync(time.monotonic())
+        parts = [self.manager.feeds[(symbol, 10)] for symbol in (BTC, OKX_BTC)]
+        for part in parts:
+            part.trades.max_bars = 12                    # 窗口很快往前滑: 两家窗口的起点会错开
+        full = type(feed)(feed.symbol, 10, feed.components, feed.price_digits, feed.qty_digits)
+        other = os.path.join(self.temp.name, "full")
+        os.makedirs(other)
+        calls = []
+        combine = feed.combine_since
+        feed.combine_since = lambda manager, ltf, since=None: (calls.append(since), combine(manager, ltf, since))[1]
+        ids, t = [1, 10_001], BASE + 300
+        for step in range(40):
+            if step in (15, 32):
+                ids[0] += 5                              # 第一家断线留洞, 正赶上一段没成交: 它少几根, 两家窗口起点错开
+            t += 40_000 if step % 29 == 15 else 900 + (step * 613) % 2300
+            for index, part in enumerate(parts):
+                if step % 5 == 2 and index == 1:
+                    continue                             # 另一家这段没成交
+                for k in range(1 + step % 3):
+                    part.trades.add(ids[index], 100.0 + (step * 7 + k) % 9 * 0.1,
+                                    0.01 * (1 + (step + k) % 5), t + 100 * k + index, (step + k) % 2 == 0)
+                    ids[index] += 1
+                part.request(ltf=0)
+                part.recompute(lambda _: None)           # 各家先算(写各自的历史), 同管理线程的顺序
+            if step % 20 == 19:
+                feed.sync_history(self.manager)
+                with patch.object(ingest, "DATA_DIR", other):
+                    full.sync_history(self.manager)
+            got, want = [], []
+            feed.recompute(self.manager, got.append)
+            full._tail_marks.clear()
+            full._record_state.clear()
+            full._part_marks.clear()
+            with patch.object(ingest, "DATA_DIR", other):
+                full.recompute(self.manager, want.append)
+            self.assertEqual(json.dumps(got, sort_keys=True), json.dumps(want, sort_keys=True), step)
+            self.assertEqual(json.dumps(feed.snapshots, sort_keys=True), json.dumps(full.snapshots, sort_keys=True), step)
+            pd.testing.assert_frame_equal(feed.latest[0][1], full.latest[0][1])
+        self.assertGreater(sum(since is not None for since in calls), len(calls) // 2, "大部分轮次应当只算尾部")
 
     def test_unknown_aggregates_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "多所汇总"):

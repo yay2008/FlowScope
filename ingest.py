@@ -24,11 +24,12 @@ import threading
 import time
 from collections.abc import Mapping, MutableMapping
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from tqsdk import TqApi, TqAuth
 
-from indicator import (CFG, DEFAULT_TF_SEC, ROLLUP_BASE_TF, TF_OPTIONS, bar_ns_for, is_rollup,
+from indicator import (CFG, DEFAULT_TF_SEC, ROLLUP_BASE_TF, TF_OPTIONS, TZ_SHIFT_S, bar_ns_for, is_rollup,
                        ltf_options, build_bars, build_bars_from_ltf, bars_to_records)
 from history_store import HistoryStore
 from rollup import RollupMixin, candles_from_klines
@@ -61,6 +62,8 @@ PROBE_SYMBOL = "KQ.m@SHFE.fu"
 # 订阅失败不是永久状态: 冷却期结束后自动重订, 避免一次抖动或一次手误把合约锁死到进程重启。
 FAIL_RETRY_SEC = 30
 COMPUTE_RETRY_SEC = 1
+# 没有页面在看的周期: 数据变了最多每这么久重算一次(落盘、快照不必每笔 tick 都跟); 在看的照常每笔都算。
+IDLE_RECOMPUTE_SEC = 5.0
 # 健康和失败 Feed 都按真实需求回收；后台自动重试不延长闲置期。
 IDLE_EVICT_SEC = 600
 # 回收订阅过的 Feed 要关掉整条连接重建(TqSdk 不能单独退订)。有一个到期时, 这么久之内
@@ -143,6 +146,32 @@ def validate_tf(tf) -> int:
     return value if value in TF_OPTIONS else DEFAULT_TF_SEC
 
 
+def _same_prefix(new: pd.DataFrame, old: pd.DataFrame) -> int:
+    """new 开头有几根与 old 里同一时间的那根逐列按位相同(都按 time 升序)。
+
+    浮点按位比: -0.0 与 0.0、NaN 都算不同, 宁可多转几根, 也不能把转出来不一样的当成一样。
+    两边列或类型不一样时为 0。
+    """
+    if new.empty or old.empty or list(new.columns) != list(old.columns) or not new.dtypes.equals(old.dtypes):
+        return 0
+    new_times, old_times = new["time"].to_numpy(), old["time"].to_numpy()
+    offset = int(np.searchsorted(old_times, new_times[0]))
+    count = min(len(new_times), len(old_times) - offset)
+    if count <= 0:
+        return 0
+    same = new_times[:count] == old_times[offset:offset + count]
+    for column in new.columns:
+        a = new[column].to_numpy()[:count]
+        b = old[column].to_numpy()[offset:offset + count]
+        if a.dtype.kind == "f":
+            same &= a.view(f"i{a.dtype.itemsize}") == b.view(f"i{b.dtype.itemsize}")
+        elif a.dtype.kind == "O":
+            same &= np.fromiter((x is y or (type(x) is type(y) and x == y) for x, y in zip(a, b)), bool, count)
+        else:
+            same &= a == b
+    return count if same.all() else int(np.argmin(same))
+
+
 class Feed:
     """单合约 + 单主周期快照；只有 ingest 线程读写 SDK 数据和历史文件。
 
@@ -181,6 +210,17 @@ class Feed:
         self.large_trades = self._new_large_detector()
         self._large_synced = None   # (TickAnalytics, version): 快照没变就不再喂检测器
         self._large_cache = None    # (输入签名, 各根汇总): 各拆分粒度共用, 见 _decorate_large
+        # 增量重算(加密与大周期用, 见 _start_round): 每轮开始时编号加一, 只有紧挨着的上一轮留下的中间结果
+        # 才能接着用 —— 中途出错的那一轮已经取走了改动记录, 它之前的结果就不能再接。
+        self._round = 0
+        self._large_since = float("-inf")   # 这一轮大额汇总要从哪根(展示秒)起重算; -inf 全部重算
+        self._large_seen = None             # 上一轮汇总用的检测器(换了就全部重算)
+        self._record_state = {}             # ltf -> (轮次, 快照, 生成它的那段 bars), 见 _records
+        self._tail_marks = {}               # ltf -> (轮次, 历史文件, 它算完时的版本), 见 _tail_since
+        self._klines_seen = None            # 上一轮的 K 线 (展示秒, 开高低收量), 见 _kline_changes
+        # 采集循环的节流(见 FeedManager._run_api): 数据变了还没算 / 上次算完的时刻
+        self.pending = False
+        self.last_compute = 0.0
 
     def _new_large_detector(self):
         """原生周期自带大额检测器; 合成周期与多所汇总没有自己的原始成交, 覆盖为 None。"""
@@ -346,17 +386,33 @@ class Feed:
         if valid_klines.empty:
             return
         first_bar_ns = int(valid_klines.datetime.iloc[0])
+        # 检测器本轮已喂完 tick, 这时才取它的改动; 大额汇总只重做改到的那几根(见 _records)
+        self._start_round()
+        # K 线与 tick 汇总从上一轮到现在最早改到哪根(展示秒): 平时只有最后一两根, 只算尾部(见 _tail_since)
+        times = (valid_klines["datetime"] // 10**9 + TZ_SHIFT_S).astype("int64").to_numpy()
+        dirty = self.analytics.dirty_from(0)
+        changed = min(self._kline_changes(valid_klines, times),
+                      dirty if not math.isfinite(dirty) else int(dirty) // 10**9 + TZ_SHIFT_S)
         snapshots = {}
         messages = []
         revision = self.revision + 1
         tick_bars = None
         for ltf in ltfs:
+            tail = None
             if ltf == 0:
                 aggregates = self.analytics.aggregate(0, first_bar_ns)
-                bars = build_bars(self.klines, self.ticks, 0, classified=classified,
-                                  aggregates=aggregates, first_tick_ns=self.analytics.first_tick_ns,
-                                  bar_ns=self.bar_ns)
+                tick_bars_of = lambda klines, aggregates=aggregates: build_bars(
+                    klines, self.ticks, 0, classified=classified, aggregates=aggregates,
+                    first_tick_ns=self.analytics.first_tick_ns, bar_ns=self.bar_ns)
+                # 足迹图要整窗口(合并历史之前)的覆盖, 开着足迹图时整窗口算
+                since = None if want_fp else self._tail_since(0, changed)
+                bars = tick_bars_of(valid_klines[times >= since]) if since is not None else None
+                if bars is None or bars.empty:       # 尾部是空的不该发生(上一轮的最后一根总在里面)
+                    bars = tick_bars_of(self.klines)
+                else:
+                    tail = (since, times, lambda: tick_bars_of(self.klines))
             else:
+                # K 线口径: 小周期窗口一滚动, 覆盖起点就在主周期窗口中间挪动, 只算尾部省不了多少, 整窗口算
                 lower = self.lower_klines.get(ltf)
                 if lower is None or not (lower.datetime > 0).any():
                     continue
@@ -365,7 +421,7 @@ class Feed:
                 continue
             if ltf == 0:
                 tick_bars = bars
-            snapshots[ltf], message = self._publish(ltf, bars, previous, revision)
+            snapshots[ltf], message = self._publish(ltf, bars, previous, revision, tail)
             if message:
                 messages.append(message)
         fp = None
@@ -436,30 +492,134 @@ class Feed:
         decorate_bars(recs, sources, self.tf)
         self._large_cache = (key, [(rec.get("large"), rec.get("largeRelative")) for rec in recs])
 
-    def _publish(self, ltf, bars, previous, revision):
-        """合并历史、落盘、算 CVD, 返回 (该粒度的快照, 有变化时的增量消息或 None)。"""
+    def _start_round(self):
+        """增量重算的一轮开始(读任何数据之前调用): 轮次加一, 取走大额检测器从上一轮到现在的改动。
+
+        检测器给的是成交时刻(ns), 换成展示秒再往前让一根: 一根 bar 的大额汇总只看 [起点, 起点+周期)
+        里的事件、覆盖区间和这之前的累计, 在改动时刻之前就结束的 bar 不受影响。不调用它(期货的原生周期)
+        就一直是 -inf, 每轮全部重新汇总。
+        """
+        self._round += 1
+        sources = tuple(self.large_sources())
+        earliest = min((source.changes.take(self) for source in sources), default=float("inf"))
+        if sources != self._large_seen:
+            earliest = float("-inf")
+        self._large_seen = sources
+        if math.isfinite(earliest):
+            earliest = int(earliest // 10**9) + TZ_SHIFT_S - self.tf
+        self._large_since = earliest
+
+    def _kline_changes(self, klines, times):
+        """K 线从上一轮到现在最早改到哪根(展示秒; inf 没改, -inf 整体都变了)。
+
+        TqSdk 原地改 K 线序列, 没有改动记录, 只能与上一轮存下的逐根按位比: 平时只有最后一根在变,
+        新的一根追加在末尾、最早的一根滑出窗口。
+        """
+        values = np.ascontiguousarray(klines[["open", "high", "low", "close", "volume"]].to_numpy(dtype=float))
+        previous, self._klines_seen = self._klines_seen, (times.copy(), values)
+        if previous is None or not len(times) or not len(previous[0]):
+            return float("-inf")
+        old_times, old_values = previous
+        offset = int(np.searchsorted(old_times, times[0]))
+        count = min(len(times), len(old_times) - offset)
+        if count <= 0:
+            return float("-inf")
+        same = times[:count] == old_times[offset:offset + count]
+        same &= (values[:count].view(np.int64) == old_values[offset:offset + count].view(np.int64)).all(axis=1)
+        first = count if same.all() else int(np.argmin(same))
+        return float("inf") if first == len(times) else int(times[first])
+
+    def _tail_since(self, ltf, changed):
+        """这一粒度能不能只算尾部: 能就返回尾部起点(展示秒), 否则 None(整窗口重算)。
+
+        changed 是数据来源从上一轮到现在最早改到哪根(展示秒; inf 没改, -inf 整体都变了)。尾部还要包括
+        上一轮算完之后历史文件又改到的地方(回填、汇总合成写进来的), 和上一轮的最后一根(那时没走完、
+        没落盘, 现在可能走完了)。更早的各根合并历史、落盘、CVD 的结果都与上一轮相同, 直接沿用。
+        """
+        mark = self._tail_marks.get(ltf)
+        entry = self.latest.get(ltf)
+        if mark is None or entry is None or mark[0] != self._round - 1:
+            return None
+        store = self._store(ltf)
+        if mark[1] is not store:
+            return None
+        store.refresh()
+        moved = store.changed_since(mark[2])
+        since = min(changed, float("inf") if moved is None else moved, int(entry[1]["time"].iloc[-1]))
+        return int(since) if math.isfinite(since) else None
+
+    def _publish(self, ltf, bars, previous, revision, tail=None):
+        """合并历史、落盘、算 CVD, 返回 (该粒度的快照, 有变化时的增量消息或 None)。
+
+        tail=(起点, 本轮窗口各根的时间, 重取整窗口的函数) 时 bars 只有起点及以后的几根(见 _tail_since):
+        更早的沿用上一轮的结果, 去掉滑出窗口的。拼出来与本轮窗口对不上(不该发生)就整窗口重算。
+        """
         store = self._store(ltf)
         # 增量读: 文件被其它进程(离线脚本/另一次运行)追加过时补齐内存视图,
         # 无变化时只是一次 stat, 不会重解析整个文件。
         store.refresh()
+        bars = self._merge_history(store, bars)
+        if tail is not None:
+            since, window, rebuild = tail
+            kept = self.latest[ltf][1]
+            times = kept["time"].to_numpy()
+            kept = kept[(times < since) & np.isin(times, window)]
+            if not kept.empty:
+                bars = pd.concat([kept, bars], ignore_index=True)
+            if not np.array_equal(bars["time"].to_numpy(), window):
+                bars = self._merge_history(store, rebuild())
+        self.latest[ltf] = (revision, bars)
+        self._tail_marks[ltf] = (self._round, store, store.revision)
+        return self._snapshot_message(ltf, bars, previous, revision, store.base)
+
+    @staticmethod
+    def _merge_history(store, bars):
         bars = store.merge(bars)
         store.save_completed(bars)
-        bars = store.with_cvd(bars)
-        self.latest[ltf] = (revision, bars)
-        return self._snapshot_message(ltf, bars, previous, revision, store.base)
+        return store.with_cvd(bars)
+
+    def _records(self, ltf, tail, prior):
+        """快照要发的最近几根 bars -> (沿用上一份快照的各根, 新转的各根)。
+
+        开头那些与上一轮(紧挨着的那一轮)的 bars 逐列按位相同、又在大额汇总改动处之前的, 直接沿用上一份
+        快照里的 dict(它们转出来、汇总出来都一样); 从第一根不同的起往后都重新转、重新汇总大额。
+        大额汇总只看这一根的时间段和更早的事件, 对一段末尾单独汇总与整段汇总再取末尾相同。
+        """
+        start = 0
+        state = self._record_state.get(ltf)
+        if (prior is not None and state is not None and state[0] == self._round - 1 and state[1] is prior
+                and self._large_since > float("-inf")):
+            start = _same_prefix(tail, state[2])
+            times = tail["time"].to_numpy()
+            if math.isfinite(self._large_since):
+                start = min(start, int(np.searchsorted(times, self._large_since, side="left")))
+            # 新的一根离前一根不到一个周期时, 前一根汇总的终点(见 decorate_bars)跟着变
+            while 0 < start < len(times) and times[start] - times[start - 1] < self.tf:
+                start -= 1
+        kept = []
+        if start:
+            old = {bar["time"]: bar for bar in prior["bars"]}
+            kept = [old[t] for t in tail["time"].iloc[:start].tolist()]
+        fresh = bars_to_records(tail.iloc[start:])
+        self._decorate_large(fresh)
+        return kept, fresh
 
     def _snapshot_message(self, ltf, bars, previous, revision, cvd_base):
         """算好的 bars -> (该粒度的快照, 与上一份快照相比有变化时的增量消息或 None)。"""
-        recs = bars_to_records(bars.tail(SNAPSHOT_BARS))
-        self._decorate_large(recs)
+        tail = bars.tail(SNAPSHOT_BARS)
+        prior = previous.get(ltf)
+        kept, fresh = self._records(ltf, tail, prior)
+        recs = kept + fresh
         snapshot ={"symbol": self.symbol, "cfg": self.cfg(), "ltf": ltf,
                     "tf": self.tf,
                     "source": "tick" if ltf == 0 else "kline",
                     "revision": revision, "cvdBase": cvd_base,
                     "bars": recs}
-        old = {b["time"]: b for b in previous.get(ltf, {}).get("bars", [])}
-        changed = [bar for bar in recs if old.get(bar["time"]) != bar]
-        cfg_changed = previous.get(ltf, {}).get("cfg") != snapshot["cfg"]
+        self._record_state[ltf] = (self._round, snapshot, tail)
+        old = {b["time"]: b for b in (prior or {}).get("bars", [])}
+        # 沿用的就是上一份里的同一个 dict, 不会有变化
+        changed = [bar for bar in fresh if old.get(bar["time"]) != bar]
+        cfg_changed = (prior or {}).get("cfg") != snapshot["cfg"]
         message = None
         if changed or cfg_changed:
             message = {"type": "bars", "symbol": self.symbol, "ltf": ltf,
@@ -1018,6 +1178,10 @@ class FeedManager:
                 feed = by_key.get((symbol, tf))
                 if feed is not None:
                     feed.request(ltf=ltf, footprint=footprint, demand=False)
+            watched = {(symbol, tf) for symbol, tf, _, _ in clients}
+            # 看着大周期, 也就是看着合成它的 30s: 30s 要跟着每笔算, 大周期才每笔都更新
+            watched |= {(feed.symbol, ROLLUP_BASE_TF) for feed in feeds
+                        if getattr(feed, "is_rollup", False) and feed_key(feed.symbol, feed.tf) in watched}
             for feed in feeds:
                 if self._stop.is_set() or self._rebuild_api.is_set():
                     break
@@ -1031,13 +1195,20 @@ class FeedManager:
                     feed.ensure_ltf_subscriptions(api)
                     with feed._state_lock:
                         changed = feed.data_changing(api)
-                        needs_recompute = (not feed.snapshots or feed.error is not None or
-                                           feed._computed_version != feed._demand_version or changed)
+                        stale = (not feed.snapshots or feed.error is not None or
+                                 feed._computed_version != feed._demand_version)
+                    now = time.monotonic()
                     if changed:
                         # 有数据在流动 = 连接肯定是活的, 自检可以往后推
-                        self._last_data_at = time.monotonic()
-                    if needs_recompute:
+                        self._last_data_at = now
+                        feed.pending = True
+                    # 没人看的攒一攒再算(is_changing 只管这一轮, 所以记着 pending); 新需求、出过错的马上算
+                    due = feed.pending and (feed_key(feed.symbol, feed.tf) in watched
+                                            or now - feed.last_compute >= IDLE_RECOMPUTE_SEC)
+                    if stale or due:
                         feed.recompute(self.broadcast)
+                        feed.pending = False
+                        feed.last_compute = time.monotonic()
                         with feed._state_lock:
                             feed.error = None
                             feed.compute_retry_at = 0.0

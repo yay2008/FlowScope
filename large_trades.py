@@ -17,6 +17,7 @@ import math
 import os
 import re
 
+from history_store import ChangeMarks
 from indicator import GAP_NS, TZ_SHIFT_S
 from large_trade_defaults import MIN_NOTIONAL
 
@@ -145,11 +146,25 @@ class _EventLayer:
         self._history = []     # 回填补判来的区间
         self._events_floor = None   # 已丢弃的最新一个事件的时刻
         self._cache = self._spans = None
+        self._index_cache = None
 
     def event_rows(self):
         if self._cache is None:
             self._cache = sorted(self.events.values(), key=lambda e: e["ns"])
         return self._cache
+
+    def event_index(self):
+        """(按时间排好的事件, 各自的时刻, 逐个累加到第 k 个事件之前的 CVD): 汇总只看最近几根时,
+        二分跳过更早的事件。累加从 base_delta 起、按同一顺序逐个加, 与从头扫一遍逐位一致(末尾多一个"全部加完")。"""
+        rows = self.event_rows()
+        if self._index_cache is None or self._index_cache[0] is not rows:
+            before, cumulative = [], self.base_delta
+            for event in rows:
+                before.append(cumulative)
+                cumulative += event["qty"] * event["side"]
+            before.append(cumulative)
+            self._index_cache = (rows, [event["ns"] for event in rows], before)
+        return self._index_cache
 
     def collected(self):
         """有原始记录(含预热)的时间段 (起, 止), 没有时 None。事件丢弃过的部分不算。"""
@@ -163,15 +178,16 @@ class _EventLayer:
         return self._spans
 
     def _trim(self):
-        """事件太多时丢掉最早的(按时间), 其净量折进 CVD 起点; 那以前的 K 线不再算作已覆盖。"""
+        """事件太多时丢掉最早的(按时间), 其净量折进 CVD 起点; 那以前的 K 线不再算作已覆盖。返回裁没裁。"""
         if len(self.events) <= EVENT_CAP + EVENT_CAP // 20:   # 攒一点再裁, 不必每来一个事件就排序
-            return
+            return False
         ordered = sorted(self.events.items(), key=lambda item: item[1]["ns"])
         for key, event in ordered[:-EVENT_CAP]:
             del self.events[key]
             self.base_delta += event["qty"] * event["side"]
             self._events_floor = event["ns"] if self._events_floor is None else max(self._events_floor, event["ns"])
         self._cache = self._spans = None
+        return True
 
 
 class LargeTradeDetector(_EventLayer):
@@ -195,7 +211,11 @@ class LargeTradeDetector(_EventLayer):
         # 已裁掉的原始记录留下的覆盖区间与扫描状态; 实时覆盖(两层共用)
         self._archived, self._archived_open = [], False
         self._live_spans = None
+        # 实时覆盖扫到哪了 (区间, 扫完时区间是否还开着, 扫到的最后一个 key): 新记录只接着往后扫(见 _live_coverage)
+        self._live_scan = None
         self.relative = _EventLayer(self) if source != "snapshot" else None
+        # 各 Feed 上次来取之后, 汇总结果最早从哪个时刻(ns)起可能变了; 只重新汇总那以后的几根(见 ingest.Feed)
+        self.changes = ChangeMarks()
 
     def _layers(self):
         return (self,) if self.relative is None else (self, self.relative)
@@ -251,6 +271,8 @@ class LargeTradeDetector(_EventLayer):
         self._evict()
         if judge:
             ready = usable and len(self._window) >= self.settings["warmup"]
+            if self._live_scan is not None and key <= self._live_scan[2]:
+                self._live_scan = None     # 改的是已经扫过的记录: 下次从头扫
             self.readiness[key] = (ns, ready, joined)
             if ready and qty > 0:
                 self._judge(key, ns, price, qty, side)
@@ -281,8 +303,9 @@ class LargeTradeDetector(_EventLayer):
                 layer._cache = None
 
     def _trim_events(self):
-        for layer in self._layers():
-            layer._trim()
+        trimmed = [layer._trim() for layer in self._layers()]
+        if any(trimmed):
+            self.changes.mark(float("-inf"))   # CVD 起点与覆盖起点变了, 每根都要重算
 
     def update(self, rows):
         """已按 key 排序的原始记录。重复不计, 修订从该记录起重放, 保留此前的统计基线。"""
@@ -293,11 +316,14 @@ class LargeTradeDetector(_EventLayer):
         if not changes:
             return
         old_last = next(reversed(self.raw)) if self.raw else None
+        # 覆盖与"已采集"的末端从上一条记录延过来; 重放的各条(含它们的事件)都在 tail 里, 下面逐条取最早
+        touched = next(reversed(self.raw.values()))[0] if self.raw else float("-inf")
         earliest = min(key for key, _ in changes)
         self.raw.update(changes)
         self._begin(min(row[0] for _, row in changes))
         replay = old_last is not None and earliest <= old_last
         if replay:
+            self._live_scan = None           # 改到了扫过的记录, 实时覆盖从头扫
             self.raw = dict(sorted(self.raw.items()))
             self._clear_window()
             self._clock, self._last_ns = 0, None
@@ -311,11 +337,16 @@ class LargeTradeDetector(_EventLayer):
                 layer._cache = None
         tail = ((key, row) for key, row in self.raw.items() if key >= earliest) if replay else changes
         for key, row in tail:
+            touched = min(touched, row[0])
             self._process(key, row)
+        self.changes.mark(touched)
         self._settle()
 
     def _append(self, key, row):
         """update 的快速路径: key 比已有的都大(加密成交编号只增不减), 不必查重、不会重放。"""
+        # 覆盖区间与"已采集"的末端从上一条记录延到这一条: 上一条所在的那根起都可能变
+        previous = next(reversed(self.raw.values()))[0] if self.raw else float("-inf")
+        self.changes.mark(min(previous, row[0]))
         self.raw[key] = row
         self._begin(row[0])
         self._process(key, row)
@@ -332,6 +363,8 @@ class LargeTradeDetector(_EventLayer):
         limit = len(self._window) + len(self._lagged) + RAW_SLACK
         if len(self.raw) > limit + max(1024, limit // 4):
             keys = list(self.raw)
+            if self._live_scan is not None and keys[-limit - 1] > self._live_scan[2]:
+                self._live_scan = None     # 裁掉的里头有还没扫过的: 下次从已裁部分接着从头扫
             self._archived, self._archived_open = _scan(
                 (self.readiness[key] for key in keys[:-limit]), self._archived, self._archived_open)
             self.raw = {key: self.raw[key] for key in keys[-limit:]}
@@ -403,6 +436,7 @@ class LargeTradeDetector(_EventLayer):
         """同一毫秒、同一方向的连续成交多半是一张吃单扫了多档或吃了多个挂单: 并进当前事件,
         价格取成交量加权。按判定首笔时的同一基线重判(两笔之间基线没动过, 本事件还在滞后队列末尾)。"""
         ns, p0, q0, side, reset, usable, joined = self.raw[key]
+        self.changes.mark(ns)
         total = q0 + qty
         vwap = (p0 * q0 + price * qty) / total
         self.raw[key] = (ns, vwap, total, side, reset, usable, joined)
@@ -444,6 +478,7 @@ class LargeTradeDetector(_EventLayer):
             changed = True
         if not changed:
             return
+        self.changes.mark(float("-inf"))
         for layer in layers:
             layer._cache = layer._spans = None
         self._trim_events()
@@ -456,10 +491,28 @@ class LargeTradeDetector(_EventLayer):
         return start, next(reversed(self.raw.values()))[0]
 
     def _live_coverage(self):
-        """实时采集(含已裁掉的原始记录)覆盖的时间段, 两层共用。"""
+        """实时采集(含已裁掉的原始记录)覆盖的时间段, 两层共用。
+
+        加密的记录按 key 只增不减地追加, 只把上次扫过之后的新记录接着扫下去(_scan 是从左往右折叠,
+        结果与从头扫一遍相同); 改到扫过的记录(期货修订)才从头扫。
+        """
         if self._live_spans is None:
-            live, _ = _scan((self.readiness[key] for key in sorted(self.readiness)),
-                            [list(span) for span in self._archived], self._archived_open)
+            state = self._live_scan
+            if state is None:
+                live, open_span = _scan((self.readiness[key] for key in sorted(self.readiness)),
+                                        [list(span) for span in self._archived], self._archived_open)
+                last = max(self.readiness, default=float("-inf"))
+            else:
+                live, open_span, last = state
+                fresh = []
+                for key in reversed(self.readiness):
+                    if key <= last:
+                        break
+                    fresh.append(key)
+                if fresh:
+                    live, open_span = _scan((self.readiness[key] for key in reversed(fresh)), live, open_span)
+                    last = fresh[0]
+            self._live_scan = (live, open_span, last)
             self._live_spans = [(lo, hi) for lo, hi in live]
         return self._live_spans
 
@@ -503,11 +556,13 @@ def _decorate_layer(bars, detectors, starts, ends, field, compact=False):
         # 期货归属 (start,end], 逐笔归属 [start,end); 用整数纳秒避免边界浮点舍入。
         shift = TZ_SHIFT_S * NS - (1 if detector.source == "snapshot" else 0)
         spans = [(lo+shift, hi+shift) for lo,hi in detector.spans()]
-        rows = detector.event_rows()
+        rows, times, before = detector.event_index()
         collected = detector.collected()   # 有原始记录(含预热)的时间段
         if collected is not None:
             collected = (collected[0] + shift, collected[1] + shift)
-        event_index, span_index, cumulative = 0, 0, detector.base_delta
+        # 第一根之前的事件只进累计: 直接跳到第一根起点, 累计值取缓存里逐个加到那儿的
+        event_index = bisect_left(times, starts[0] - shift)
+        span_index, cumulative = 0, before[event_index]
         for i, bar in enumerate(bars):
             s = summaries[i]
             while event_index < len(rows) and rows[event_index]["ns"] + shift < ends[i]:

@@ -30,6 +30,7 @@
   无变化时 ``refresh()`` 只是一次 ``stat``。
 """
 import os
+import weakref
 from collections import deque
 from itertools import chain
 from pathlib import Path
@@ -77,6 +78,12 @@ def _pairs(table, times):
     """{时间: (买, 卖)} 按 times 的顺序 -> (n, 2) 数组; 比逐根组元组再转数组快一倍多。"""
     flat = np.fromiter(chain.from_iterable(map(table.__getitem__, times.tolist())), float, 2 * len(times))
     return flat.reshape(-1, 2)
+
+
+def _contains(times, table):
+    """各时间戳在不在 table(dict) 里。只查这几根: Series.isin(dict) 每次都要把整张历史表的键重建一遍哈希,
+    历史一长(加密 10s 一个月十几万根)每轮重算都白花几十毫秒。"""
+    return np.fromiter((t in table for t in times.tolist()), bool, len(times))
 
 
 def _extras_from_values(values):
@@ -138,6 +145,39 @@ class ChangeLog:
         return min(earliest for version, earliest in self._entries if version > revision)
 
 
+class ChangeMarks:
+    """几个读者各自"上次来取之后, 最早改到了哪"(时间的单位由数据方定)。
+
+    给改得很勤的数据用(每笔成交都改): 只记每个读者的一个最早值, 不像 ChangeLog 那样每次改动记一条。
+    读者是重算它的 Feed, 只弱引用: Feed 回收了就不再替它记。读者第一次来取得到 -inf(全部重算)。
+    """
+
+    def __init__(self):
+        self._entries = []     # [读者的弱引用, 最早值]; 读者只有几个, 列表比弱引用字典快得多
+
+    def mark(self, earliest):
+        """改到了 earliest(-inf 表示整体都可能变了)。"""
+        for entry in self._entries:
+            if earliest < entry[1]:
+                entry[1] = earliest
+
+    def take(self, reader):
+        """reader 上次来取之后最早改到哪(没改过是 inf), 并从现在起重新记。"""
+        value, kept = float("-inf"), []
+        for entry in self._entries:
+            target = entry[0]()
+            if target is None:
+                continue                 # 读者已回收
+            if target is reader:
+                value, entry[1] = entry[1], float("inf")
+                reader = None
+            kept.append(entry)
+        if reader is not None:
+            kept.append([weakref.ref(reader), float("inf")])
+        self._entries = kept
+        return value
+
+
 class HistoryStore:
     """单合约单周期的历史 bar 表; 只有采集线程读写, 不做跨线程加锁。"""
 
@@ -161,6 +201,8 @@ class HistoryStore:
         self._size = 0
         self._needs_header = True
         self._dirty = True
+        # 索引建好之后新写的、都比已有的晚的行 (时间, 买, 卖, 来源码): 用到索引时接在末尾(见 _ensure_index)
+        self._tail = []
         self._read_initial()
         self._index()
 
@@ -466,11 +508,53 @@ class HistoryStore:
         codes[np.searchsorted(self.display_times, self.times)] = 0
         self.display_codes = codes
         self._dirty = False
+        self._tail = []
 
     def _ensure_index(self):
-        """落盘只改字典, 索引推迟到真正要读的时候再建: 一根 bar 一次不必重建全表。"""
+        """落盘只改字典, 索引推迟到真正要读的时候再建: 一根 bar 一次不必重建全表。
+
+        实时走完的 bar 都比已有的晚, 只把它们接在索引末尾(累计和接着上一个值往下加, 与整表重建逐位一致);
+        其余改动(插到中间、改旧行、partial 升级)才整表重建。
+        """
         if self._dirty:
             self._index()
+        elif self._tail:
+            self._extend_index()
+
+    def _extend_index(self):
+        times = np.array([row[0] for row in self._tail], dtype=np.int64)
+        pairs = np.array([row[1:3] for row in self._tail], dtype=float).reshape(-1, 2)
+        codes = np.array([row[3] for row in self._tail], dtype=np.int8)
+        complete = codes == 0
+        self.times = np.r_[self.times, times[complete]]
+        delta = pairs[complete, 0] - pairs[complete, 1]
+        self.sums = np.r_[self.sums, np.cumsum(np.r_[self.sums[-1], delta])[1:]]
+        self.display_times = np.r_[self.display_times, times]
+        self.display_buy = np.r_[self.display_buy, pairs[:, 0]]
+        self.display_sell = np.r_[self.display_sell, pairs[:, 1]]
+        delta = pairs[:, 0] - pairs[:, 1]
+        self.display_sums = np.r_[self.display_sums, np.cumsum(np.r_[self.display_sums[-1], delta])[1:]]
+        self.display_codes = np.r_[self.display_codes, codes]
+        self._tail = []
+
+    def _grow(self, rows, code):
+        """save_completed 新写了 rows {时间: (买, 卖)}: 全都比索引里(含待接的)最晚的还晚就记下待接, 否则整表重建。"""
+        if self._dirty:
+            return
+        last = self._tail[-1][0] if self._tail else (
+            int(self.display_times[-1]) if len(self.display_times) else None)
+        for timestamp, (buy, sell) in rows.items():
+            if last is not None and timestamp <= last:
+                self._dirty = True
+                self._tail = []
+                return
+            self._tail.append((timestamp, buy, sell, code))
+            last = timestamp
+
+    def confirmed_times(self, since=float("-inf")):
+        """核对通过的各根时间戳(不早于 since), 升序。"""
+        self._ensure_index()
+        return self.times[np.searchsorted(self.times, since, side="left"):] if since > float("-inf") else self.times
 
     def _fill_extra(self, bars):
         """补齐对照列: 旧历史行本身即旧算法口径; 其余从已保存行读取。"""
@@ -488,16 +572,17 @@ class HistoryStore:
         missing_columns = [c for c in EXTRA_COLUMNS if bars[c].isna().any()]
         if not missing_columns:
             return bars
-        # 对照列优先级与 buy/sell 一致: 核对通过 > 待核对估算。
-        extra = dict(self.estimated_extra)
-        extra.update(self.extra)
-        stored = bars["time"].to_numpy(dtype=np.int64)
+        # 对照列优先级与 buy/sell 一致: 核对通过 > 待核对估算(整行取一边, 不逐列拼)。
+        # 只查这几根, 不把整张历史表复制一遍再查。
+        extra, estimated = self.extra, self.estimated_extra
+        empty = {}
+        rows = [extra[t] if t in extra else estimated.get(t, empty)
+                for t in bars["time"].to_numpy(dtype=np.int64).tolist()]
         for column in missing_columns:
             missing = bars[column].isna().to_numpy()
             if not missing.any():
                 continue
-            filled = np.array([extra.get(int(t), {}).get(column, np.nan)
-                               for t in stored], dtype=float)
+            filled = np.array([row.get(column, np.nan) for row in rows], dtype=float)
             take = missing & np.isfinite(filled)
             if take.any():
                 bars.loc[take, column] = filled[take]
@@ -515,12 +600,12 @@ class HistoryStore:
         for values, quality in [(self.values, SOURCE_COMPLETE),
                                 (self.estimates, SOURCE_PARTIAL),
                                 (self._legacy, SOURCE_LEGACY)]:
-            mask = result.coverage.ne(SOURCE_COMPLETE) & result.time.isin(values)
+            mask = result.coverage.ne(SOURCE_COMPLETE) & _contains(result.time, values)
             if quality != SOURCE_COMPLETE:
                 # 不用旧估算覆盖具备前置快照的新数据；窗口左边缘则优先回填已保存估算。
                 mask &= ~result.get("hasBaseline", pd.Series(False, index=result.index))
                 if quality == SOURCE_LEGACY:
-                    mask &= ~result.time.isin(self.estimates)
+                    mask &= ~_contains(result.time, self.estimates)
             times = result.loc[mask, "time"]
             if not times.empty:
                 result.loc[mask, "buy"] = times.map(lambda t: values[int(t)][0])
@@ -561,7 +646,7 @@ class HistoryStore:
             return
         done = bars if final else bars.iloc[:-1]
         estimated = (done.coverage.eq(SOURCE_PARTIAL)
-                     & (done.get("hasBaseline", False) | ~done.time.isin(self.estimates)))
+                     & (done.get("hasBaseline", False) | ~_contains(done.time, self.estimates)))
         for mask, values, quality in [(done.coverage.eq(SOURCE_COMPLETE), self.values,
                                        SOURCE_COMPLETE),
                                       (estimated, self.estimates, SOURCE_PARTIAL)]:
@@ -584,9 +669,9 @@ class HistoryStore:
             self._append(lines)
             # 落盘成功才提交去重缓存; 后一批失败也不能漏掉前一批的索引/版本更新。
             if pending_values:
+                self._grow(pending_values, 0 if quality == SOURCE_COMPLETE else 1)
                 values.update(pending_values)
                 self.extra.update(pending_extra)
-                self._dirty = True
                 self.changes.mark(min(pending_values))
 
     @property

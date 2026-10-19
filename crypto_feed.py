@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import math
 import os
 import queue
 import threading
@@ -42,7 +43,7 @@ import pandas as pd
 import ingest
 from indicator import (BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, ROLLUP_BASE_TF, TZ_SHIFT_S, VOLUME_ROUND,
                        finalize_bars, is_rollup, ltf_options)
-from history_store import ChangeLog
+from history_store import ChangeLog, ChangeMarks
 from ingest import COMPUTE_RETRY_SEC, MAX_KLINES, SNAPSHOT_BARS, feed_key, feed_label, validate_symbol
 from rollup import INT64_MAX, CANDLE_COLUMNS, ClosedCache, RollupMixin, candle_buckets, split_buckets, utc_bucket
 
@@ -145,6 +146,9 @@ class TradeBars:
         self.live_start: int | None = None  # 最新一笔实时成交所在 bar 的起点
         self.gaps = 0                        # 本次运行编号接不上的次数(断线重连)
         self.large_trades = None
+        # 各 Feed 上次取过之后最早改到哪根(起点毫秒): 重算只取那以后的几根(见 frame_since);
+        # 洞、裁窗口、读回落盘这类会动到多根的改动记 -inf, 整窗口重算
+        self.changes = ChangeMarks()
 
     def bar_of(self, t_ms: int) -> int:
         return t_ms // self.tf_ms * self.tf_ms
@@ -170,6 +174,7 @@ class TradeBars:
         if self.last_id is None or trade_id != self.last_id + 1:
             # 本次运行的第一笔, 或编号接不上(断线): 中间的成交没收到, 记一个洞等回填。
             self.holes.append([self.last_id, self.last_ms, trade_id, t_ms])
+            self.changes.mark(float("-inf"))
             if self.last_id is not None:
                 self.gaps += 1
         elif self.live_start is not None and start > self.live_start + self.tf_ms:
@@ -196,6 +201,7 @@ class TradeBars:
                 continue
             self._apply(int(trade_id), float(price), float(qty), int(t_ms), bool(sell))
         self.holes.remove(hole)
+        self.changes.mark(float("-inf"))
         begin = self.bar_of(after_ms if after_ms is not None else before_ms)
         self._fill_quiet(begin, self.bar_of(before_ms))
         return True
@@ -203,6 +209,7 @@ class TradeBars:
     def _apply(self, trade_id, price, qty, t_ms, sell):
         """按编号先后更新 bar 与 1 秒小 bar: 编号更小的定开盘, 更大的定收盘, 与到达顺序无关。"""
         start = self.bar_of(t_ms)
+        self.changes.mark(start)
         bar = self.bars.get(start)
         if bar is None or bar[7] is None:          # 新 bar, 或之前补的零量 bar
             bar = self.bars[start] = [price, price, price, price, 0.0, 0.0, 0.0, trade_id, trade_id]
@@ -239,6 +246,7 @@ class TradeBars:
         只在两端之间的成交编号确实连续时调用: 那段时间确实没成交, 价格沿用前收。
         """
         close = self._close_at(begin)
+        self.changes.mark(begin + self.tf_ms)
         for start in range(begin + self.tf_ms, end, self.tf_ms)[-self.max_bars:]:
             known = self._close_at(start)
             if known is not None:
@@ -248,6 +256,7 @@ class TradeBars:
 
     def _trim(self):
         """窗口只留最近 max_bars 根; 1 秒小 bar、落盘记录与洞跟着裁。"""
+        self.changes.mark(float("-inf"))
         keys = sorted(self.bars)
         for key in keys[:-self.max_bars]:
             del self.bars[key]
@@ -264,15 +273,18 @@ class TradeBars:
         return [(self.bar_of(after_ms if after_ms is not None else before_ms), self.bar_of(before_ms))
                 for _, after_ms, _, before_ms in self.holes]
 
-    def split(self, ltf: int) -> pd.DataFrame:
+    def split(self, ltf: int, since: int | None = None) -> pd.DataFrame:
         """K 线口径(同 indicator.build_bars_from_ltf): ltf 秒小 bar 收 > 开整根记买, 收 < 开记卖,
         十字丢弃, 再汇总到主周期。小 bar 的开/收是其中第一笔/最后一笔成交价, 与交易所 K 线一致。
 
         返回按主周期起点(毫秒)索引的 buy/sell; ltf 必须整除主周期(由 Feed.request 保证)。
+        since(主周期起点毫秒)给了就只算这以后的各根(每根只用自己的 1 秒小 bar)。
         """
-        if not self.seconds:
+        seconds = self.seconds if since is None else {key: value for key, value in self.seconds.items()
+                                                      if key >= since}
+        if not seconds:
             return pd.DataFrame({"buy": [], "sell": []}, dtype=float)
-        seconds = pd.DataFrame([value[:3] for value in self.seconds.values()], index=list(self.seconds),
+        seconds = pd.DataFrame([value[:3] for value in seconds.values()], index=list(seconds),
                                columns=["open", "close", "volume"]).sort_index()
         ltf_ms = ltf * 1000
         groups = seconds.groupby(seconds.index // ltf_ms * ltf_ms)
@@ -289,11 +301,21 @@ class TradeBars:
         HistoryStore.merge 用已保存的记录补上) > 落在洞两端的实时 bar(partial)。
         ltf=0 的买卖量就是交易所给的主动方向; ltf>0 为 K 线口径(见 split)。
         """
+        return self.frame_since(ltf)[0]
+
+    def frame_since(self, ltf: int = 0, since: int | None = None) -> tuple[pd.DataFrame, np.ndarray]:
+        """同 frame, 但只出起点(展示秒)不早于 since 的那几根; 另返回整个窗口各根的展示秒。
+
+        每根只取决于它自己的成交、落盘记录与洞, 只出尾部与整窗口取尾部逐列相同。
+        """
         keys = sorted(self.bars.keys() | self.stored.keys())[-self.max_bars:]
+        window = np.array(keys, dtype=np.int64) // 1000 + TZ_SHIFT_S
+        if since is not None:
+            keys = keys[bisect.bisect_left(keys, (since - TZ_SHIFT_S) * 1000):]
         if not keys:
-            return pd.DataFrame(columns=BAR_COLUMNS)
+            return pd.DataFrame(columns=BAR_COLUMNS), window
         spans = self.hole_spans()
-        split = self.split(ltf) if ltf else None
+        split = self.split(ltf, keys[0] if since is not None else None) if ltf else None
         split_buy = split["buy"].to_dict() if split is not None else None
         split_sell = split["sell"].to_dict() if split is not None else None
         rows = []
@@ -317,7 +339,7 @@ class TradeBars:
         df["bar_ns"] = df["start"] * 10**6
         df = finalize_bars(df)
         df["time"] = (df["bar_ns"] // 10**9 + TZ_SHIFT_S).astype("int64")
-        return df[BAR_COLUMNS]
+        return df[BAR_COLUMNS], window
 
 
 def aggregate_trades(trades: pd.DataFrame, tf: int, ltfs, start_ms: int, end_ms: int) -> pd.DataFrame:
@@ -581,16 +603,26 @@ class CryptoFeed(ingest.Feed):
             ltfs = [ltf for ltf, expires in self._requested.items() if expires >= now]
             demand_version = self._demand_version
             previous = dict(self.snapshots)
+        self._start_round()
+        # 逐笔成交窗口从上一轮到现在最早改到哪根: 一般只有正在走的那根, 只算尾部(见 Feed._tail_since)
+        changed = self.trades.changes.take(self)
+        if math.isfinite(changed):
+            changed = changed // 1000 + TZ_SHIFT_S
         snapshots = {}
         messages = []
         revision = self.revision + 1
         for ltf in ltfs:
-            bars = self.trades.frame(ltf)
+            since = self._tail_since(ltf, changed)
+            bars, window = self.trades.frame_since(ltf, since)
+            if since is not None and bars.empty:
+                since = None                     # 不该发生: 上一轮的最后一根总在尾部里
+                bars, window = self.trades.frame_since(ltf)
             if bars.empty:
                 continue
             if ltf == 0 and self.candles is not None:
                 self.candles.save(bars)
-            snapshots[ltf], message = self._publish(ltf, bars, previous, revision)
+            tail = None if since is None else (since, window, lambda ltf=ltf: self._full_frame(ltf))
+            snapshots[ltf], message = self._publish(ltf, bars, previous, revision, tail)
             if message:
                 messages.append(message)
         self.last_compute = time.monotonic()
@@ -604,6 +636,12 @@ class CryptoFeed(ingest.Feed):
                 self.ready.set()
         for message in messages:
             broadcast(message)
+
+    def _full_frame(self, ltf):
+        bars = self.trades.frame(ltf)
+        if ltf == 0 and self.candles is not None:
+            self.candles.save(bars)
+        return bars
 
 
 class CryptoRollupFeed(RollupMixin, ingest.Feed):
