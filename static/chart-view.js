@@ -16,7 +16,7 @@
  */
 (function (root) {
   "use strict";
-  const { LW, BAND, EMA_PERIODS, HTF_EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf } = FlowIndicators;
+  const { LW, BAND, MODE_CHOICES, THRESH_CHOICES, EMA_PERIODS, HTF_EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf } = FlowIndicators;
 
   // 可选主周期(秒), 与后端 indicator.TF_OPTIONS 一致(tests/test_rollup.py 核对两边相同)
   const TF_CHOICES = [10, 30, 60, 300, 900, 3600, 14400];
@@ -386,10 +386,7 @@
     { key: "band", name: "FlowWave带", params: true,
       title: "FlowWave 的回归通道: 中线 = 收盘价线性回归 21 根(默认不画, 点后面的「中线」显示成淡虚线), 上下轨 = 中线 ±k 倍回归残差标准差(k 点后面的「2σ」切换)。平时只有两条淡轨线; wt2 超买(大于80)时中线到上轨之间染红、上轨加粗, 超卖(小于20)时中线到下轨之间染绿、下轨加粗, 上色段的起点就是首次越界。轨道是真实价格, 可当动态支撑压力看。" },
   ];
-  // FlowMeter 窗格左上角的模式/阈值下拉框: [值, 显示名]。默认选中哪个由页面的 settings 决定
-  const MODE_CHOICES = [["rvol", "Relative Volume"], ["crvol", "CRVOL"], ["volume", "Volume"],
-                        ["bsv", "Buy/Sell Volume"], ["delta", "Volume Delta"], ["cvd", "CVD"]];
-  const THRESH_CHOICES = [["RELATIVE", "RELATIVE"], ["SMA", "SMA"], ["Z-SCORE", "Z-SCORE"]];
+  // FlowMeter 的模式/阈值选项在 indicators.js 共用；默认值由页面 settings 决定。
   // 读数里模式主值的简称
   const MODE_SHORT = { rvol: "RVOL", crvol: "CRVOL", volume: "量", bsv: "买/卖", delta: "Δ", cvd: "CVD" };
   const COVERAGE_LABELS = { complete: "完整", partial: "部分", missing: "缺失", legacy: "旧历史" };
@@ -1163,53 +1160,10 @@
       return FlowIndicators.levelOf(derived, cfg, settings.threshtype, kind, i);
     }
 
-    function colorFor(up, level) {
-      const c = cfg.colors;
-      if (level > 0) return up ? c.upLevels[level - 1] : c.downLevels[level - 1];
-      return up ? c.up : c.down;
-    }
-
     // ---------- 渲染 ----------
 
     function buildSuiteData() {
-      const mode = settings.mode;
-      const hist = [], histSell = [], candles = [];
-      const n = bars.length;
-      const cumulative = mode === "crvol" ? derived.crv : mode === "cvd" ? bars.map((b) => b.cvd) : null;
-      for (let i = 0; i < n; i++) {
-        const b = bars[i], d = derived;
-        const up = b.close > b.open;      // 与原指标一致: 十字线算跌
-
-        if (mode === "rvol" || mode === "volume") {
-          const val = mode === "rvol" ? d.rvol[i] : d.vol[i];
-          if (val == null) continue;
-          hist.push({ time: b.time, value: val, color: colorFor(up, levelOf("vol", i)) });
-        } else if (mode === "bsv") {
-          const buy = buyOf(b), sell = sellOf(b);
-          if (buy == null) continue;
-          hist.push({ time: b.time, value: buy, color: colorFor(true, levelOf("buy", i)) });
-          histSell.push({ time: b.time, value: -(sell ?? 0), color: colorFor(false, levelOf("sell", i)) });
-        } else if (mode === "delta") {
-          const delta = deltaOf(b);
-          if (delta == null) continue;
-          const lvl = levelOf(delta > 0 ? "posd" : "negd", i);   // 原指标: delta>0 才算涨
-          hist.push({ time: b.time, value: delta, color: colorFor(delta > 0, lvl) });
-        } else {
-          // crvol / cvd: 蜡烛图, o=前一累计值, h=l=c=当前值
-          const arr = cumulative;
-          const shape = mode === "cvd" ? FlowData.cvdCandle(b) :
-            (arr[i] == null || i === 0 || arr[i - 1] == null ? null :
-              {time: b.time, open: arr[i - 1], high: Math.max(arr[i - 1], arr[i]),
-               low: Math.min(arr[i - 1], arr[i]), close: arr[i]});
-          if (!shape) continue;
-          const lvl = mode === "crvol" ? levelOf("vol", i)
-                                      : levelOf(b.delta > 0 ? "posd" : "negd", i);
-          // 原指标: CRVOL 蜡烛按 K线阴阳着色, CVD 蜡烛按 delta 正负着色
-          const col = mode === "crvol" ? colorFor(up, lvl) : colorFor(b.delta > 0, lvl);
-          candles.push({ ...shape, color: col, wickColor: col });
-        }
-      }
-      return { hist, histSell, candles };
+      return FlowIndicators.buildSuiteData(bars, derived, cfg, settings.mode, settings.threshtype);
     }
 
     function renderSuite() {
@@ -1239,20 +1193,7 @@
     // 透明度对应 Pine color.new(x, 88/55/25/0); 涨 teal 跌红, 三级放量换醒目实色。
     // 有自己的价格轴, 直接画 RVOL 本身(原来在 FlowWave 副图里要和 0~100 的振荡值共用一条轴, 才乘了 5)。
     function buildPulseData() {
-      const pulse = [];
-      const th = cfg.mult;
-      const ALPHA = [0.12, 0.45, 0.75, 1];
-      for (let i = 0; i < bars.length; i++) {
-        const b = bars[i];
-        const rv = derived.rvol[i];
-        if (rv == null) continue;
-        const up = b.close > b.open;      // 与原指标一致: 十字线算跌
-        const lvl = rv >= th[2] ? 3 : rv >= th[1] ? 2 : rv >= th[0] ? 1 : 0;
-        const color = lvl === 3 ? (up ? "#00e676" : "#f23645")
-          : up ? `rgba(0, 150, 136, ${ALPHA[lvl]})` : `rgba(242, 54, 69, ${ALPHA[lvl]})`;
-        pulse.push({ time: b.time, value: rv, color });
-      }
-      return pulse;
+      return FlowIndicators.buildPulseData(bars, derived, cfg);
     }
 
     function renderPulse() {   // 整体 setData(数据量小); 不画的模式下不必算
@@ -1491,15 +1432,7 @@
     // ---------- FlowWave 主图叠加: 数据与开关 ----------
 
     function buildBandData() {
-      const { mid, up, dn, state } = derived.band;
-      const out = [];
-      for (let i = 0; i < bars.length; i++) {
-        if (mid[i] == null || up[i] == null || dn[i] == null) continue;
-        // idx 用来判断两根在时间上是否相邻: custom series 会把缺口两端的 bar 排在一起, 直接连会画出假带
-        out.push({ time: bars[i].time, mid: mid[i], up: up[i], dn: dn[i], state: state[i],
-                   close: bars[i].close, idx: i });
-      }
-      return out;
+      return FlowIndicators.buildBandData(bars, derived.band);
     }
 
     function renderBand() {
@@ -2764,6 +2697,7 @@
   }
 
   // 渲染类与时间换算一并导出, 测试直接检查
-  root.ChartView = { create, FootprintRenderer, BandRenderer, BandSeries, TF_CHOICES, tfLabel, localLtfOptions, htfOptions,
+  root.ChartView = { create, FootprintRenderer, BandRenderer, BandSeries, TF_CHOICES, tfLabel, localLtfOptions, htfOptions, defaultHtf,
+                     EMA_COLORS, EMA_LONG_PERIODS, EMA_DRAW_BARS, HTF_EMA_COLORS, HTF_EMA_WIDTH,
                      indexAtOrBefore, timeAtLogical, logicalAtTime, formatDuration, measureStats, measureLines };
 })(typeof globalThis !== "undefined" ? globalThis : this);

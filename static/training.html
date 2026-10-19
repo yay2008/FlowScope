@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>K 线训练 · FlowScope</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="training.css">
+  <script src="vendor/lightweight-charts.standalone.production.js" defer></script>
+  <script src="data-sync.js" defer></script>
+  <script src="indicators.js" defer></script>
+  <script src="chart-view.js" defer></script>
+  <script src="training.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">FlowScope</a><span class="divider">/</span><h1>K 线训练</h1>
+  <div id="workspace-bar" class="workspace-bar" hidden>
+    <div class="session-head"><h2 id="session-title"></h2><span id="session-mode">盲盘训练</span><span id="session-clock"></span></div>
+    <div class="workspace-tools">
+      <div class="chart-switch" role="group" aria-label="行情布局"><button type="button" data-layout="split" aria-pressed="true">双图</button><button type="button" data-layout="main" aria-pressed="false">左图</button><button type="button" data-layout="context" aria-pressed="false">右图</button></div>
+      <div class="detail-switch"><button type="button" data-detail="journal" aria-controls="detail-drawer" aria-expanded="false">成交记录</button><button id="review-toggle" type="button" data-detail="review" aria-controls="detail-drawer" aria-expanded="false" disabled>复盘报告</button><button type="button" data-detail="rules" aria-controls="detail-drawer" aria-expanded="false">规则</button></div>
+    </div>
+  </div>
+  <nav><a href="/">实时行情</a><button id="new-training" type="button">新训练</button><button id="history-toggle" type="button" aria-expanded="false" aria-controls="history">训练记录</button></nav>
+</header>
+<main>
+  <div id="notice" class="notice" role="status" aria-live="polite">正在读取训练数据…</div>
+  <dialog id="history" class="panel history-dialog" aria-labelledby="history-title">
+    <div class="section-head"><h2 id="history-title">训练记录</h2><div class="actions"><button id="refresh-history" type="button">刷新</button><button id="history-close" type="button">关闭</button></div></div>
+    <div id="history-list" class="table-wrap"></div>
+  </dialog>
+  <section id="setup">
+    <div class="intro"><p class="eyebrow">历史盲盘 · 单合约日内训练</p><h2>把每一次判断，放回当时的行情里。</h2><p>选择一段历史，逐根看盘并交易。结束后回到每笔操作，检查风险和执行。</p></div>
+    <div class="setup-grid">
+      <section class="panel">
+        <div class="section-head"><h2>行情数据</h2><button id="load-demo" type="button">体验演示行情</button></div>
+        <label class="field">数据集<select id="dataset"><option value="">请先载入或导入数据</option></select></label>
+        <p id="dataset-detail" class="muted">使用实际月份合约的一分钟 K 线。演示行情为合成数据，会单独标明。</p>
+        <details class="source-block" open>
+          <summary>从天勤载入行情</summary>
+          <form id="download-form" class="form-grid">
+            <label class="field">实际合约<input id="download-symbol" placeholder="例如 SHFE.fu2611" required maxlength="40" autocomplete="off"></label>
+            <label class="field">载入范围<select id="download-mode"><option value="recent">最近已收盘行情</option><option value="range">指定历史日期（需下载权限）</option></select></label>
+            <label class="field" id="recent-field">最近根数<input id="download-count" type="number" min="100" max="10000" value="5000" required></label>
+            <div id="range-fields" class="form-grid full" hidden>
+              <label class="field">开始交易日<input id="download-from" type="date"></label>
+              <label class="field">结束交易日<input id="download-to" type="date"></label>
+            </div>
+            <div class="full actions"><button id="download-submit" type="submit">载入行情</button><span id="download-status" class="muted" role="status"></span></div>
+          </form>
+        </details>
+        <details class="source-block">
+          <summary>导入本地 CSV</summary>
+          <form id="import-form" class="form-grid">
+            <label class="field full">一分钟 CSV<input id="csv-file" type="file" accept=".csv,text/csv" required></label>
+            <label class="field">实际合约<input id="import-symbol" placeholder="例如 SHFE.fu2505" required maxlength="40"></label>
+            <label class="field">显示名称<input id="import-name" placeholder="例如 燃油历史样本" maxlength="80"></label>
+            <label class="field">最小变动价位<input id="import-tick" type="number" step="any" min="0.000001" placeholder="例如 1" required></label>
+            <label class="field">合约乘数<input id="import-multiplier" type="number" step="any" min="0.000001" placeholder="例如 10" required></label>
+            <p class="muted full">列：time / open / high / low / close / volume。时间为每分钟起点，支持北京时间日期字符串及 Unix 时间戳，也支持天勤导出表头。至少 40 根；无时段元数据时在行情间隔处截段。</p>
+            <button id="import-submit" type="submit">校验并导入</button>
+          </form>
+        </details>
+      </section>
+      <section class="panel">
+        <h2>本次训练</h2>
+        <form id="create-form" class="form-grid">
+          <label class="field">抽取方式<select id="sample-mode"><option value="random">随机行情</option><option value="date">指定自然日内随机起点</option></select></label>
+          <label class="field" id="sample-date-field" hidden>自然日期<input id="sample-date" type="date"></label>
+          <label class="field">初始资金（元）<input id="initial-cash" type="number" min="100" max="1000000000" value="100000" required></label>
+          <label class="field">背景 K 线<input id="warmup" type="number" min="20" max="500" value="200" required></label>
+          <label class="field">训练 K 线<input id="steps" type="number" min="10" max="1000" value="90" required></label>
+          <label class="check full"><input id="hide-date" type="checkbox" checked>训练中隐藏行情日期和合约月份</label>
+          <details class="full cost-settings" open>
+            <summary>成交与风险参数</summary>
+            <div class="form-grid">
+              <label class="field">保证金率（%）<input id="margin-rate" type="number" min="0.1" max="100" step="0.1" value="15" required></label>
+              <label class="field">每次成交滑点（跳）<input id="slippage" type="number" min="0" max="100" value="1" required></label>
+              <label class="field full">手续费模式<select id="fee-mode"><option value="fixed">按手（元 / 手 / 单边）</option><option value="ratio">按成交额（万分之）</option></select></label>
+              <label class="field">开仓费率<input id="open-fee" type="number" min="0" step="any" value="2" required></label>
+              <label class="field">日内平仓费率<input id="close-fee" type="number" min="0" step="any" value="2" required></label>
+              <label class="field full">单笔初始止损风险上限（元，0 为不限制）<input id="risk-budget" type="number" min="0" max="1000000000" value="0" required></label>
+            </div>
+          </details>
+          <p class="muted full">以上为可调整的训练假设，本局固定使用。每段限于同一日盘或夜盘，不跨结算边界；剩余行情不足时缩短训练长度。未设置止损时无法计算初始风险。</p>
+          <button class="primary full" id="create-submit" type="submit" disabled>开始盲盘训练</button>
+        </form>
+      </section>
+    </div>
+  </section>
+  <section id="work" data-layout="split" hidden>
+    <div class="charts">
+        <section class="chart-panel"><div class="chart-title"><div class="chart-period"><h3>左图</h3><select id="main-timeframe" aria-label="左图 K 线周期" title="只切换左图；历史数据为 1 分钟精度，回放仍按分钟推进"></select></div><span id="last-price"></span></div><div id="main-chart" class="chart" role="group" aria-label="左图已揭示 K 线、指标及交易标记"></div></section>
+        <section class="chart-panel"><div class="chart-title"><div class="chart-period"><h3>右图</h3><select id="context-timeframe" aria-label="右图 K 线周期" title="只切换右图；历史数据为 1 分钟精度，回放仍按分钟推进"></select></div><span class="muted">末根随回放进度形成</span></div><div id="context-chart" class="chart" role="group" aria-label="右图已揭示 K 线、指标及交易标记"></div></section>
+    </div>
+    <section id="detail-drawer" class="detail-drawer" aria-labelledby="detail-title" hidden>
+      <div class="drawer-head"><h2 id="detail-title">成交记录</h2><button id="detail-close" type="button">收起</button></div>
+      <div class="detail-scroll">
+      <section id="review" hidden>
+      <div id="review-metrics" class="metrics"></div>
+      <p id="review-note" class="muted"></p>
+      <div id="equity-chart" class="equity-chart" role="img" aria-label="截至复盘位置的一分钟收盘权益曲线"></div>
+      <div id="trades" class="table-wrap"></div>
+      </section>
+      <section id="journal" class="journal" hidden><div id="events" class="table-wrap"></div></section>
+      <section id="rules" class="rules" hidden><p>只使用已揭示行情。开平仓按下一根一分钟开盘及不利滑点成交；跳空按开盘处理。同一分钟同时触发止盈止损时按止损优先，并标记顺序不确定。持仓时可拖动两张图上的保护线，调整从后续行情生效。首版单仓整笔开平。</p><p>OHLC 无法复刻盘口排队；零量和已知一字涨跌停不成交，未提供涨跌停数据时无法识别所有封板。训练结束的持仓保留并按最后已揭示收盘价估值，未平仓不计胜率。</p><p id="config-note"></p><p>左右图独立选择 1m / 5m / 15m / 1h / 4h；切换周期不推进时间，不改变交易与账户。回放始终按一分钟推进，休市跳过；末根大周期 K 线仅由已揭示分钟合成。当前数据无法还原 10s / 30s。</p><p>FlowWave、FlowMeter 与 EMA 使用正式看盘页的算法。EMA 21 / 55 / 100 / 200 按各自图表周期计算；大周期 EMA 21 / 55 仅用最近已收盘的大周期值，在下一桶出现时更新。近 100 / 全部只改变画线范围，计算使用全部已揭示历史；EMA 从首根收盘价播种，背景较短时长周期数值仍在收敛。</p><p>买卖量 / Delta / CVD 按已揭示的 1 分钟 K 线阴阳估算，十字线量归为未知；非 tick 买卖量。CVD 从本局背景起点累计，大周期图汇总分钟数据。FlowWave 等指标未预热时留空。</p></section>
+      </div>
+    </section>
+    <aside class="execution-dock" aria-label="交易与回放操作区">
+      <div class="dock-operations">
+      <div class="dock-heading">
+        <div class="dock-context"><h3>交易与回放</h3><span id="position" class="position-label">当前空仓</span></div>
+        <div class="progress-row"><progress id="progress" max="90" value="0"></progress><span id="progress-label"></span></div>
+        <span class="execution-hint">按分钟回放 · 下一分钟开盘成交</span>
+      </div>
+      <div class="execution-controls">
+        <div class="playback">
+          <div id="playback-controls" class="playback-controls"><button id="play" type="button" class="primary" title="空格：播放 / 暂停">播放 <kbd>Space</kbd></button><button id="step" type="button" title="右方向键：推进下一根一分钟 K 线，休市跳过">下一分钟 <kbd>→</kbd></button><label class="speed-label"><span class="sr-only">速度</span><select id="speed" title="每秒推进的一分钟 K 线根数"><option value="1000">1 根 / 秒</option><option value="500">2 根 / 秒</option><option value="200">5 根 / 秒</option></select></label></div>
+          <div id="review-navigation" hidden><label for="review-slider">回看当时行情</label><input id="review-slider" type="range" min="0" max="1" value="0"><span id="review-position" class="muted"></span></div>
+        </div>
+        <form id="order-form" class="order-form">
+          <label class="field qty-field">手数<input id="qty" type="number" value="1" min="1" max="500" required></label>
+          <label class="field">止损价<input id="stop-loss" type="number" step="any" placeholder="可不填"></label>
+          <label class="field">止盈价<input id="take-profit" type="number" step="any" placeholder="可不填"></label>
+          <details id="decision-note" class="decision-note"><summary>决策备注</summary><label class="field note-content">入场依据 / 调整原因<textarea id="trade-note" maxlength="500" rows="3" placeholder="记录这次判断"></textarea></label></details>
+        </form>
+      </div>
+      <div id="trade-actions" class="trade-buttons" role="group" aria-label="交易指令"><button id="buy" type="button" form="order-form" class="long">开多</button><button id="sell" type="button" form="order-form" class="short">开空</button><button id="close-position" type="button" form="order-form">全部平仓</button><button id="update-stops" type="button" form="order-form">更新止盈止损</button></div>
+      <div class="dock-footer"><div id="dock-notice"></div><div class="pending-actions"><span id="pending" class="pending" role="status"></span><button id="cancel-order" type="button" hidden>撤销待成交指令</button></div></div>
+      </div>
+      <div class="dock-account">
+        <div class="account-heading"><h3>账户 <span class="muted">· 元</span></h3><button id="finish" type="button">结束并复盘</button></div>
+        <div id="account" class="metrics" role="group" aria-label="训练账户概况，金额单位为元"></div>
+      </div>
+    </aside>
+  </section>
+</main>
+</body>
+</html>

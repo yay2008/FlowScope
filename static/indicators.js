@@ -15,6 +15,9 @@
   // 残差标准差取与中线同一个窗口, 用总体标准差(除以 n)。k 在主图图例里点「2σ」按 kOptions 的顺序循环切换,
   // 两张图共用; 三档包含率与选型依据见 docs/flowwave_band_probe.py。
   const BAND = { n: 21, kOptions: [1.5, 2, 2.5], kDefault: 2 };
+  const MODE_CHOICES = [["rvol", "Relative Volume"], ["crvol", "CRVOL"], ["volume", "Volume"],
+                        ["bsv", "Buy/Sell Volume"], ["delta", "Volume Delta"], ["cvd", "CVD"]];
+  const THRESH_CHOICES = [["RELATIVE", "RELATIVE"], ["SMA", "SMA"], ["Z-SCORE", "Z-SCORE"]];
 
   // 主图 EMA 周期
   const EMA_PERIODS = [21, 55, 100, 200];
@@ -448,6 +451,66 @@
     return 0;
   }
 
+  // 正式看盘与历史训练共用绘图数据，保持分档、颜色、十字线与预热缺值口径一致。
+  function colorFor(cfg, up, level) {
+    const c = cfg.colors;
+    if (level > 0) return up ? c.upLevels[level - 1] : c.downLevels[level - 1];
+    return up ? c.up : c.down;
+  }
+
+  function buildSuiteData(bars, derived, cfg, mode, threshtype) {
+    const hist = [], histSell = [], candles = [];
+    const level = (kind, i) => levelOf(derived, cfg, threshtype, kind, i);
+    const color = (up, lvl) => colorFor(cfg, up, lvl);
+    for (let i = 0; i < bars.length; i++) {
+      const b = bars[i], up = b.close > b.open;
+      if (mode === "rvol" || mode === "volume") {
+        const value = mode === "rvol" ? derived.rvol[i] : derived.vol[i];
+        if (value != null) hist.push({ time: b.time, value, color: color(up, level("vol", i)) });
+      } else if (mode === "bsv") {
+        const buy = buyOf(b), sell = sellOf(b);
+        if (buy == null) continue;
+        hist.push({ time: b.time, value: buy, color: color(true, level("buy", i)) });
+        histSell.push({ time: b.time, value: -(sell ?? 0), color: color(false, level("sell", i)) });
+      } else if (mode === "delta") {
+        const delta = deltaOf(b);
+        if (delta != null) hist.push({ time: b.time, value: delta,
+          color: color(delta > 0, level(delta > 0 ? "posd" : "negd", i)) });
+      } else {
+        const arr = derived.crv;
+        const shape = mode === "cvd" ? flowData().cvdCandle(b) :
+          (arr[i] == null || i === 0 || arr[i - 1] == null ? null :
+            { time: b.time, open: arr[i - 1], high: Math.max(arr[i - 1], arr[i]),
+              low: Math.min(arr[i - 1], arr[i]), close: arr[i] });
+        if (!shape) continue;
+        const lvl = mode === "crvol" ? level("vol", i) : level(b.delta > 0 ? "posd" : "negd", i);
+        const col = color(mode === "crvol" ? up : b.delta > 0, lvl);
+        candles.push({ ...shape, color: col, wickColor: col });
+      }
+    }
+    return { hist, histSell, candles };
+  }
+
+  function buildPulseData(bars, derived, cfg) {
+    const pulse = [], th = cfg.mult, alpha = [0.12, 0.45, 0.75, 1];
+    for (let i = 0; i < bars.length; i++) {
+      const rv = derived.rvol[i];
+      if (rv == null) continue;
+      const up = bars[i].close > bars[i].open;
+      const lvl = rv >= th[2] ? 3 : rv >= th[1] ? 2 : rv >= th[0] ? 1 : 0;
+      const color = lvl === 3 ? (up ? "#00e676" : "#f23645") :
+        up ? `rgba(0, 150, 136, ${alpha[lvl]})` : `rgba(242, 54, 69, ${alpha[lvl]})`;
+      pulse.push({ time: bars[i].time, value: rv, color });
+    }
+    return pulse;
+  }
+
+  function buildBandData(bars, band) {
+    const { mid, up, dn, state } = band;
+    return bars.flatMap((bar, i) => mid[i] == null || up[i] == null || dn[i] == null ? [] :
+      [{ time: bar.time, mid: mid[i], up: up[i], dn: dn[i], state: state[i], close: bar.close, idx: i }]);
+  }
+
   // ---------- 固定范围成交量分布(Fixed Range Volume Profile) ----------
   // 口径同 TradingView 的 FRVP: 区间内的价格从最低到最高切成若干行(默认 24 行), 每根 K 线的成交量按它的
   // 最低-最高价均匀摊进各行。TradingView 用小周期 K 线、按阴阳分上涨/下跌量; 这里直接用本图的 K 线(周期越大
@@ -555,9 +618,10 @@
   }
 
   const api = {
-    LW, BAND, EMA_PERIODS, HTF_EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf,
+    LW, BAND, MODE_CHOICES, THRESH_CHOICES, EMA_PERIODS, HTF_EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf,
     rollingSma, rollingZ, ema, htfBucket, htfEma, rma, rsi, linreg, smaStrict, channelIndex,
     deriveLw, deriveBand, deriveObZones, normalizeObOptions, obVolumeEnds, derive, levelOf, volumeProfile,
+    colorFor, buildSuiteData, buildPulseData, buildBandData,
   };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.FlowIndicators = api;

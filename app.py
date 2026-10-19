@@ -31,6 +31,8 @@ from okx_feed import OkxAdapter
 from paper import DEFAULT_CASH, PaperService, PaperStore
 from paper_crypto import CryptoPaperService
 from trade_review import ReviewHistory, TradeReviewService, validate_account
+from training import TrainingService
+from training_api import TrainingDownloads, make_training_router
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "KQ.m@SHFE.fu"
@@ -65,6 +67,9 @@ trade_review = TradeReviewService(
     lambda account: (crypto_paper if account == "crypto" else paper).review_snapshot(),
     lambda: os.path.join(ingest.DATA_DIR, "review"))
 review_history = ReviewHistory(lambda: os.path.join(ingest.DATA_DIR, "review"))
+training = TrainingService(lambda: os.path.join(ingest.DATA_DIR, "training"))
+training_downloads = TrainingDownloads(training.datasets)
+app.include_router(make_training_router(training, training_downloads))
 
 
 def manager_for(symbol: str):
@@ -122,6 +127,7 @@ async def _startup():
 
 @app.on_event("shutdown")
 async def _shutdown():
+    training_downloads.stop()
     manager.stop()
     crypto.stop()
     backups.stop()
