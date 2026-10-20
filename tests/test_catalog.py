@@ -1,6 +1,8 @@
 """合约目录的离线回归: 品种/月份解析、排序、缓存与离线回退。"""
 import asyncio
 import unittest
+from datetime import datetime
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -25,6 +27,7 @@ class FakeApi:
         self.pre_open_interest = dict(pre_open_interest or {})
         self.quote_error = quote_error
         self.quotes = []
+        self.info_calls = []
 
     def query_quotes(self, ins_class=None, exchange_id=None, product_id=None, expired=None):
         if ins_class is None:
@@ -39,6 +42,7 @@ class FakeApi:
         return FakeQuote(underlying=CONT_MAINS.get(symbol, ""))
 
     def query_symbol_info(self, symbols):
+        self.info_calls.append(list(symbols))
         rows = []
         for symbol in symbols:
             rows.append({
@@ -178,6 +182,113 @@ class BuildTests(unittest.TestCase):
         self.assertEqual([g["exchangeId"] for g in groups], ["AAA"])
 
 
+def daily_rows(*days):
+    return pd.DataFrame([{"datetime": pd.Timestamp(day, tz="Asia/Shanghai").value, "volume": volume}
+                         for day, volume in days])
+
+
+class DailyApi(FakeApi):
+    def __init__(self, *args, daily=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.daily = daily or {}
+        self.daily_calls = []
+
+    def get_trading_calendar(self, start_dt, end_dt):
+        dates = pd.date_range(start_dt, end_dt)
+        return pd.DataFrame({"date": dates, "trading": [
+            day.weekday() < 5 and not ("2026-10-01" <= day.strftime("%Y-%m-%d") <= "2026-10-07")
+            for day in dates]})
+
+    def create_task(self, coroutine):
+        return asyncio.create_task(coroutine)
+
+    def get_kline_serial(self, symbol, duration_seconds, data_length):
+        self.daily_calls.append((symbol, duration_seconds, data_length))
+        value = self.daily.get(symbol)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+class DailyVolumeTests(unittest.TestCase):
+    def test_only_requested_trading_day_counts_and_missing_is_not_zero(self):
+        rows = daily_rows(("2026-10-16", 400), ("2026-10-19", 1200), ("2026-10-20", 9999))
+        self.assertEqual(catalog.previous_daily_volume(rows, "2026-10-19"), 1200)
+        self.assertIsNone(catalog.previous_daily_volume(rows, "2026-10-18"))
+        for value in (None, float("nan"), float("inf"), -1):
+            self.assertIsNone(catalog.previous_daily_volume(daily_rows(("2026-10-19", value)), "2026-10-19"))
+        self.assertEqual(catalog.previous_daily_volume(daily_rows(("2026-10-19", 0)), "2026-10-19"), 0)
+        self.assertIsNone(catalog.previous_daily_volume([{"datetime": 0, "volume": 0}], "2026-10-19"))
+
+    def test_calendar_handles_weekends_holidays_and_night_session(self):
+        reader, api = catalog.DailyVolumes(), DailyApi()
+        for now, expected in (
+            ("2026-10-19T10:00:00+08:00", "2026-10-16"),
+            ("2026-10-20T17:59:00+08:00", "2026-10-19"),
+            ("2026-10-20T21:00:00+08:00", "2026-10-20"),
+            ("2026-10-17T10:00:00+08:00", "2026-10-16"),
+            ("2026-10-08T09:00:00+08:00", "2026-09-30"),
+        ):
+            with self.subTest(now=now):
+                self.assertEqual(reader.snapshot(api, [], datetime.fromisoformat(now))[1], expected)
+
+    def test_subscriptions_are_deferred_deduplicated_and_reset_on_reconnect(self):
+        async def run():
+            now = datetime.fromisoformat("2026-10-20T10:00:00+08:00")
+            reader = catalog.DailyVolumes()
+            api = DailyApi(daily={"SHFE.fu2611": daily_rows(("2026-10-19", 12345))})
+            first, date = reader.snapshot(api, ["SHFE.fu2611", "SHFE.fu2611", ""], now)
+            self.assertEqual(first, {"SHFE.fu2611": None})
+            self.assertEqual(date, "2026-10-19")
+            self.assertEqual(api.daily_calls, [])  # HTTP 查询不等待 SDK 下载日线。
+            await asyncio.sleep(0)
+            self.assertEqual(reader.snapshot(api, ["SHFE.fu2611"], now)[0], {"SHFE.fu2611": 12345})
+            self.assertEqual(api.daily_calls, [("SHFE.fu2611", 86400, 3)])
+            fresh = DailyApi(daily={"SHFE.fu2611": daily_rows(("2026-10-19", 67890))})
+            self.assertIsNone(reader.snapshot(fresh, ["SHFE.fu2611"], now)[0]["SHFE.fu2611"])
+            await asyncio.sleep(0)
+            self.assertEqual(reader.snapshot(fresh, ["SHFE.fu2611"], now)[0]["SHFE.fu2611"], 67890)
+        asyncio.run(run())
+
+    def test_one_failed_contract_does_not_hide_other_volumes_and_can_retry(self):
+        async def run():
+            now = datetime.fromisoformat("2026-10-20T10:00:00+08:00")
+            reader = catalog.DailyVolumes()
+            api = DailyApi(daily={"SHFE.fu2611": RuntimeError("unavailable"),
+                                 "SHFE.fu2701": daily_rows(("2026-10-19", 12))})
+            with patch("catalog.time.monotonic", return_value=100):
+                reader.snapshot(api, api.daily, now)
+                await asyncio.sleep(0)
+                self.assertEqual(reader.snapshot(api, api.daily, now)[0], {"SHFE.fu2611": None, "SHFE.fu2701": 12})
+                self.assertEqual(len(api.daily_calls), 2)
+            api.daily["SHFE.fu2611"] = daily_rows(("2026-10-19", 34))
+            with patch("catalog.time.monotonic", return_value=161):
+                reader.snapshot(api, api.daily, now)
+                await asyncio.sleep(0)
+                self.assertEqual(reader.snapshot(api, api.daily, now)[0]["SHFE.fu2611"], 34)
+        asyncio.run(run())
+
+    def test_service_adds_main_and_month_volumes_without_changing_interest_or_rank(self):
+        async def run():
+            api = DailyApi(conts=["KQ.m@SHFE.fu"], months=["SHFE.fu2611", "SHFE.fu2701"],
+                           pre_open_interest={"SHFE.fu2611": 400, "SHFE.fu2701": 200},
+                           daily={"SHFE.fu2611": daily_rows(("2026-10-19", 123)),
+                                  "SHFE.fu2701": daily_rows(("2026-10-19", 999))})
+            service = catalog.CatalogService(lambda: FakeManager(api))
+            await service.payload(exchange="SHFE", product="fu")
+            await asyncio.sleep(0)
+            data = await service.payload(exchange="SHFE", product="fu")
+            product = data["groups"][0]["products"][0]
+            self.assertEqual((product["openInterest"], product["previousVolume"]), (200, 123))
+            self.assertEqual([(m["symbol"], m["openInterest"], m["previousVolume"]) for m in data["months"]],
+                             [("SHFE.fu2611", 200, 123), ("SHFE.fu2701", 100, 999)])
+            self.assertEqual(data["previousVolumeDate"], "2026-10-19")
+            self.assertNotIn("previousVolume", service._catalog[1]["groups"][0]["products"][0])
+        with patch("catalog.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime.fromisoformat("2026-10-20T10:00:00+08:00")
+            asyncio.run(run())
+
+
 class ServiceTests(unittest.TestCase):
     def test_live_catalog_is_cached_and_served_with_months(self):
         api = FakeApi(conts=["KQ.m@SHFE.fu"], months=["SHFE.fu2611", "SHFE.fu2701"],
@@ -190,9 +301,9 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual([m["symbol"] for m in data["months"]], ["SHFE.fu2611", "SHFE.fu2701"])
         self.assertTrue(data["months"][0]["isMain"])
         self.assertEqual(data["groups"][0]["products"][0]["contSymbol"], "KQ.m@SHFE.fu")
-        jobs = len(manager.jobs)
+        info_calls = len(api.info_calls)
         asyncio.run(service.payload(exchange="SHFE", product="fu"))
-        self.assertEqual(len(manager.jobs), jobs)   # 命中缓存, 不再打扰采集线程
+        self.assertEqual(len(api.info_calls), info_calls)  # 静态目录命中缓存; 日线只读已有引用。
 
     def test_offline_catalog_falls_back_to_builtin_varieties(self):
         service = catalog.CatalogService(lambda: FakeManager(error=RuntimeError("行情线程未就绪")))

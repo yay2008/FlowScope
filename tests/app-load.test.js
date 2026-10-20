@@ -216,7 +216,7 @@ function stubFetch(url) {
 function paperResponse() {
   return {
     symbol: "KQ.m@SHFE.fu", contract: "SHFE.fu2611", error: null, fee: null, feeSource: null,
-    autoStopRatio: 1.5,
+    autoStopsVersion: 2,
     quote: { contract: "SHFE.fu2611", name: "燃油2611", ask: 3001, bid: 3000, askVolume: 5, bidVolume: 7,
              last: 3000, priceTick: 1, priceDecs: 0, open: true, reason: "", datetime: "2026-09-30 10:00:00" },
     account: { initialCash: 1000000, cash: 1000000, equity: 1000100, floatPnl: 100, margin: 4500,
@@ -233,6 +233,14 @@ function paperResponse() {
 
 function jsonResponse(payload) {
   return { ok: true, status: 200, json: async () => payload };
+}
+
+function cryptoPaperResponse() {
+  const state = paperResponse();
+  return { ...state, mode: "crypto", symbol: "BINANCE.BTCUSDT.P", contract: "BINANCE.BTCUSDT.P", leverage: 10,
+    fee: { maker: 0.0002, taker: 0.0005 }, positions: [], orders: [], trades: [],
+    quote: { ...state.quote, contract: "BINANCE.BTCUSDT.P", last: 100, bid: 100, ask: 100.1,
+      priceTick: 0.1, priceDecs: 1, qtyStep: 0.001, qtyDecs: 3, minQty: 0.001, maxLeverage: 125, unit: "BTC" } };
 }
 
 function runBrowser(options = {}) {
@@ -347,8 +355,8 @@ test("下单时填的止盈止损随委托提交, 成功后清空; 挂单带的�
   assert.deepEqual(lines.map((line) => line.textContent), ["止盈 3100 · 止损 2950"], "只有带了止盈止损的挂单多一行");
   assert.equal(byId("trade-orders-count").textContent, "挂单 2", "委托默认折叠, 标题上标出挂单数(桩里原有一张挂单 + O4)");
 
-  byId("trade-auto-enabled").checked = false;
-  byId("trade-auto-enabled").handlers.change[0]();
+  byId("trade-auto-loss-enabled").checked = false;
+  byId("trade-auto-loss-enabled").handlers.change[0]();
   assert.equal(byId("trade-order-stops").hidden, false);
   byId("trade-order-tp").value = "3100";
   byId("trade-order-sl").value = "2950";
@@ -371,7 +379,7 @@ test("下单时填的止盈止损随委托提交, 成功后清空; 挂单带的�
   assert.equal(byId("trade-msg").textContent, "止盈止损价要是正数");
 });
 
-test("期货默认自动止损100元止盈150元, 金额随委托提交并记住, 加密不使用", async () => {
+test("期货默认只启用100元止损, 止盈独立配置并记住, 加密不使用", async () => {
   const posts = [];
   const storage = createLocalStorage();
   let crypto = false;
@@ -396,14 +404,17 @@ test("期货默认自动止损100元止盈150元, 金额随委托提交并记住
   const context = runBrowser({ fetch, localStorage: storage });
   await vm.runInContext("paperPanel.refresh()", context);
   const byId = (id) => context.document.getElementById(id);
-  assert.equal(byId("trade-auto-enabled").checked, true);
+  assert.equal(byId("trade-auto-loss-enabled").checked, true);
   assert.equal(byId("trade-auto-loss").value, "100");
-  assert.equal(byId("trade-auto-profit").textContent, "止盈 150.00 元 · 1:1.5");
+  assert.equal(byId("trade-auto-profit-enabled").checked, false);
+  assert.equal(byId("trade-auto-profit").disabled, true);
+  assert.equal(byId("trade-auto-profit").value, "150");
   assert.equal(byId("trade-order-stops").hidden, true);
   byId("trade-order-sl").value = "999";  // 隐藏的手动价不能混入金额委托
   byId("trade-buy").handlers.click[0]();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(posts[0].autoStopLoss, 100);
+  assert.ok(!("autoTakeProfit" in posts[0]));
   assert.ok(!("tp" in posts[0]) && !("sl" in posts[0]));
   byId("trade-auto-loss").value = "0";
   byId("trade-buy").handlers.click[0]();
@@ -412,19 +423,26 @@ test("期货默认自动止损100元止盈150元, 金额随委托提交并记住
   byId("trade-auto-loss").handlers.input[0]();
   await vm.runInContext("paperPanel.refresh()", context);
   assert.equal(byId("trade-auto-loss").value, "200", "轮询不冲掉金额");
-  assert.equal(byId("trade-auto-profit").textContent, "止盈 300.00 元 · 1:1.5");
+  assert.equal(byId("trade-auto-profit").value, "150", "止盈不随止损联动");
+  byId("trade-auto-profit-enabled").checked = true;
+  byId("trade-auto-profit-enabled").handlers.change[0]();
+  byId("trade-auto-profit").value = "270";
+  byId("trade-auto-profit").handlers.input[0]();
   byId("trade-sell").handlers.click[0]();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(posts[1].autoStopLoss, 200);
+  assert.equal(posts[1].autoTakeProfit, 270);
   assert.equal(byId("trade-auto-loss").value, "200", "成交不清空金额");
   let reloaded = runBrowser({ localStorage: storage });
   assert.equal(reloaded.document.getElementById("trade-auto-loss").value, "200");
-  byId("trade-auto-enabled").checked = false;
-  byId("trade-auto-enabled").handlers.change[0]();
+  assert.equal(reloaded.document.getElementById("trade-auto-profit").value, "270");
+  assert.equal(reloaded.document.getElementById("trade-auto-profit-enabled").checked, true);
+  byId("trade-auto-loss-enabled").checked = false;
+  byId("trade-auto-loss-enabled").handlers.change[0]();
   reloaded = runBrowser({ localStorage: storage });
-  assert.equal(reloaded.document.getElementById("trade-auto-enabled").checked, false);
+  assert.equal(reloaded.document.getElementById("trade-auto-loss-enabled").checked, false);
   // 即使金额模式勾着, 加密仍显示手动价格且不发人民币目标。
-  byId("trade-auto-enabled").checked = true;
+  byId("trade-auto-loss-enabled").checked = true;
   crypto = true;
   await vm.runInContext("paperPanel.refresh()", context);
   assert.equal(byId("trade-auto-stops").hidden, true);
@@ -435,12 +453,260 @@ test("期货默认自动止损100元止盈150元, 金额随委托提交并记住
   assert.ok(!("autoStopLoss" in posts[2]));
 });
 
+test("旧版自动配置升级后默认关闭联动止盈, 单独启用止盈只提交独立金额", async () => {
+  const storage = createLocalStorage();
+  storage.setItem("flowscope.futuresAutoStops", JSON.stringify({ enabled: true, loss: 180 }));
+  const posts = [];
+  const context = runBrowser({ localStorage: storage, fetch: (url, init) => {
+    if (String(url).split("?")[0] === "/api/paper/orders") {
+      const body = JSON.parse(init.body);
+      posts.push(body);
+      return Promise.resolve(jsonResponse({ ...body, status: "filled", fillPrice: 3001, autoStopApplied: true }));
+    }
+    return stubFetch(url);
+  } });
+  await vm.runInContext("paperPanel.refresh()", context);
+  const byId = (id) => context.document.getElementById(id);
+  assert.equal(byId("trade-auto-loss-enabled").checked, true);
+  assert.equal(byId("trade-auto-loss").value, "180");
+  assert.equal(byId("trade-auto-profit-enabled").checked, false);
+  byId("trade-auto-loss-enabled").checked = false;
+  byId("trade-auto-loss-enabled").handlers.change[0]();
+  byId("trade-auto-profit-enabled").checked = true;
+  byId("trade-auto-profit-enabled").handlers.change[0]();
+  byId("trade-auto-profit").value = "0";
+  await byId("trade-buy").handlers.click[0]();
+  assert.equal(posts.length, 0);
+  assert.match(byId("trade-msg").textContent, /自动止盈金额/);
+  byId("trade-auto-profit").value = "260";
+  byId("trade-auto-profit").handlers.input[0]();
+  await byId("trade-buy").handlers.click[0]();
+  assert.equal(posts[0].autoTakeProfit, 260);
+  assert.ok(!("autoStopLoss" in posts[0]));
+  assert.match(byId("trade-msg").textContent, /自动止盈 260\.00/);
+  assert.doesNotMatch(byId("trade-msg").textContent, /自动止损/);
+  byId("trade-auto-profit-enabled").checked = false;
+  byId("trade-auto-profit-enabled").handlers.change[0]();
+  assert.equal(byId("trade-order-stops").hidden, false);
+  await byId("trade-buy").handlers.click[0]();
+  assert.ok(!("autoStopLoss" in posts[1]) && !("autoTakeProfit" in posts[1]));
+});
+
+test("自动平仓显示原因、价格和盈亏, 收起面板仍提示, 历史成交与重复轮询不重放", async () => {
+  const automatic = (id, reason, side = "sell") => ({ id, contract: "SHFE.fu2611", status: "filled",
+    type: "market", side, qty: 1, fillPrice: 3016, reason });
+  let state = paperResponse();
+  state.orders = [automatic("O1", "止损")];
+  const context = runBrowser({ fetch: (url) => String(url).split("?")[0] === "/api/paper"
+    ? Promise.resolve(jsonResponse(state)) : stubFetch(url) });
+  const byId = (id) => context.document.getElementById(id);
+  byId("trade-notice").hidden = true;
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.equal(byId("trade-notice").hidden, true, "首次加载不提示旧成交");
+  byId("trade-toggle").handlers.click[0]();
+  assert.equal(byId("trade").classList.contains("collapsed"), true);
+  state = { ...state, positions: [], orders: [automatic("O2", "止盈"), ...state.orders],
+    trades: [{ orderId: "O2", pnl: 160, price: 3016, side: "sell", qty: 1, close: 1 }] };
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.match(byId("trade-msg").textContent, /止盈已自动平仓.*SHFE\.fu2611.*3016.*\+160\.00/);
+  assert.equal(byId("trade-notice").hidden, false);
+  assert.equal(byId("trade-notice-text").textContent, byId("trade-msg").textContent);
+  assert.match(textOf(byId("trade-position")), /无持仓/);
+  byId("trade-notice-close").handlers.click[0]();
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.equal(byId("trade-notice").hidden, true, "同一平仓不重复弹出");
+  state = { ...state, orders: [automatic("O3", "止损", "buy"), ...state.orders],
+    trades: [{ orderId: "O3", pnl: -100, price: 3016, side: "buy", qty: 1, close: 1 }] };
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.match(byId("trade-notice-text").textContent, /止损已自动平仓.*买入.*-100\.00/);
+  assert.equal(byId("trade-notice").hidden, false);
+});
+
+test("提交期间出现的自动平仓不丢失, 完成后补刷新且不同账户订单编号互不干扰", async () => {
+  let state = paperResponse();
+  let finishOrder;
+  const context = runBrowser({ fetch: (url, init) => {
+    const route = String(url).split("?")[0];
+    if (route === "/api/paper") return Promise.resolve(jsonResponse(state));
+    if (route === "/api/paper/orders") return new Promise((resolve) => { finishOrder = resolve; });
+    return stubFetch(url, init);
+  } });
+  const byId = (id) => context.document.getElementById(id);
+  byId("trade-notice").hidden = true;
+  await vm.runInContext("paperPanel.refresh()", context);
+  const sending = byId("trade-buy").handlers.click[0]();
+  const exitOrder = { id: "O3", contract: "SHFE.fu2611", side: "sell", qty: 1, status: "filled", reason: "止盈", fillPrice: 3015 };
+  state = { ...state, orders: [exitOrder], positions: [] };
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.equal(byId("trade-notice").hidden, true, "提交期间先保留通知");
+  finishOrder(jsonResponse({ side: "buy", qty: 1, status: "filled", fillPrice: 3000 }));
+  await sending;
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.match(byId("trade-notice-text").textContent, /止盈已自动平仓/);
+  byId("trade-notice-close").handlers.click[0]();
+  state = cryptoPaperResponse();
+  await vm.runInContext("paperPanel.refresh()", context);
+  state = { ...state, orders: [{ ...exitOrder, reason: "止损", contract: "BINANCE.BTCUSDT.P" }] };
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.match(byId("trade-notice-text").textContent, /止损已自动平仓.*BINANCE/);
+});
+
+test("下单完成时仍有旧轮询在途, 返回后立即补拉持仓", async () => {
+  let resolvePoll;
+  let slow = false;
+  const context = runBrowser({ fetch: (url, init) => {
+    const route = String(url).split("?")[0];
+    if (route === "/api/paper" && slow) return new Promise((resolve) => { resolvePoll = resolve; });
+    if (route === "/api/paper/orders") return Promise.resolve(jsonResponse({ side: "buy", qty: 1, status: "filled", fillPrice: 3000 }));
+    return stubFetch(url, init);
+  } });
+  await vm.runInContext("paperPanel.refresh()", context);
+  const timers = [];
+  context.setTimeout = (fn, delay) => { timers.push({ fn, delay }); return timers.length; };
+  slow = true;
+  const inFlight = vm.runInContext("paperPanel.refresh()", context);
+  await context.document.getElementById("trade-buy").handlers.click[0]();
+  resolvePoll(jsonResponse(paperResponse()));
+  await inFlight;
+  assert.equal(timers.at(-1).delay, 0, "不能等到下一次常规轮询才看见新持仓");
+});
+
+test("加密按保证金下单: 市价、限价与图表菜单都提交金额, 不混入币数, 非法金额不提交", async () => {
+  const posts = [];
+  const fetch = (url, init) => {
+    const route = String(url).split("?")[0];
+    if (route === "/api/paper") return Promise.resolve(jsonResponse(cryptoPaperResponse()));
+    if (route === "/api/paper/orders" && init?.method === "POST") {
+      const body = JSON.parse(init.body);
+      posts.push(body);
+      return Promise.resolve(jsonResponse({ ...body, qty: 1, status: body.type === "market" ? "filled" : "open", fillPrice: 100.1 }));
+    }
+    return stubFetch(url);
+  };
+  const context = runBrowser({ fetch, search: "?symbol=BINANCE.BTCUSDT.P" });
+  await vm.runInContext("paperPanel.refresh()", context);
+  const byId = (id) => context.document.getElementById(id);
+  assert.equal(byId("trade-sizing").value, "margin");
+  assert.equal(byId("trade-sizing-row").hidden, false);
+  assert.equal(byId("trade-margin-row").hidden, false);
+  assert.equal(byId("trade-qty-row").hidden, true);
+  assert.equal(byId("trade-margin").value, "100");
+  assert.match(byId("trade-sizing-note").textContent, /1,000\.00 USDT · 10x/);
+
+  byId("trade-margin").value = "125.5";
+  byId("trade-margin").handlers.input[0]();
+  byId("trade-qty").value = "999";
+  await vm.runInContext("paperPanel.refresh()", context);
+  assert.equal(byId("trade-margin").value, "125.5", "轮询不覆盖正在输入的金额");
+  await byId("trade-buy").handlers.click[0]();
+  assert.equal(posts[0].margin, 125.5);
+  assert.equal(posts[0].type, "market");
+  assert.ok(!("qty" in posts[0]) && !("autoStopLoss" in posts[0]));
+  assert.match(byId("trade-msg").textContent, /已成交: 买 1/);
+
+  for (const value of ["", "0", "-1", "Infinity", "NaN"]) {
+    byId("trade-margin").value = value;
+    await byId("trade-buy").handlers.click[0]();
+    assert.equal(posts.length, 1);
+    assert.match(byId("trade-msg").textContent, /保证金金额要是有限正数/);
+  }
+  byId("trade-margin").value = "20";
+  byId("trade-type").value = "limit";
+  byId("trade-type").handlers.change[0]();
+  byId("trade-price").value = "99";
+  byId("trade-order-sl").value = "90";
+  await byId("trade-buy").handlers.click[0]();
+  assert.deepEqual([posts[1].margin, posts[1].type, posts[1].price, posts[1].sl], [20, "limit", 99, 90]);
+  assert.match(byId("trade-sizing-note").textContent, /挂单后币数固定/);
+  const items = vm.runInContext("paperPanel.menuItems(99)", context);
+  assert.match(items[1].label, /卖出条件 保证金 20 USDT/);
+  await items[1].run();
+  assert.deepEqual([posts[2].side, posts[2].type, posts[2].margin, posts[2].price], ["sell", "stop", 20, 99]);
+  assert.ok(posts.every((body) => !("qty" in body)));
+});
+
+test("加密下单方式和保证金跨刷新记住, 币数模式与期货手数仍可使用", async () => {
+  const storage = createLocalStorage();
+  const posts = [];
+  const fetch = (url, init) => {
+    if (String(url).split("?")[0] === "/api/paper") return Promise.resolve(jsonResponse(cryptoPaperResponse()));
+    if (init?.method === "POST") {
+      const body = JSON.parse(init.body);
+      posts.push(body);
+      return Promise.resolve(jsonResponse({ ...body, status: "filled", fillPrice: 100 }));
+    }
+    return stubFetch(url);
+  };
+  const context = runBrowser({ fetch, localStorage: storage, search: "?symbol=BINANCE.BTCUSDT.P" });
+  await vm.runInContext("paperPanel.refresh()", context);
+  const byId = (id) => context.document.getElementById(id);
+  byId("trade-margin").value = "250";
+  byId("trade-margin").handlers.input[0]();
+  byId("trade-sizing").value = "qty";
+  byId("trade-sizing").handlers.change[0]();
+  assert.equal(byId("trade-margin-row").hidden, true);
+  assert.equal(byId("trade-qty-row").hidden, false);
+  assert.equal(byId("trade-sizing-note").hidden, true);
+  assert.equal(byId("trade-qty").step, "0.001");
+  byId("trade-qty").value = "0.2";
+  await byId("trade-sell").handlers.click[0]();
+  assert.equal(posts[0].qty, 0.2);
+  assert.ok(!("margin" in posts[0]));
+  const reloaded = runBrowser({ fetch, localStorage: storage, search: "?symbol=BINANCE.BTCUSDT.P" });
+  await vm.runInContext("paperPanel.refresh()", reloaded);
+  assert.equal(reloaded.document.getElementById("trade-sizing").value, "qty");
+  assert.equal(reloaded.document.getElementById("trade-margin").value, "250");
+  byId("trade-sizing").value = "margin";
+  byId("trade-sizing").handlers.change[0]();
+  assert.equal(byId("trade-margin").value, "250");
+  const futures = runBrowser({ localStorage: storage });
+  await vm.runInContext("paperPanel.refresh()", futures);
+  const futureEl = (id) => futures.document.getElementById(id);
+  assert.equal(futureEl("trade-sizing-row").hidden, true);
+  assert.equal(futureEl("trade-margin-row").hidden, true);
+  assert.equal(futureEl("trade-qty-row").hidden, false);
+  assert.equal(futureEl("trade-qty-label").textContent, "手数");
+  assert.equal(futureEl("trade-qty").step, "1");
+});
+
+test("保证金仓位预估等杠杆设置成功才更新, 失败恢复原杠杆, 设置中不能下单", async () => {
+  let resolveLeverage;
+  let orderCount = 0;
+  const fetch = (url, init) => {
+    const route = String(url).split("?")[0];
+    if (route === "/api/paper") return Promise.resolve(jsonResponse(cryptoPaperResponse()));
+    if (route === "/api/paper/leverage") return new Promise((resolve) => { resolveLeverage = resolve; });
+    if (route === "/api/paper/orders") orderCount += 1;
+    return stubFetch(url);
+  };
+  const context = runBrowser({ fetch, search: "?symbol=BINANCE.BTCUSDT.P" });
+  await vm.runInContext("paperPanel.refresh()", context);
+  const byId = (id) => context.document.getElementById(id);
+  byId("trade-leverage").value = "20";
+  const changing = byId("trade-leverage").handlers.change[0]();
+  assert.equal(byId("trade-buy").disabled, true);
+  assert.equal(byId("trade-leverage").disabled, true);
+  assert.match(byId("trade-sizing-note").textContent, /1,000\.00 USDT · 10x/);
+  await byId("trade-buy").handlers.click[0]();
+  assert.equal(orderCount, 0);
+  resolveLeverage(jsonResponse({ account: {} }));
+  await changing;
+  assert.match(byId("trade-sizing-note").textContent, /2,000\.00 USDT · 20x/);
+  assert.equal(byId("trade-buy").disabled, false);
+  byId("trade-leverage").value = "1";
+  const failing = byId("trade-leverage").handlers.change[0]();
+  resolveLeverage({ ok: false, status: 400, json: async () => ({ detail: "降低杠杆后保证金不够, 先减仓" }) });
+  await failing;
+  assert.equal(byId("trade-leverage").value, "20");
+  assert.match(byId("trade-sizing-note").textContent, /2,000\.00 USDT · 20x/);
+});
+
 test("只刷新前端但后端未重启时, 自动止盈止损不能静默变成无保护开仓", async () => {
   const posts = [];
   const fetch = (url, init) => {
     if (String(url).split("?")[0] === "/api/paper") {
       const state = paperResponse();
-      delete state.autoStopRatio;
+      delete state.autoStopsVersion;
       return Promise.resolve(jsonResponse(state));
     }
     if (init?.method === "POST") posts.push(url);
@@ -2038,6 +2304,116 @@ const near = (actual, expected) =>
   assert.ok(Math.abs(actual.from - expected.from) < 1e-9 && Math.abs(actual.to - expected.to) < 1e-9,
             `范围 ${JSON.stringify(actual)} 应为 ${JSON.stringify(expected)}`);
 
+function paperEntryFixture(context, index = 0) {
+  const el = chartEl(context, index);
+  const pane = new StubElement("tr");
+  pane.getBoundingClientRect = () => ({ left: 100, top: 40, right: 900, bottom: 440, width: 800, height: 400 });
+  el.getBoundingClientRect = () => ({ left: 100, top: 40, right: 900, bottom: 740, width: 800, height: 700 });
+  stubCharts[index].paneElement = pane;
+  const button = findByClass(el, "paper-add");
+  const fire = (node, type, extra = {}) => {
+    const event = { target: node, stopPropagation() {}, ...extra };
+    (node.handlers[type] || []).forEach(fn => fn(event));
+  };
+  const move = (extra = {}) => stubCharts[index].crosshairHandlers.forEach(fn => fn({
+    time: T0 + 50, paneIndex: 0, point: { x: 300, y: 100.25 }, ...extra,
+  }));
+  return { el, button, fire, move };
+}
+
+test("十字线加号: 贴住价格轴、悬停保持价位, 点击只开菜单, 选项才按对齐价和表单手数挂单", async () => {
+  const posts = [];
+  const context = runBrowser({ fetch: (url, init) => {
+    if (url === "/api/paper/orders" && init?.method === "POST") {
+      const body = JSON.parse(init.body);
+      posts.push(body);
+      return Promise.resolve(jsonResponse({ ...body, id: "O3", contract: "SHFE.fu2611", status: "open" }));
+    }
+    return stubFetch(url);
+  } });
+  await vm.runInContext("paperPanel.refresh()", context);
+  feedBothCharts(context);
+  context.document.getElementById("trade-qty").value = "2";
+  const { el, button, fire, move } = paperEntryFixture(context);
+  assert.equal(button.hidden, true);
+  fire(el, "pointerenter");
+  move();
+  assert.equal(button.hidden, false);
+  assert.equal(button.style.left, "740px", "800px 窗格扣除 60px 价格轴, 按钮右端贴到轴边");
+  assert.equal(button.style.top, "100.25px", "按钮中心跟随十字线高度");
+  assert.equal(el.handlers.contextmenu, undefined, "右键不再拦截为挂单入口");
+
+  fire(button, "pointerenter");
+  move({ point: undefined, time: undefined });
+  assert.equal(button.hidden, false, "从画布进入 DOM 按钮时不能把加号藏掉");
+  assert.deepEqual(stubCharts[0].crosshair.at(-1), { price: 4100.25, time: T0 + 50 });
+  fire(button, "click");
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  const menu = el.children.filter(node => node.className === "paper-menu").at(-1);
+  assert.match(menu.children[0].textContent, /卖出限价 2 手 @ 4100/);
+  assert.match(menu.children[1].textContent, /买入条件 2 手 @ 4100/);
+  assert.equal(posts.length, 0, "点击加号不会直接下单");
+
+  fire(button, "pointerleave");
+  move({ point: { x: 400, y: 200 } });
+  assert.equal(button.style.top, "100.25px", "菜单打开后鼠标移动不能改变所选价位");
+  fire(menu.children[0], "click");
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].price, 4100);
+  assert.equal(posts[0].type, "limit");
+  assert.equal(posts[0].side, "sell");
+  assert.equal(posts[0].qty, 2);
+  assert.equal(posts[0].autoStopLoss, 100, "仍带下单表单里的自动止盈止损");
+  assert.equal(button.getAttribute("aria-expanded"), "false");
+});
+
+test("十字线加号: 只在鼠标所在主图显示, 留白可选价, 离开/绘图/换视图/报价失效时收起", async () => {
+  const context = runBrowser();
+  await vm.runInContext("paperPanel.refresh()", context);
+  feedBothCharts(context);
+  const { el, button, fire, move } = paperEntryFixture(context);
+  const peer = paperEntryFixture(context, 1);
+  fire(el, "pointerenter");
+  move();
+  peer.move();
+  assert.equal(button.hidden, false);
+  assert.equal(peer.button.hidden, true, "联动或行情刷新不能让另一张图凭空出现加号");
+  move({ paneIndex: 1 });
+  assert.equal(button.hidden, true, "副图量能坐标不能当成下单价格");
+  move({ point: { x: 780, y: 100 } });
+  assert.equal(button.hidden, true, "价格轴内不显示");
+  move({ time: undefined });
+  assert.equal(button.hidden, false, "最新 K 线右侧留白仍可选价");
+  fire(el, "pointerleave");
+  move();
+  assert.equal(button.hidden, true, "离开后行情刷新不能重新显示");
+
+  fire(el, "pointerenter");
+  move();
+  fire(findByClass(el, "measure-btn"), "click");
+  move();
+  assert.equal(button.hidden, true, "测量期间不显示");
+  vm.runInContext("charts[0].cancelTools()", context);
+  move();
+  assert.equal(button.hidden, false);
+  fire(button, "click");
+  fire(el, "wheel");
+  assert.equal(button.hidden, true);
+  assert.equal(button.getAttribute("aria-expanded"), "false", "缩放同时关闭旧价位菜单");
+
+  move();
+  vm.runInContext('settings.view = "footprint"; charts[0].setView()', context);
+  move();
+  assert.equal(button.hidden, true);
+  vm.runInContext('settings.view = "candles"; charts[0].setView()', context);
+  move();
+  assert.equal(button.hidden, false);
+  vm.runInContext("charts[0].setPaperState(null)", context);
+  move();
+  assert.equal(button.hidden, true, "没有可交易报价不能保留旧加号");
+});
+
 test("时间换算: 逻辑坐标与时间互逆, 休市缺口里线性插值, 两端按周期外推", () => {
   const context = runBrowser();
   const r = JSON.parse(vm.runInContext(`JSON.stringify((() => {
@@ -2070,7 +2446,7 @@ test("可视范围联动: 以鼠标所在那张图为准, 另一张显示同一�
   near(ts10.getVisibleLogicalRange(), { from: 60, to: 180 });
 
   // 鼠标进了 10s 图: 改以它为准。右侧留白按时间换算: 10s 图越过末根 4 根(T0+3630) = 30s 图越过末根 2 根
-  chartEl(context, 0).handlers.pointerenter[0]();
+  chartEl(context, 0).handlers.pointerenter.forEach(fn => fn());
   ts10.setVisibleLogicalRange({ from: 300, to: 363 });
   near(ts30.getVisibleLogicalRange(), { from: 100, to: 121 });
 });
@@ -2080,7 +2456,7 @@ test("十字光标联动: 另一张图的光标落到同一时刻所在的那根
   feedBothCharts(context);
   const [chart10, chart30] = stubCharts;
   const move = (chart, param) => chart.crosshairHandlers[0](param);
-  const enter = (index) => chartEl(context, index).handlers.pointerenter[0]();
+  const enter = (index) => chartEl(context, index).handlers.pointerenter.forEach(fn => fn());
 
   // 鼠标在 10s 图主图窗格 T0+50 上: 30s 图摆到包含它的 T0+30 那根, 价位跟光标(stub 的价格 = 4000 + y)
   enter(0);
@@ -2130,7 +2506,7 @@ test("读数每张图各显示各的: 主图左上角是 OHLC 与涨跌, FlowMet
                "CVD 模式下 CVD 只列一次; 期货列出判向对照");
 
   // 鼠标在 10s 图 T0+50: 10s 图显示那根, 涨跌对上一根收盘; 30s 图显示包含它的 T0+30 那根
-  chartEl(context, 0).handlers.pointerenter[0]();
+  chartEl(context, 0).handlers.pointerenter.forEach(fn => fn());
   stubCharts[0].crosshairHandlers[0]({ time: T0 + 50, point: { x: 100, y: 200 }, paneIndex: 0 });
   const prev = bar(0, T0 + 40), cur = bar(0, T0 + 50);
   const change = cur.close - prev.close;
@@ -2576,16 +2952,16 @@ test("可视范围联动: 周期相差超过 3 倍时只对齐右边缘, 另一�
   })()`, context);
   const [ts1m, ts1h] = stubCharts.map((chart) => chart.timeScale);
   ts1h.setVisibleLogicalRange({ from: 0, to: 20 });            // 1h 图看 20 根
-  chartEl(context, 0).handlers.pointerenter[0]();
+  chartEl(context, 0).handlers.pointerenter.forEach(fn => fn());
   ts1m.setVisibleLogicalRange({ from: 600, to: 700 });         // 1m 图右边缘 = T0 + 700 分钟
   near(ts1h.getVisibleLogicalRange(), { from: 700 / 60 - 20, to: 700 / 60 });
   const sets = ts1h.sets;
   ts1m.setVisibleLogicalRange({ from: 600, to: 700 });         // 已经对齐: 不再重设
   assert.equal(ts1h.sets, sets);
   // 两边都已看到最新(右边缘越过末根): 1h 图停在最新, 保留自己的右侧留白
-  chartEl(context, 1).handlers.pointerenter[0]();
+  chartEl(context, 1).handlers.pointerenter.forEach(fn => fn());
   ts1h.setVisibleLogicalRange({ from: 10, to: 26 });           // 鼠标在 1h 图上把它拖到最新, 末根是第 23 根
-  chartEl(context, 0).handlers.pointerenter[0]();
+  chartEl(context, 0).handlers.pointerenter.forEach(fn => fn());
   ts1m.setVisibleLogicalRange({ from: 1400, to: 1443 });       // 1m 图也到最新(末根是第 1439 根)
   near(ts1h.getVisibleLogicalRange(), { from: 10, to: 26 });
   // 1m 图拖回去: 1h 图跟着把右边缘移到同一时刻
@@ -2593,12 +2969,95 @@ test("可视范围联动: 周期相差超过 3 倍时只对齐右边缘, 另一�
   near(ts1h.getVisibleLogicalRange(), { from: 1140 / 60 - 16, to: 1140 / 60 });
   // 反过来: 1m 图停在过去, 鼠标在 1h 图上把它拖到最新(右侧留白 3 根 = 3 小时 = 180 根 1m)。
   // 1m 图只到最新、留自己的 3 根留白, 不能被推进 180 根空白里
-  chartEl(context, 1).handlers.pointerenter[0]();
+  chartEl(context, 1).handlers.pointerenter.forEach(fn => fn());
   ts1h.setVisibleLogicalRange({ from: 10, to: 26 });
   near(ts1m.getVisibleLogicalRange(), { from: 1442 - 40, to: 1442 });
 });
 
-// ---------- 自选请求乱序 ----------
+// ---------- 自选分组、收起与请求乱序 ----------
+
+test("自选按市场分组, 无报价也保留组内添加顺序, 空组不显示", async () => {
+  const context = runBrowser();
+  await new Promise((resolve) => setImmediate(resolve));
+  vm.runInContext(`favorites = ["BINANCE.BTCUSDT.P", "KQ.m@DCE.i", "CFFEX.IF2611",
+    "SHFE.fu2611", "OKX.ETH-USDT-SWAP", "AGG.BTC", "KQ.m@CFFEX.T"]; renderWatch();`, context);
+  const list = context.document.getElementById("watch-items");
+  const snapshot = () => list.children.map((group) => ({
+    title: group.children[0].children[0].textContent,
+    count: group.children[0].children[1].textContent,
+    codes: group.children[1].children.map((item) => item.children[1].children[0].title),
+  }));
+  const expected = [
+    { title: "商品期货", count: "2", codes: ["KQ.m@DCE.i", "SHFE.fu2611"] },
+    { title: "金融期货", count: "2", codes: ["CFFEX.IF2611", "KQ.m@CFFEX.T"] },
+    { title: "加密", count: "3", codes: ["BINANCE.BTCUSDT.P", "OKX.ETH-USDT-SWAP", "AGG.BTC"] },
+  ];
+  assert.deepEqual(snapshot(), expected);
+  vm.runInContext(`watchRows.set("AGG.BTC", {symbol: "AGG.BTC", name: "BTC", venue: "多所汇总",
+    lastPrice: 60000, volume: 12}); renderWatch();`, context);
+  assert.deepEqual(snapshot(), expected, "报价刷新不得重新排序或重复添加分组");
+  vm.runInContext(`favorites = ["AGG.BTC"]; renderWatch();`, context);
+  assert.deepEqual(snapshot(), [{ title: "加密", count: "1", codes: ["AGG.BTC"] }]);
+  vm.runInContext("favorites = []; renderWatch();", context);
+  assert.deepEqual(snapshot(), []);
+  assert.match(context.document.getElementById("watch-hint").textContent, /加入自选/);
+});
+
+test("点自选先收起再切换, 重载后保持收起, 当前合约也可收起并通过箭头展开", async () => {
+  const storage = createLocalStorage();
+  const context = runBrowser({ localStorage: storage });
+  await new Promise((resolve) => setImmediate(resolve));
+  vm.runInContext(`favorites = ["KQ.m@SHFE.fu", "AGG.BTC"]; renderWatch();`, context);
+  const byId = (id) => context.document.getElementById(id);
+  const [futures, crypto] = byId("watch-items").children.map((group) => group.children[1].children[0]);
+  futures.handlers.click.forEach((fn) => fn());
+  assert.equal(context.location.search, "", "点击当前合约不应重载页面");
+  assert.equal(byId("watchlist").classList.contains("collapsed"), true);
+  assert.equal(storage.getItem("flowscope.watchCollapsed"), "1");
+  assert.equal(byId("watch-toggle").getAttribute("aria-expanded"), "false");
+  byId("watch-toggle").handlers.click.forEach((fn) => fn());
+  assert.equal(byId("watchlist").classList.contains("collapsed"), false);
+  assert.equal(storage.getItem("flowscope.watchCollapsed"), "0");
+  assert.equal(byId("watch-toggle").getAttribute("aria-expanded"), "true");
+  let navigation;
+  Object.defineProperty(context.location, "search", {
+    get: () => "",
+    set: (value) => {
+      assert.equal(storage.getItem("flowscope.watchCollapsed"), "1", "导航前必须保存收起状态");
+      assert.equal(byId("watchlist").classList.contains("collapsed"), true);
+      navigation = value;
+    },
+  });
+  crypto.handlers.click.forEach((fn) => fn());
+  assert.equal(navigation, "?symbol=AGG.BTC");
+  const reloaded = runBrowser({ localStorage: storage, search: navigation });
+  assert.equal(reloaded.document.getElementById("watchlist").classList.contains("collapsed"), true);
+  assert.equal(reloaded.document.getElementById("watch-toggle").getAttribute("aria-label"), "展开自选面板");
+});
+
+test("点分组内的移出按钮只移出自选, 不收起或切换合约", async () => {
+  const requests = [];
+  const context = runBrowser({ fetch: (url, init) => {
+    if (String(url).startsWith("/api/favorites?")) {
+      requests.push({ url: String(url), method: init.method });
+      return Promise.resolve(jsonResponse({ symbols: [], max: 40 }));
+    }
+    return stubFetch(url);
+  } });
+  await new Promise((resolve) => setImmediate(resolve));
+  vm.runInContext(`favorites = ["AGG.BTC"]; renderWatch();`, context);
+  const list = context.document.getElementById("watch-items");
+  const item = list.children[0].children[1].children[0];
+  const remove = item.children[0].children[1];
+  let stopped = false;
+  remove.handlers.click.forEach((fn) => fn({ stopPropagation() { stopped = true; } }));
+  assert.equal(stopped, true, "移出按钮必须阻止点击冒泡到合约行");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests, [{ url: "/api/favorites?symbol=AGG.BTC", method: "DELETE" }]);
+  assert.equal(context.location.search, "");
+  assert.equal(context.document.getElementById("watchlist").classList.contains("collapsed"), false);
+  assert.equal(list.children.length, 0);
+});
 
 test("连点两个 ☆ 时晚到的旧响应不会覆盖新列表", async () => {
   const pending = [];

@@ -97,6 +97,16 @@ test("上下键到边界停住, 不绕回", () => {
   assert.equal(moveIndex(0, 1, 0), 0);
 });
 
+test("月份选项保留昨日成交量与日期, 月份未到时沿用主力的统计", () => {
+  const product = { ...PRODUCTS[0], previousVolume: 100, previousVolumeDate: "2026-10-19" };
+  assert.equal(monthOptions(product, [])[0].previousVolume, 100);
+  const options = monthOptions(product, MONTHS.map((month, i) => ({
+    ...month, previousVolume: i ? 200 : 0, previousVolumeDate: "2026-10-20",
+  })));
+  assert.deepEqual(options.map((item) => item.previousVolume), [0, 200]);
+  assert.deepEqual(options.map((item) => item.previousVolumeDate), ["2026-10-20", "2026-10-20"]);
+});
+
 test("一级上下键移动并请求预取对应品种的月份", () => {
   const state = { level: "product", productIndex: 0, monthIndex: 0 };
   const down = reduceKey(state, "ArrowDown", PRODUCTS, []);

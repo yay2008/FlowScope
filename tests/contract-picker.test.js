@@ -6,6 +6,8 @@ const assert = require("node:assert/strict");
 const PickerCore = require("../static/picker-core.js");
 const FlowData = require("../static/data-sync.js");
 const ContractPicker = require("../static/contract-picker.js");
+const activePickers = [];
+test.afterEach(() => { activePickers.splice(0).forEach((picker) => picker.close()); });
 
 // ---------- 最小 DOM stub ----------
 
@@ -163,6 +165,7 @@ function setup(options = {}) {
     onPick: (symbol) => picked.push(symbol),
     onStatus: (text, detail) => statuses.push([text, detail]),
   });
+  activePickers.push(picker);
   return { doc, el, picker, calls, picked, statuses, toggled, favorites: favoriteSet };
 }
 
@@ -201,6 +204,77 @@ test("打开菜单聚焦搜索框, Esc 关闭", async () => {
   el.search.dispatch("keydown", { key: "Escape" });
   assert.equal(picker.isOpen(), false);
   assert.equal(el.popup.hidden, true);
+});
+
+test("期货同时显示昨仓与昨量, 主力和月份各用自己的成交量, 缺失不冒充零", async () => {
+  const data = structuredClone(CATALOG);
+  data.groups[0].products[0].previousVolume = 1234500;
+  data.groups[0].products[0].previousVolumeDate = "2026-10-19";
+  data.groups[0].products[1].previousVolume = 0;
+  const { picker, el } = setup({ fetchJson: (url) => url === "/api/symbols" ? data : {
+    months: [
+      { ...MONTHS["SHFE.fu"].months[0], previousVolume: 1234500, previousVolumeDate: "2026-10-19" },
+      { ...MONTHS["SHFE.fu"].months[1], previousVolume: 456000, previousVolumeDate: "2026-10-19" },
+    ],
+  } });
+  picker.load();
+  await flush();
+  assert.match(el.products.textContent, /昨仓 42\.8万昨量 123\.5万/);
+  assert.match(el.products.textContent, /昨仓 314\.5万昨量 0/);
+  assert.match(el.products.textContent, /昨仓 59\.0万昨量 —/);
+  assert.match(el.months.textContent, /★ 燃油2611昨仓 42\.8万昨量 123\.5万/);
+  assert.match(el.months.textContent, /燃油2701昨仓 26\.7万昨量 45\.6万/);
+  const row = el.products.children.find((child) => child.attributes.id);
+  assert.match(row.children[0].children[1].children[1].title, /2026-10-19/);
+});
+
+test("重新打开菜单补上昨日成交量, 保留当前品种与持仓量", async () => {
+  let ready = false;
+  const { picker, el } = setup({ fetchJson: (url) => {
+    if (url !== "/api/symbols") return defaultRoutes()(url);
+    const data = structuredClone(CATALOG);
+    data.groups[0].products[0].previousVolume = ready ? 92000 : null;
+    return data;
+  } });
+  picker.load();
+  await flush();
+  assert.match(el.products.textContent, /昨量 —/);
+  ready = true;
+  picker.open();
+  await flush();
+  assert.match(el.products.textContent, /昨仓 42\.8万昨量 9\.2万/);
+  assert.equal(picker.snapshot().products[picker.snapshot().productIndex].productId, "fu");
+});
+
+test("菜单打开时自动补昨量并保留滚动位置, 关闭后停止轮询", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const ticks = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+  let clock = 10000;
+  let ready = false;
+  const { picker, el, calls } = setup({ now: () => clock, fetchJson: (url) => {
+    if (url !== "/api/symbols") return defaultRoutes()(url);
+    const data = structuredClone(CATALOG);
+    data.groups[0].products[0].previousVolume = ready ? 10000 : null;
+    return data;
+  } });
+  picker.load();
+  await ticks();
+  picker.open();
+  await ticks();
+  el.products.scrollTop = 80;
+  el.months.scrollTop = 20;
+  ready = true;
+  clock += 5000;
+  t.mock.timers.tick(5000);
+  await ticks();
+  assert.match(el.products.textContent, /昨仓 42\.8万昨量 1\.0万/);
+  assert.equal(el.products.scrollTop, 80);
+  assert.equal(el.months.scrollTop, 20);
+  picker.close();
+  const requests = calls.length;
+  t.mock.timers.tick(10000);
+  await ticks();
+  assert.equal(calls.length, requests);
 });
 
 test("输入即过滤一级, 并自动预取第一个命中品种的月份", async () => {

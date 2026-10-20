@@ -19,6 +19,7 @@
   const MONTHS_RETRY_MS = 8000;    // 月份取失败后隔多久允许再试(下次悬停/打开菜单时生效)
   const CATALOG_RETRY_MS = 10000;  // 目录失败后的自动重试间隔
   const CATALOG_RETRY_MAX = 6;
+  const VOLUME_REFRESH_MS = 5000; // 菜单打开时补上异步到达的昨日成交量。
 
   function create(options) {
     const core = options.core || root.PickerCore;
@@ -44,9 +45,11 @@
     let monthState = new Map();      // key -> {status, months, error}
     let symbol = "";                 // 当前合约(URL 里那个)
     let label = "";                  // 页面给的展示名(服务端解析的合约中文名), 有就优先显示在触发器上
-    let generation = 0;              // 请求代际: 丢弃过期响应
     let hoverTimer = null;
     let isOpen = false;
+    let refreshTimer = null;
+    let loadingCatalog = false;
+    let volumeDate = null;
     let productRows = [];            // 与 filtered 一一对应, 供高亮时直接改 class
     let monthRows = [];              // 与 currentOptions() 一一对应
     // 两列各自记 ☆ 元素(就地改状态, 不重排列表, 免得滚动位置被重置), key = 合约代码
@@ -74,40 +77,61 @@
 
     // ---------- 目录 ----------
 
-    function load(attempt = 0) {
-      const cached = readCache();
+    function load(attempt = 0, useCache = true) {
+      if (loadingCatalog) return;
+      loadingCatalog = true;
+      const cached = useCache ? readCache() : null;
       if (cached) applyCatalog(cached);
       fetchJson("/api/symbols")
         .then((data) => {
           applyCatalog(data);
           writeCache(data);
+          const product = activeProduct();
+          if (isOpen && product && !product.crypto) ensureMonths(product, true);
         })
         .catch((error) => {
-          if (cached) return;                      // 有缓存先用着, 后台下次打开再刷新
+          if (cached || products.length) return;  // 已有菜单继续可用, 下次打开再刷新。
           setStatus(`合约目录加载失败（${attempt + 1}/${CATALOG_RETRY_MAX}），可直接手填合约`,
                     error.message, "error");
           // 连接刚断时目录会失败, 稍后自动重试; 不重试的话这一页就只能手填合约了。
           if (attempt + 1 < CATALOG_RETRY_MAX) {
             setTimeout(() => load(attempt + 1), CATALOG_RETRY_MS);
           }
-        });
+        })
+        .finally(() => { loadingCatalog = false; scheduleRefresh(); });
+    }
+
+    function scheduleRefresh() {
+      clearTimeout(refreshTimer);
+      if (!isOpen) return;
+      refreshTimer = setTimeout(() => {
+        if (!isOpen) return;
+        if (!doc.hidden) {
+          load(0, false);
+        } else scheduleRefresh();
+      }, VOLUME_REFRESH_MS);
     }
 
     function applyCatalog(data) {
-      generation += 1;                                  // 上一份目录的月份请求全部作废
+      const productScroll = el.products.scrollTop;
+      const monthScroll = el.months.scrollTop;
       // 常见时序: 先用缓存画出菜单, 用户已经 ↑↓ 选到某个品种, 网络目录才到。光标要跟着
       // 那个品种走(新目录里它可能换了位置), 不能归零 —— 否则紧接着的 Enter 会切到第一个品种。
       const keepKey = productKey(activeProduct());
       const keepLevel = level;
       const keepMonth = monthIndex;
-      // 已经取到的月份也带过去, 否则二级在重取完成前只剩「★ 主力」, 月份光标会落到列表之外。
-      // 只带成功的结果: 取到一半的请求会因为换代被丢弃, 带过去的 loading 状态就永远不会结束。
+      // 同一交易日、同一主力的月份继续使用, 包括在途请求与失败冷却期。
       const keepMonths = monthState.get(keepKey);
+      const keepMain = activeProduct() && activeProduct().mainSymbol;
       monthState = new Map();
-      if (keepMonths && keepMonths.status === "ready" && !keepMonths.error) {
+      const incoming = core.flattenGroups((data && data.groups) || []);
+      const sameProduct = incoming.find((item) => productKey(item) === keepKey && item.mainSymbol === keepMain);
+      if (keepMonths && sameProduct
+          && volumeDate === (data && data.previousVolumeDate || null)) {
         monthState.set(keepKey, keepMonths);
       }
-      products = core.flattenGroups((data && data.groups) || []);
+      volumeDate = data && data.previousVolumeDate || null;
+      products = incoming;
       categories = core.CATEGORIES.map((item) => item.id)
         .filter((id) => products.some((product) => core.categoryOf(product) === id));
       // 首次到达时按当前合约选页签; 当前页签在新目录里没了(加密源停了)也重新选
@@ -140,6 +164,8 @@
       } else {
         setStatus("");
       }
+      el.products.scrollTop = productScroll;
+      el.months.scrollTop = monthScroll;
     }
 
     function readCache() {
@@ -260,7 +286,7 @@
       hoverTimer = setTimeout(() => ensureMonths(product), HOVER_DEBOUNCE_MS);
     }
 
-    function ensureMonths(product) {
+    function ensureMonths(product, refresh = false) {
       const key = productKey(product);
       // 加密永续没有月份: 二级只有永续本身(monthOptions 的第一项), 不必去问服务端
       if (product.crypto) {
@@ -273,22 +299,26 @@
         // 服务端把月份查询失败(超时、连接无响应)包成 200 + monthsError 返回, 也算失败
         const failed = known.status === "error" || (known.status === "ready" && known.error);
         const retryable = failed && now() - (known.at || 0) >= MONTHS_RETRY_MS;
-        if (!retryable) return;
+        const stale = now() - (known.at || 0) >= VOLUME_REFRESH_MS;
+        if (known.status === "loading" || (failed && !retryable) || (!retryable && (!refresh || !stale))) return;
       }
-      const ticket = generation;
-      monthState.set(key, { status: "loading", months: (known && known.months) || [],
-                            error: null, at: now() });
+      const ticket = { status: "loading", months: (known && known.months) || [], error: null, at: now() };
+      monthState.set(key, ticket);
       if (key === activeKey) renderMonths();
       fetchJson(`/api/symbols?exchange=${encodeURIComponent(product.exchangeId)}` +
                 `&product=${encodeURIComponent(product.productId)}`)
         .then((data) => {
-          if (ticket !== generation) return;            // 目录已换代, 这份响应过期了
+          if (monthState.get(key) !== ticket) return;    // 品种/交易日已变化, 丢弃旧响应。
           monthState.set(key, { status: "ready", months: (data && data.months) || [],
                                 error: (data && data.monthsError) || null, at: now() });
-          if (key === activeKey) { renderMonths(); renderHighlight(); }
+          if (key === activeKey) {
+            const scroll = el.months.scrollTop;
+            renderMonths(); renderHighlight();
+            el.months.scrollTop = scroll;
+          }
         })
         .catch((error) => {
-          if (ticket !== generation) return;
+          if (monthState.get(key) !== ticket) return;
           monthState.set(key, { status: "error", months: [], error: error.message, at: now() });
           if (key === activeKey) { renderMonths(); renderHighlight(); }
         });
@@ -325,7 +355,11 @@
         qty.textContent = product.crypto && !product.openInterest ? "" : flow.formatOpenInterest(product.openInterest);
         // 期货这一栏是主力合约的昨日持仓量, 加密永续是 24 小时成交额(USDT)
         qty.title = product.crypto ? "24 小时成交额（USDT）" : "主力合约昨日持仓量";
-        item.append(name, qty);
+        if (product.crypto) item.append(name, qty);
+        else {
+          qty.textContent = `昨仓 ${flow.formatOpenInterest(product.openInterest)}`;
+          appendFuturesInfo(item, name, qty, product, "主力合约");
+        }
         // 品种行上的 ☆ 收藏的是它的主力(主连), 与二级第一项是同一个合约; 加密永续就是它本身
         appendStar(item, product.contSymbol, product.crypto ? "" : "该品种主力", productStars);
         item.addEventListener("mouseenter", () => selectProduct(index, false));
@@ -334,6 +368,22 @@
         el.products.append(item);
         productRows.push(item);
       });
+    }
+
+    function appendFuturesInfo(item, name, interest, data, prefix = "") {
+      const info = node("picker-info");
+      const metrics = node("picker-metrics");
+      const volume = doc.createElement("span");
+      volume.className = "picker-qty";
+      const value = data.previousVolume;
+      const valid = value != null && Number.isFinite(Number(value)) && Number(value) >= 0;
+      volume.textContent = `昨量 ${valid ? flow.formatOpenInterest(value) : "—"}`;
+      volume.title = `${prefix}上一交易日成交量（手）` +
+        (data.previousVolumeDate ? ` · ${data.previousVolumeDate}` : "") +
+        (valid ? "" : " · 暂无数据");
+      metrics.append(interest, volume);
+      info.append(name, metrics);
+      item.append(info);
     }
 
     function selectProduct(index, fetchNow) {
@@ -372,9 +422,16 @@
         const name = doc.createElement("span");
         name.className = "picker-name";
         name.textContent = product.crypto ? `${product.name} · ${product.exchangeName}`
-          : (option.isMain ? "★ " : "") + flow.monthLabel(option);
+          : (option.isMain ? "★ " : "") + (option.name || option.symbol);
         name.title = option.symbol;
-        item.append(name);
+        if (product.crypto) item.append(name);
+        else {
+          const interest = doc.createElement("span");
+          interest.className = "picker-qty";
+          interest.textContent = `昨仓 ${flow.formatOpenInterest(option.openInterest)}`;
+          interest.title = "昨日持仓量（手，单边）";
+          appendFuturesInfo(item, name, interest, option);
+        }
         appendStar(item, option.symbol, option.isMain && !product.crypto ? "该品种主力" : "", monthStars);
         item.addEventListener("mouseenter", () => {
           level = "month";
@@ -479,11 +536,14 @@
       const moved = !!home && home !== category && categories.includes(home);
       if (moved) category = home;
       applyFilter(moved);
+      load(0, false);
+      scheduleRefresh();
     }
 
     function close() {
       if (!isOpen) return;
       isOpen = false;
+      clearTimeout(refreshTimer);
       el.popup.hidden = true;
       if (el.trigger) el.trigger.setAttribute("aria-expanded", "false");
     }

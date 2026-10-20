@@ -36,7 +36,7 @@
 - 下单时也能带止盈止损: 成交后挂到持仓上(只覆盖填了的那一项), 只减仓或平仓的委托不能带。
   市价单按最新价校验; 限价单按委托价校验, 当场成交的再按最新价校验。挂着的限价单成交时价格若已经
   越过止损/止盈价, 成交后紧接着就会触发 —— 和交易所的"成交后生效"一样。
-- 金额模式: 开仓委托可带 autoStopLoss(元), 按成交后整份持仓的均价、手数与乘数换算止损和 1.5 倍止盈。
+- 金额模式: 开仓委托可分别带 autoStopLoss / autoTakeProfit(元), 按成交后整份持仓的均价、手数与乘数换算价位。
   加减仓后重算, 手动设置价格后退出金额模式。价格向达到目标金额的方向取整, 不含手续费与滑点。
 """
 from __future__ import annotations
@@ -61,7 +61,8 @@ DEFAULT_CASH = 1_000_000.0
 MIN_CASH, MAX_CASH = 10_000.0, 1e10
 MARGIN_RATE = 0.15        # 保证金率估算值: 交易所 5%~12% 再加期货公司上浮, 实际按品种不同
 MAX_ORDER_QTY = 500
-AUTO_STOP_RATIO = 1.5
+LEGACY_AUTO_STOP_RATIO = 1.5
+AUTO_STOPS_VERSION = 2
 # 开盘前集合竞价(8:55、20:55)的报价也算本时段的新报价。
 AUCTION_LEAD = timedelta(minutes=15)
 # 页面不再请求后, 这个合约的报价还跟踪多久(持仓与挂单合约一直跟踪)。
@@ -71,7 +72,7 @@ VERIFY_RETRY_SEC = 30
 COLD_WAIT_SEC = 1.0       # 第一次订阅的合约等报价下发的时间
 MAX_TRADES = 5000
 MAX_FINISHED_ORDERS = 200
-STORE_VERSION = 1
+STORE_VERSION = 2
 FEE_PATTERN = os.path.join(BASE_DIR, "docs", "手续费最低品种排名_*.csv")
 EXCHANGE_CODES = {"中金所": "CFFEX", "郑商所": "CZCE", "大商所": "DCE",
                   "广期所": "GFEX", "能源中心": "INE", "上期所": "SHFE"}
@@ -291,7 +292,7 @@ def normalize_request(raw) -> dict:
             raise OrderError(MISSING_PRICE[kind])
     return {"symbol": symbol, "side": side, "type": kind, "qty": int(qty), "price": price,
             "tp": normalize_stop(raw.get("tp"), "tp"), "sl": normalize_stop(raw.get("sl"), "sl"),
-            "autoStopLoss": normalize_auto_stop_loss(raw.get("autoStopLoss")),
+            **{field: normalize_auto_amount(raw.get(field), kind) for kind, field in AUTO_STOP_FIELDS.items()},
             "clientId": str(raw.get("clientId") or "")[:64]}
 
 
@@ -304,32 +305,36 @@ def snap_to_tick(price: float, tick: float) -> float:
 
 
 STOP_LABELS = {"tp": "止盈", "sl": "止损"}
+AUTO_STOP_FIELDS = {"sl": "autoStopLoss", "tp": "autoTakeProfit"}
 # 委托类型: 条件单(stop)的 price 存的是触发价
 ORDER_TYPES = ("market", "limit", "stop")
 MISSING_PRICE = {"limit": "限价单要填价格", "stop": "条件单要填触发价"}
 PRICE_BASIS = {"limit": "委托价", "stop": "触发价"}
 
 
-def normalize_auto_stop_loss(value) -> float | None:
+def normalize_auto_amount(value, kind: str) -> float | None:
     """未传/null 表示不用金额模式; 显式传入时必须是有限正金额。"""
     if value is None:
         return None
-    loss = None if isinstance(value, bool) else _price(value)
-    if loss is None or not math.isfinite(loss * AUTO_STOP_RATIO):
-        raise OrderError("自动止损金额要是有限正数")
-    return loss
+    amount = None if isinstance(value, bool) else _price(value)
+    if amount is None:
+        raise OrderError(f"自动{STOP_LABELS[kind]}金额要是有限正数")
+    return amount
 
 
-def automatic_stops(position: dict, loss: float, tick: float) -> dict:
+def automatic_stops(position: dict, loss: float | None, tick: float, profit: float | None = None) -> dict:
     """整份持仓的税费前目标盈亏 -> 触发价格; 到达金额后的第一个合法价位。
 
     均价可能不在价位格上(多次成交的加权均价), 所以对最终价格取整而不是对价差取整。
-    跳动金额较大时不能保证正好 100/150 元, 界面按实际生成的价位显示预估盈亏。
+    跳动金额较大时不能保证正好达到目标金额, 界面按实际生成的价位显示预估盈亏。
     """
     value = abs(position["qty"]) * position["multiplier"]
     direction = 1 if position["qty"] > 0 else -1
-    targets = {"sl": position["avgPrice"] - direction * loss / value,
-               "tp": position["avgPrice"] + direction * loss * AUTO_STOP_RATIO / value}
+    targets = {}
+    if loss is not None:
+        targets["sl"] = position["avgPrice"] - direction * loss / value
+    if profit is not None:
+        targets["tp"] = position["avgPrice"] + direction * profit / value
     result = {}
     for kind, target in targets.items():
         up = (kind == "tp") == (direction > 0)
@@ -342,7 +347,7 @@ def automatic_stops(position: dict, loss: float, tick: float) -> dict:
             steps = nearest
         price = round((math.ceil(steps) if up else math.floor(steps)) * tick, 10)
         if price <= 0:
-            raise OrderError("自动止盈止损价格不大于 0, 请调小止损金额")
+            raise OrderError(f"自动{STOP_LABELS[kind]}价格不大于 0, 请调小金额")
         result[kind] = price
     return result
 
@@ -477,6 +482,11 @@ class PaperBook:
         self.positions = {contract: dict(pos) for contract, pos in (state.get("positions") or {}).items()
                           if pos.get("qty")}
         self.orders = [dict(order) for order in state.get("orders") or []]
+        # 旧账本的金额模式始终联动 1.5 倍止盈; 升级后保留已受理委托和持仓的原设置。
+        if state.get("version", 1) < 2:
+            for record in [*self.positions.values(), *self.orders]:
+                if record.get("autoStopLoss") is not None and "autoTakeProfit" not in record:
+                    record["autoTakeProfit"] = record["autoStopLoss"] * LEGACY_AUTO_STOP_RATIO
         self.trades = [dict(trade) for trade in state.get("trades") or []]
         self.seq = int(state.get("seq", 0))
         self.fees = fees if fees is not None else FeeTable()
@@ -529,11 +539,12 @@ class PaperBook:
                 # 够得着对手价就按对手价成交(可能比限价更好); 否则挂着等价格穿过限价。
                 price = opposite if open_now and crosses and (volume or 0) >= qty else None
         held = (self.positions.get(quote["contract"]) or {}).get("qty", 0)
-        auto_loss = normalize_auto_stop_loss(request.get("autoStopLoss"))
-        if auto_loss is not None:
+        amounts = {field: normalize_auto_amount(request.get(field), kind)
+                   for kind, field in AUTO_STOP_FIELDS.items() if request.get(field) is not None}
+        if amounts:
             if any(request.get(key) is not None for key in STOP_LABELS):
                 raise OrderError("自动止盈止损与手动价格不能同时设置")
-            order["autoStopLoss"] = auto_loss
+            order.update(amounts)
         order.update(order_stops(request, held, quote, order["price"], price is not None))
         self._check_funds(order, order["price"] if price is None else price, quote, now)
         order["id"] = self._next_id("O")
@@ -632,7 +643,8 @@ class PaperBook:
                 position.pop(key, None)
             else:
                 position[key] = value
-        position.pop("autoStopLoss", None)   # 手动改价/取消后, 加减仓不再覆盖用户设置
+        for field in AUTO_STOP_FIELDS.values():
+            position.pop(field, None)   # 手动改价/取消后, 加减仓不再覆盖用户设置
         self.stop_errors.pop(contract, None)
         return position
 
@@ -725,8 +737,8 @@ class PaperBook:
         position = {"qty": new_qty, "avgPrice": new_avg, "multiplier": multiplier,
                     "todayQty": today, "tradingDay": day.isoformat()}
         keep_stops(old, position)
-        if new_qty and qty and (new_qty > 0) == (qty > 0) and old.get("autoStopLoss") is not None:
-            position["autoStopLoss"] = old["autoStopLoss"]
+        if new_qty and qty and (new_qty > 0) == (qty > 0):
+            position.update({field: old[field] for field in AUTO_STOP_FIELDS.values() if old.get(field) is not None})
         return position, realized, fee, opening, closing
 
     def _fill_preview(self, order: dict, price: float, quote: dict, now: datetime):
@@ -736,13 +748,20 @@ class PaperBook:
         position, realized, fee, opening, closing = self._preview(
             order["contract"], signed, price, quote["multiplier"], day)
         if opening:
-            if order.get("autoStopLoss") is not None:
-                position["autoStopLoss"] = order["autoStopLoss"]
+            if any(order.get(field) is not None for field in AUTO_STOP_FIELDS.values()):
+                # 新金额配置替换整套设置, 只启用止损时不能残留旧止盈。
+                for kind, field in AUTO_STOP_FIELDS.items():
+                    position.pop(kind, None)
+                    position.pop(field, None)
+                    if order.get(field) is not None:
+                        position[field] = order[field]
             elif any(order.get(key) is not None for key in STOP_LABELS):
-                position.pop("autoStopLoss", None)
+                for field in AUTO_STOP_FIELDS.values():
+                    position.pop(field, None)
         attach_stops(order, position)
-        if position.get("autoStopLoss") is not None:
-            position.update(automatic_stops(position, position["autoStopLoss"], quote["priceTick"]))
+        if any(position.get(field) is not None for field in AUTO_STOP_FIELDS.values()):
+            position.update(automatic_stops(position, position.get("autoStopLoss"), quote["priceTick"],
+                                            position.get("autoTakeProfit")))
         return position, realized, fee, opening, closing
 
     def _check_funds(self, order: dict, price: float, quote: dict, now: datetime):
@@ -779,7 +798,7 @@ class PaperBook:
                             "time": chart_time(moment), "at": _stamp(moment),
                             "tradingDay": day.isoformat()})
         order.update(status="filled", fillPrice=price, filledAt=_stamp(moment), updatedAt=_stamp(now))
-        if order.get("autoStopLoss") is not None:
+        if any(order.get(field) is not None for field in AUTO_STOP_FIELDS.values()):
             order["autoStopApplied"] = bool(opening)
 
     def _trim(self):
@@ -816,6 +835,7 @@ class PaperBook:
                               "margin": round(margin, 2), "multiplier": position["multiplier"],
                               "tp": position.get("tp"), "sl": position.get("sl"),
                               "autoStopLoss": position.get("autoStopLoss"),
+                              "autoTakeProfit": position.get("autoTakeProfit"),
                               "stopError": self.stop_errors.get(contract)})
         equity = self.cash + float_total
         return {"account": {"initialCash": self.initial_cash, "cash": round(self.cash, 2),
@@ -956,7 +976,7 @@ class PaperService:
             position = book.set_stops(contract, tp, sl, self._quotes.get(contract))
             self._save(book)
             return {"contract": contract, "qty": position["qty"], "tp": position.get("tp"), "sl": position.get("sl"),
-                    "autoStopLoss": position.get("autoStopLoss")}
+                    "autoStopLoss": position.get("autoStopLoss"), "autoTakeProfit": position.get("autoTakeProfit")}
 
     # ---------- 采集线程里执行的部分 ----------
 
@@ -1121,7 +1141,7 @@ class PaperService:
             finished = [order for order in book.orders if order["status"] != "open"][-10:]
             return {**book.summary(),
                     "symbol": value, "contract": contract, "quote": quote,
-                    "autoStopRatio": AUTO_STOP_RATIO,
+                    "autoStopsVersion": AUTO_STOPS_VERSION,
                     "fee": book.fees.spec(contract) if contract else None,
                     "feeSource": book.fees.source,
                     "orders": open_orders + finished[::-1],

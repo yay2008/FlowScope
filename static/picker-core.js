@@ -70,11 +70,14 @@
       symbol: product.contSymbol,
       name: (main && main.name) || product.name || product.contSymbol || "主力",
       openInterest: main ? main.openInterest : product.openInterest,
+      previousVolume: main ? main.previousVolume : product.previousVolume,
+      previousVolumeDate: main ? main.previousVolumeDate : product.previousVolumeDate,
       isMain: true,
     }];
     for (const month of list) {
       if (month.isMain) continue;      // 主力已经在第一项, 不重复列出
       options.push({ symbol: month.symbol, name: month.name, openInterest: month.openInterest,
+                     previousVolume: month.previousVolume, previousVolumeDate: month.previousVolumeDate,
                      isMain: false });
     }
     return options;

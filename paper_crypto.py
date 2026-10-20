@@ -8,6 +8,8 @@
 规则(结果只作参考 —— 看不到排队, 五档盘口 500ms 一次):
 
 - 数量以币计(OKX 也折成币), 必须是数量步长的整数倍、不少于最小下单量; 名义金额不少于最小下单金额。
+- 可按保证金金额(USDT, 不含手续费)下单: 金额乘当前杠杆后换算币数并向下对齐步长;
+  市价按五档盘口换算, 限价/条件按委托价/触发价换算, 挂单后币数固定。
 - 市价单: 按五档盘口逐档吃到够为止, 按成交均价成交(吃单费率); 五档都吃完还不够就拒单。
 - 限价单: 下单时就够得着(买: 卖一不高于限价)且五档里限价以内的量够, 立即按均价成交(吃单费率);
   否则挂单, 之后最新价或对手一档**穿过**限价才按限价成交(挂单费率), 碰到不算。
@@ -30,6 +32,7 @@ import copy
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_FLOOR
 
 from crypto_feed import is_crypto, venue_of
 from ingest import validate_symbol
@@ -104,7 +107,7 @@ def quote_snapshot(symbol: str, instrument, raw: dict, now: float) -> dict:
 
 
 def normalize_request(raw) -> dict:
-    """校验页面提交的委托(数量是小数的币); 不合法抛 OrderError。"""
+    """校验委托: qty 是币数, margin 是不含手续费的 USDT 保证金, 二选一。"""
     if not isinstance(raw, dict):
         raise OrderError("委托格式不对")
     symbol = validate_symbol(str(raw.get("symbol") or ""))
@@ -114,16 +117,19 @@ def normalize_request(raw) -> dict:
     kind = raw.get("type") or "market"
     if kind not in ORDER_TYPES:
         raise OrderError("委托类型只能是市价、限价或条件")
-    qty = raw.get("qty")
-    qty = _num(qty) if isinstance(qty, (int, float)) and not isinstance(qty, bool) else None
-    if qty is None or qty <= 0:
-        raise OrderError("数量要是正数")
+    if raw.get("qty") is not None and raw.get("margin") is not None:
+        raise OrderError("币数和保证金金额只能填一项")
+    size_key = "margin" if "margin" in raw else "qty"
+    size = raw.get(size_key)
+    size = _num(size) if isinstance(size, (int, float)) and not isinstance(size, bool) else None
+    if size is None or size <= 0:
+        raise OrderError("保证金金额要是有限正数" if size_key == "margin" else "数量要是正数")
     price = None
     if kind != "market":
         price = _num(raw.get("price"))
         if price is None or price <= 0:
             raise OrderError(MISSING_PRICE[kind])
-    return {"symbol": symbol, "side": side, "type": kind, "qty": qty, "price": price,
+    return {"symbol": symbol, "side": side, "type": kind, size_key: size, "price": price,
             "tp": normalize_stop(raw.get("tp"), "tp"), "sl": normalize_stop(raw.get("sl"), "sl"),
             "clientId": str(raw.get("clientId") or "")[:64]}
 
@@ -189,24 +195,27 @@ class CryptoBook:
         if quote is None:
             raise OrderError("行情未就绪, 稍后再试")
         side, kind = request["side"], request["type"]
-        qty = self._check_qty(request["qty"], quote)
+        if kind == "market" and not quote["open"]:
+            raise OrderError(quote["reason"])
+        limit = self._check_limit_price(request["price"], quote) if kind != "market" else None
+        qty = (self._qty_for_margin(request["margin"], quote, side, limit) if "margin" in request
+               else request["qty"])
+        qty = self._check_qty(qty, quote)
         order = {"id": "", "clientId": client_id, "symbol": request.get("symbol") or quote["contract"],
                  "contract": quote["contract"], "side": side, "qty": qty, "type": kind,
-                 "price": request.get("price"), "status": "open", "reason": "",
+                 "price": limit, "status": "open", "reason": "",
                  "createdAt": _stamp(now_ms), "fillPrice": None, "filledAt": None}
+        if "margin" in request:
+            order.update(margin=request["margin"], sizingLeverage=self.leverage_of(quote["contract"]))
         book = quote["asks"] if side == "buy" else quote["bids"]
         maker, taker = FEES.get(venue_of(quote["contract"]), FEES["BINANCE"])
         if kind == "market":
-            if not quote["open"]:
-                raise OrderError(quote["reason"])
             price = sweep(book, qty, None, side)
             if price is None:
                 raise OrderError("五档盘口的量不够这笔市价单")
             self._check_notional(qty, price, quote)
             self._check_funds(quote["contract"], side, qty, price, taker, quote)
         else:
-            limit = self._check_limit_price(order["price"], quote)
-            order["price"] = limit
             self._check_notional(qty, limit, quote)
             if kind == "stop":
                 check_trigger(side, limit, quote.get("last"))   # 挂着等触发, 触发后按盘口市价成交(见 match)
@@ -362,6 +371,34 @@ class CryptoBook:
             self._funding_rate.pop(symbol, None)
 
     # ---------- 规则 ----------
+
+    def _qty_for_margin(self, margin: float, quote: dict, side: str, price: float | None) -> float:
+        """按下单时杠杆换算一次; Decimal 防止整步数量因浮点误差少一档或超过金额。"""
+        budget = Decimal(str(margin)) * self.leverage_of(quote["contract"])
+        if budget > MAX_NOTIONAL:
+            raise OrderError(f"名义金额超过 {MAX_NOTIONAL:,.0f} USDT")
+        if price is not None:
+            qty = budget / Decimal(str(price))
+        else:
+            qty = Decimal(0)
+            remaining = budget
+            levels = quote["asks"] if side == "buy" else quote["bids"]
+            for level_price, size in levels:
+                level_price, size = Decimal(str(level_price)), Decimal(str(size))
+                cost = level_price * size
+                if remaining <= cost:
+                    qty += remaining / level_price
+                    remaining = Decimal(0)
+                    break
+                qty += size
+                remaining -= cost
+            if remaining > 0:
+                raise OrderError("五档盘口的量不够这笔保证金金额的市价单")
+        step = Decimal(str(quote["qtyStep"]))
+        qty = (qty / step).to_integral_value(rounding=ROUND_FLOOR) * step
+        if qty <= 0 or qty < Decimal(str(quote["minQty"])):
+            raise OrderError(f"保证金金额过小, 换算数量不能少于 {quote['minQty']:g} {quote.get('unit', '')}")
+        return float(qty)
 
     @staticmethod
     def _check_qty(qty: float, quote: dict) -> float:

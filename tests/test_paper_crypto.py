@@ -13,7 +13,7 @@ from fastapi import HTTPException
 import app as server
 from binance_feed import BinanceAdapter
 from paper import OrderError, PaperStore
-from paper_crypto import CryptoBook, CryptoPaperService, quote_snapshot, sweep
+from paper_crypto import CryptoBook, CryptoPaperService, normalize_request, quote_snapshot, sweep
 
 BTC = BinanceAdapter().builtin_instruments()[0]
 NOW = 1_791_000_000_000
@@ -266,6 +266,100 @@ class BookTests(unittest.TestCase):
         self.assertTrue(first["id"].startswith("C"))
 
 
+class MarginOrderTests(unittest.TestCase):
+    def request(self, margin, side="buy", kind="market", price=None, **extra):
+        return {"symbol": BTC.symbol, "side": side, "margin": margin, "type": kind, "price": price, **extra}
+
+    def test_normalization_accepts_either_coins_or_margin_and_rejects_invalid_amounts(self):
+        self.assertEqual(normalize_request(self.request(20))["margin"], 20)
+        self.assertNotIn("qty", normalize_request(self.request(20)))
+        self.assertEqual(normalize_request(order("buy", 1))["qty"], 1)
+        with self.assertRaisesRegex(OrderError, "只能填一项"):
+            normalize_request(self.request(20, qty=1))
+        for value in (0, -1, True, "20", None, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(OrderError, "保证金金额"):
+                normalize_request(self.request(value))
+
+    def test_market_amount_walks_both_sides_of_depth_and_rounds_down(self):
+        for side, expected_qty in (("buy", 1.997), ("sell", 2.001)):
+            with self.subTest(side=side):
+                book = CryptoBook()
+                quote = make_quote()
+                filled = book.place(self.request(20, side), quote, NOW)
+                self.assertEqual(filled["qty"], expected_qty)
+                self.assertLessEqual(filled["qty"] * filled["fillPrice"], 200)
+                levels = quote["asks"] if side == "buy" else quote["bids"]
+                next_qty = expected_qty + quote["qtyStep"]
+                self.assertGreater(next_qty * sweep(levels, next_qty, None, side), 200)
+                self.assertAlmostEqual(book.fees_paid, expected_qty * filled["fillPrice"] * 0.0005)
+                self.assertEqual((filled["margin"], filled["sizingLeverage"]), (20, 10))
+
+    def test_exact_step_is_not_lost_to_float_rounding(self):
+        filled = CryptoBook().place(self.request(20.03), make_quote(), NOW)
+        self.assertEqual(filled["qty"], 2)
+        self.assertAlmostEqual(filled["fillPrice"], 100.15)
+        coarse = replace(BTC, step_size=0.1, min_qty=0.1, min_notional=0)
+        quote = make_quote(instrument=coarse, bids=((2.9, 10),), asks=((3.0, 10),), last=3, mark=3)
+        self.assertEqual(CryptoBook().place(self.request(0.09), quote, NOW)["qty"], 0.3)
+
+    def test_current_contract_leverage_controls_sizing(self):
+        book = CryptoBook()
+        book.set_leverage(BTC.symbol, 20, 125)
+        filled = book.place(self.request(10.015), make_quote(), NOW)
+        self.assertEqual((filled["qty"], filled["sizingLeverage"]), (2, 20))
+
+    def test_margin_still_requires_fresh_and_sufficient_depth(self):
+        for quote, margin, message in ((make_quote(fresh=False), 20, "盘口"),
+                                       (make_quote(), 40, "五档"),
+                                       (make_quote(asks=()), 20, "五档")):
+            with self.subTest(margin=margin, quote=quote), self.assertRaisesRegex(OrderError, message):
+                book = CryptoBook()
+                book.place(self.request(margin), quote, NOW)
+            self.assertEqual((book.orders, book.positions, book.cash), ([], {}, 10000))
+
+    def test_minimum_quantity_notional_and_maximum_notional_are_enforced(self):
+        quote = make_quote(instrument=replace(BTC, min_notional=5))
+        for margin, message in ((0.001, "保证金金额过小"), (0.1, "最小下单金额"), (1e308, "名义金额超过")):
+            with self.subTest(margin=margin), self.assertRaisesRegex(OrderError, message):
+                CryptoBook().place(self.request(margin), quote, NOW)
+
+    def test_fees_need_additional_available_funds(self):
+        quote = make_quote(mark=100.15)
+        with self.assertRaisesRegex(OrderError, "资金不足"):
+            CryptoBook({"cash": 20.03}).place(self.request(20.03), quote, NOW)
+        book = CryptoBook({"cash": 20.2})
+        book.place(self.request(20.03), quote, NOW)
+        self.assertAlmostEqual(book.summary()["account"]["margin"], 20.03)
+        self.assertAlmostEqual(book.fees_paid, 0.10015)
+
+    def test_limit_and_stop_quantities_stay_fixed_after_price_and_leverage_changes(self):
+        for kind, original, amended in (("limit", 99, 98), ("stop", 105, 106)):
+            with self.subTest(kind=kind):
+                book = CryptoBook()
+                resting = book.place(self.request(original / 10, kind=kind, price=original, tp=120, sl=90),
+                                     make_quote(), NOW)
+                self.assertEqual((resting["status"], resting["qty"]), ("open", 1))
+                book.set_leverage(BTC.symbol, 20, 125)
+                book.amend(resting["id"], amended, make_quote(), NOW)
+                trigger = 97 if kind == "limit" else 107
+                quote = make_quote(bids=((trigger, 3),), asks=((trigger + .1, 3),), last=trigger, mark=trigger)
+                book.match({BTC.symbol: quote}, NOW + 1000)
+                self.assertEqual((resting["status"], resting["qty"]), ("filled", 1))
+                self.assertEqual((book.positions[BTC.symbol]["tp"], book.positions[BTC.symbol]["sl"]), (120, 90))
+
+    def test_immediately_marketable_limit_uses_the_order_price_for_sizing(self):
+        filled = CryptoBook().place(self.request(20.1, kind="limit", price=100.5), make_quote(), NOW)
+        self.assertEqual((filled["status"], filled["qty"], filled["fillPrice"]), ("filled", 2, 100.15))
+
+    def test_duplicate_client_id_does_not_reconvert_at_new_prices(self):
+        book = CryptoBook()
+        request = self.request(20.03, clientId="margin-once")
+        first = book.place(request, make_quote(), NOW)
+        book.set_leverage(BTC.symbol, 20, 125)
+        self.assertIs(book.place(request, make_quote(fresh=False), NOW + 1000), first)
+        self.assertEqual((len(book.trades), first["qty"]), (1, 2))
+
+
 class FakeCrypto:
     """假的加密行情: 只认 BTC 永续, 报价从 raw 里给; 记录 touch。"""
 
@@ -303,6 +397,17 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual((state["mode"], state["leverage"], state["error"]), ("crypto", 10, None))
         self.assertEqual(state["quote"]["ask"], 100.1)
         self.assertIn((BTC.symbol, ("book", "mark", "ticker")), self.crypto.touched)
+
+    def test_margin_orders_use_aggregate_leverage_and_persist_resolved_quantity(self):
+        self.service.set_leverage("AGG.BTC", 20)
+        placed = self.service.place({"symbol": "AGG.BTC", "side": "buy", "margin": 10.01})
+        self.assertEqual((placed["contract"], placed["qty"], placed["margin"], placed["sizingLeverage"]),
+                         (BTC.symbol, 2, 10.01, 20))
+        reloaded = CryptoPaperService(lambda: self.crypto, PaperStore(lambda: self.path), clock=lambda: NOW)
+        self.assertEqual(reloaded.state(BTC.symbol)["orders"][0], placed)
+        flattened = reloaded.flatten("AGG.BTC")
+        self.assertEqual((flattened["qty"], flattened["status"]), (2, "filled"))
+        self.assertEqual(reloaded.state(BTC.symbol)["positions"], [])
 
     def test_aggregate_uses_binance_book_and_shares_positions_trades_and_leverage(self):
         self.crypto.raw["book"]["asks"] = [[100.1, 1.0], [100.2, 4.0]]
@@ -480,6 +585,14 @@ class RoutingTests(unittest.TestCase):
             asyncio.run(server.paper_flatten(BTC.symbol))                        # 没有持仓
         asyncio.run(server.paper_order(order("buy", 1.0)))
         self.assertEqual(server.paper_stops({"symbol": BTC.symbol, "tp": None, "sl": 90})["sl"], 90.0)
+
+    def test_margin_api_routes_to_crypto_and_invalid_requests_return_400(self):
+        placed = asyncio.run(server.paper_order({"symbol": BTC.symbol, "side": "buy", "margin": 10.01}))
+        self.assertEqual((placed["qty"], placed["status"]), (1, "filled"))
+        for fields in ({"margin": -10}, {"margin": 10, "qty": 1}):
+            with self.subTest(fields=fields), self.assertRaises(HTTPException) as caught:
+                asyncio.run(server.paper_order({"symbol": BTC.symbol, "side": "buy", **fields}))
+            self.assertEqual(caught.exception.status_code, 400)
 
     def test_aggregate_requests_keep_the_chart_symbol_and_trade_the_binance_contract(self):
         symbol = "AGG.BTC"

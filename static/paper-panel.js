@@ -7,7 +7,7 @@
  * 止盈止损挂在持仓上(每个合约一对价格, 按最新价触发后市价全平, 由服务端每轮检查), 在「持仓」下方设置;
  * 下单表单里也能填, 跟着委托走, 成交后由服务端挂到持仓上。K 线上还能划线设置(拖动在 chart-view.js,
  * 这里出拖动时线的价位、标题与预估盈亏, 松手后由 setStops 提交)。挂单线也能拖(改价, amendOrder)、双击撤单
- * (cancelOrder); 右键 K 线按点到的价位挂限价单或条件单(menuItems, 手数与止盈止损用下单表单里的)。
+ * (cancelOrder); 点击十字线加号按选中的价位挂限价单或条件单(menuItems, 手数与止盈止损用下单表单里的)。
  * 这几个图上操作的结果回 {ok, text}, 图上就地提示 —— 面板折叠着也看得到。
  * 面板轮询 GET /api/paper(展开时 1 秒一次, 折叠时 5 秒一次, 页面在后台时停止),
  * 每次拿到新数据回调 onState, 由 app.js 重画成交标记与价格线。
@@ -29,7 +29,8 @@
   const POLL_COLLAPSED_MS = 5000;
   const COLLAPSED_KEY = "flowscope.tradeCollapsed";
   const AUTO_STOPS_KEY = "flowscope.futuresAutoStops";
-  const AUTO_STOP_RATIO = 1.5;
+  const CRYPTO_SIZING_KEY = "flowscope.cryptoSizing";
+  const AUTO_STOPS_VERSION = 2;
   const STATUS_LABELS = { open: "挂单中", filled: "已成交", cancelled: "已撤", rejected: "已拒" };
   const LEVERAGES = [1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125];
   const STOP_NAMES = { tp: "止盈", sl: "止损" };
@@ -128,7 +129,7 @@
     return crosses ? "会立即成交" : "";
   }
 
-  // 右键 K 线点到 price 时能挂的单: 最新价下方是买入限价和卖出条件, 上方是卖出限价和买入条件,
+  // 十字线加号选中 price 时能挂的单: 最新价下方是买入限价和卖出条件, 上方是卖出限价和买入条件,
   // 正好在最新价上(或还没有最新价)只给两个限价。
   function menuChoices(last, price) {
     if (last != null && price < last) return [{ side: "buy", type: "limit" }, { side: "sell", type: "stop" }];
@@ -190,9 +191,10 @@
 
   // 委托带的止盈止损(成交后挂到持仓上), 没带回空串
   function stopsText(order, decimals) {
-    if (order.autoStopLoss != null) {
+    if (order.autoStopLoss != null || order.autoTakeProfit != null) {
       if (order.status === "filled" && order.autoStopApplied === false) return "";
-      return `自动止损 ${formatMoney(order.autoStopLoss, 2)} 元 · 止盈 ${formatMoney(order.autoStopLoss * AUTO_STOP_RATIO, 2)} 元`;
+      return [["自动止损", order.autoStopLoss], ["自动止盈", order.autoTakeProfit]]
+        .filter(([, value]) => value != null).map(([label, value]) => `${label} ${formatMoney(value, 2)} 元`).join(" · ");
     }
     const parts = [];
     if (order.tp != null) parts.push(`止盈 ${FlowDataRef.formatPrice(order.tp, decimals)}`);
@@ -220,16 +222,22 @@
       trades: byId("trade-trades"), note: byId("trade-note"), reset: byId("trade-reset"),
       ordersCount: byId("trade-orders-count"),
       qtyLabel: byId("trade-qty-label"), leverageRow: byId("trade-leverage-row"), leverage: byId("trade-leverage"),
+      qtyRow: byId("trade-qty-row"), sizingRow: byId("trade-sizing-row"), sizing: byId("trade-sizing"),
+      marginRow: byId("trade-margin-row"), margin: byId("trade-margin"), sizingNote: byId("trade-sizing-note"),
       stops: byId("trade-stops"), tp: byId("trade-tp"), sl: byId("trade-sl"), stopsSet: byId("trade-stops-set"),
       stopsNote: byId("trade-stops-note"), orderTp: byId("trade-order-tp"), orderSl: byId("trade-order-sl"),
       orderStops: byId("trade-order-stops"), autoStops: byId("trade-auto-stops"),
-      autoEnabled: byId("trade-auto-enabled"), autoFields: byId("trade-auto-fields"),
+      autoLossEnabled: byId("trade-auto-loss-enabled"), autoProfitEnabled: byId("trade-auto-profit-enabled"),
       autoLoss: byId("trade-auto-loss"), autoProfit: byId("trade-auto-profit"), autoNote: byId("trade-auto-note"),
+      notice: byId("trade-notice"), noticeText: byId("trade-notice-text"), noticeClose: byId("trade-notice-close"),
     };
     let state = null;
     let timer = null;
     let polling = false;
+    let refreshAgain = false;
     let submitting = false;
+    let noticeTimer = null;
+    const closeEvents = new Map();   // 两类账户分别去重; 初次加载只记基线, 不把历史平仓当作新通知。
     let pollError = false;   // 当前提示来自轮询失败: 下一次轮询成功就清掉, 下单结果的提示则保留
     let formMode = "";       // 下单表单当前按哪种账户布置(换了才重设数量默认值与杠杆选项)
     let stopsKey = null;     // 止盈止损输入框上次按哪份服务端数据回填(变了才回填, 不冲掉正在敲的数字)
@@ -239,6 +247,7 @@
     const decimals = () => (state && state.quote ? state.quote.priceDecs : 0);
     const price = (value) => FlowDataRef.formatPrice(value, decimals());
     const isCrypto = () => !!state && state.mode === "crypto";
+    const byMargin = () => isCrypto() && els.sizing && els.sizing.value === "margin";
     // 金额: 期货按元取整, 加密按 USDT 两位小数; 数量: 期货是手, 加密是币(按数量步长的位数)
     const money = (value) => formatMoney(value, isCrypto() ? 2 : 0);
     const signed = (value) => formatSigned(value, isCrypto() ? 2 : 0);
@@ -248,36 +257,70 @@
     const currentPosition = () => currentPositionOf(state);
     const readPrice = (input) => (input.value === "" ? null : Number(input.value));   // 空 = 不设
 
+    function loadSizing() {
+      let saved;
+      try { saved = JSON.parse(root.localStorage.getItem(CRYPTO_SIZING_KEY)); } catch (error) { /* 用默认值 */ }
+      els.sizing.value = saved && saved.mode === "qty" ? "qty" : "margin";
+      const margin = saved && saved.margin;
+      els.margin.value = Number.isFinite(margin) && margin > 0 ? String(margin) : "100";
+    }
+
+    function saveSizing() {
+      const margin = Number(els.margin.value);
+      try {
+        root.localStorage.setItem(CRYPTO_SIZING_KEY, JSON.stringify({ mode: els.sizing.value,
+          margin: Number.isFinite(margin) && margin > 0 ? margin : null }));
+      } catch (error) { /* 存储不可用不影响下单 */ }
+    }
+
+    function renderSizingNote() {
+      if (!els.sizingNote) return;
+      els.sizingNote.hidden = !byMargin();
+      if (!byMargin()) return;
+      const margin = Number(els.margin.value);
+      const notional = margin * state.leverage;
+      const market = orderType() === "market";
+      els.sizingNote.textContent = margin > 0 && Number.isFinite(notional)
+        ? `仓位约 ${formatMoney(notional, 2)} USDT · ${state.leverage}x\n手续费另计 · ${market ? "币数向下取整" : "挂单后币数固定"}`
+        : "请输入有效保证金金额";
+      els.sizingNote.title = "币数按数量步长向下取整。市价按提交时五档盘口换算；限价/条件按委托价/触发价换算，" +
+        "挂单后改价或改杠杆不重新换算，实际保证金可能变化。账户保证金按标记价格估值；反向下单先减仓。";
+    }
+
     function loadAutoStops() {
-      if (!els.autoEnabled) return;
+      if (!els.autoLossEnabled) return;
       let saved;
       try { saved = JSON.parse(root.localStorage.getItem(AUTO_STOPS_KEY)); } catch (error) { /* 用默认值 */ }
-      els.autoEnabled.checked = !saved || saved.enabled !== false;
+      els.autoLossEnabled.checked = !saved || (saved.version === 2 ? saved.lossEnabled !== false : saved.enabled !== false);
+      els.autoProfitEnabled.checked = !!saved && saved.version === 2 && saved.profitEnabled === true;
       const loss = saved && saved.loss;
-      els.autoLoss.value = Number.isFinite(loss * AUTO_STOP_RATIO) && loss > 0 ? String(loss) : "100";
+      const profit = saved && saved.profit;
+      els.autoLoss.value = Number.isFinite(loss) && loss > 0 ? String(loss) : "100";
+      els.autoProfit.value = Number.isFinite(profit) && profit > 0 ? String(profit) : "150";
     }
 
     function renderAutoStops() {
-      if (!els.autoEnabled) return;
-      const enabled = !isCrypto() && els.autoEnabled.checked;
+      if (!els.autoLossEnabled) return;
+      const enabled = !isCrypto() && (els.autoLossEnabled.checked || els.autoProfitEnabled.checked);
       els.autoStops.hidden = isCrypto();
-      els.autoFields.hidden = !enabled;
       els.autoNote.hidden = !enabled;
       els.orderStops.hidden = enabled;
-      const unavailable = enabled && state && state.autoStopRatio !== AUTO_STOP_RATIO;
+      els.autoLoss.disabled = !els.autoLossEnabled.checked;
+      els.autoProfit.disabled = !els.autoProfitEnabled.checked;
+      const unavailable = enabled && state && state.autoStopsVersion !== AUTO_STOPS_VERSION;
       els.autoNote.textContent = unavailable ? "请先重启服务，再使用自动止盈止损" : "整份持仓 · 不含手续费 · 价位取整";
       els.autoNote.classList.toggle("error", !!unavailable);
-      const loss = Number(els.autoLoss.value);
-      els.autoProfit.textContent = loss > 0 && Number.isFinite(loss * AUTO_STOP_RATIO)
-        ? `止盈 ${formatMoney(loss * AUTO_STOP_RATIO, 2)} 元 · 1:1.5` : "请输入有效止损金额";
     }
 
     function changeAutoStops() {
       renderAutoStops();
       const loss = Number(els.autoLoss.value);
-      if (!(loss > 0) || !Number.isFinite(loss * AUTO_STOP_RATIO)) return;
+      const profit = Number(els.autoProfit.value);
       try {
-        root.localStorage.setItem(AUTO_STOPS_KEY, JSON.stringify({ enabled: els.autoEnabled.checked, loss }));
+        root.localStorage.setItem(AUTO_STOPS_KEY, JSON.stringify({ version: 2,
+          lossEnabled: els.autoLossEnabled.checked, profitEnabled: els.autoProfitEnabled.checked,
+          loss: Number.isFinite(loss) && loss > 0 ? loss : null,
+          profit: Number.isFinite(profit) && profit > 0 ? profit : null }));
       } catch (error) { /* 存储不可用不影响下单 */ }
     }
 
@@ -302,6 +345,35 @@
       els.msg.className = "trade-msg" + (kind ? " " + kind : "");
     }
 
+    function notifyAutomaticCloses() {
+      const account = isCrypto() ? "crypto" : "futures";
+      const orders = (state.orders || []).filter((order) => order.status === "filled");
+      let events = closeEvents.get(account);
+      if (!events) {
+        events = { seen: new Set(orders.map((order) => order.id)), pending: [] };
+        closeEvents.set(account, events);
+        return;
+      }
+      for (const order of orders.slice().reverse()) {
+        if (events.seen.has(order.id) || !TRIGGER_REASONS.has(order.reason)) continue;
+        const trade = (state.trades || []).find((item) => item.orderId === order.id);
+        const pnl = trade && Number.isFinite(trade.pnl)
+          ? ` · 平仓盈亏 ${formatSigned(trade.pnl, 2)} ${isCrypto() ? "USDT" : "元"}（未扣手续费）` : "";
+        events.pending.push(`${order.reason}已自动平仓：${order.contract} ` +
+          `${order.side === "buy" ? "买入" : "卖出"} ${order.qty}${isCrypto() ? "" : " 手"} @${order.fillPrice}${pnl}`);
+      }
+      events.seen = new Set(orders.map((order) => order.id));
+      if (!events.pending.length || submitting || state.error) return;
+      const text = events.pending.splice(0).join("\n");
+      showMessage(text, "ok");
+      if (els.notice) {
+        clearTimeout(noticeTimer);
+        els.noticeText.textContent = text;
+        els.notice.hidden = false;
+        noticeTimer = setTimeout(() => { els.notice.hidden = true; }, 10000);
+      }
+    }
+
     function schedule(delay) {
       clearTimeout(timer);
       timer = null;
@@ -311,7 +383,7 @@
 
     async function poll() {
       timer = null;
-      if (polling) return;
+      if (polling) { refreshAgain = true; return; }
       polling = true;
       try {
         state = await fetchJson(`/api/paper?symbol=${encodeURIComponent(options.getSymbol())}`);
@@ -319,12 +391,14 @@
         if (state.error && !submitting) { showMessage(state.error, "error"); pollError = true; }
         render();
         onState(state);
+        notifyAutomaticCloses();
       } catch (error) {
         showMessage("模拟账户加载失败：" + error.message, "error");
         pollError = true;
       } finally {
         polling = false;
-        schedule();
+        schedule(refreshAgain ? 0 : undefined);
+        refreshAgain = false;
       }
     }
 
@@ -363,11 +437,14 @@
       renderForm();
     }
 
-    // 下单表单跟着账户类型换: 期货是整数手; 加密是币(步长、最小量来自合约), 外加杠杆选择
+    // 期货是整数手; 加密可按币数或 USDT 保证金下单, 保证金在服务端按当前杠杆换算。
     function renderForm() {
       const quote = state.quote;
       const mode = isCrypto() ? `crypto:${state.symbol}` : "futures";
       els.panel.classList.toggle("crypto", isCrypto());
+      if (els.sizingRow) els.sizingRow.hidden = !isCrypto();
+      if (els.qtyRow) els.qtyRow.hidden = !!byMargin();
+      if (els.marginRow) els.marginRow.hidden = !byMargin();
       // 无法解析交易合约时没有报价: 不显示单位与杠杆
       if (els.qtyLabel) els.qtyLabel.textContent = isCrypto() ? (unit() ? `数量(${unit()})` : "数量") : "手数";
       if (els.leverageRow) els.leverageRow.hidden = !(isCrypto() && quote);
@@ -399,6 +476,7 @@
         els.leverage.value = String(state.leverage);
       }
       renderAutoStops();
+      renderSizingNote();
     }
 
     function renderButtons() {
@@ -414,6 +492,7 @@
       const blocked = submitting || !quote || (market && !quote.open);
       els.buy.disabled = blocked;
       els.sell.disabled = blocked;
+      if (els.leverage) els.leverage.disabled = submitting;
       const position = currentPosition();
       els.flatten.disabled = submitting || !position || !(quote && quote.open);
       els.flatten.textContent = position ? `平仓 ${position.qty > 0 ? "多" : "空"}${Math.abs(position.qty)}` : "平仓";
@@ -455,8 +534,8 @@
         ["保证金", money(position.margin)],
         ["止盈 / 止损", `${position.tp != null ? price(position.tp) : "—"} / ${position.sl != null ? price(position.sl) : "—"}`],
       ] : [["当前合约", "无持仓"]];
-      if (position && position.autoStopLoss != null) {
-        rows.push(["目标止损 / 止盈(元)", `${money(position.autoStopLoss)} / ${money(position.autoStopLoss * AUTO_STOP_RATIO)}`]);
+      if (position && (position.autoStopLoss != null || position.autoTakeProfit != null)) {
+        rows.push(["目标止损 / 止盈(元)", `${money(position.autoStopLoss)} / ${money(position.autoTakeProfit)}`]);
         const pnl = (value) => value == null ? "—" : signed((value - position.avgPrice) * position.qty * position.multiplier);
         rows.push(["价位预估盈亏(元)", `${pnl(position.sl)} / ${pnl(position.tp)}`]);
       }
@@ -607,7 +686,8 @@
       } finally {
         submitting = false;
         if (state) renderButtons();
-        schedule(0);
+        if (polling) refreshAgain = true;
+        else schedule(0);
       }
     }
 
@@ -626,30 +706,37 @@
       return `${STATUS_LABELS[order.status] || order.status}: ${order.reason || ""}`;
     }
 
-    // 表单没填对: 面板上提示, 也回 {ok: false, text} 给图上的右键下单
+    // 表单没填对: 面板上提示, 也回 {ok: false, text} 给图上的加号挂单
     function refuse(text) {
       showMessage(text, "error");
       return { ok: false, text };
     }
 
-    // 按表单下单; 右键 K 线下单时 override 给出类型和价格({type, price}), 手数与止盈止损仍取表单里的
+    // 按表单下单; 十字线加号挂单时 override 给出类型和价格({type, price}), 手数与止盈止损仍取表单里的
     async function submit(side, override) {
       if (submitting) return null;
-      const qty = Number(els.qty.value);
-      if (isCrypto() ? !(qty > 0) : !Number.isInteger(qty) || qty < 1) {
-        return refuse(isCrypto() ? "数量要是正数" : "手数要是正整数");
+      const size = Number(byMargin() ? els.margin.value : els.qty.value);
+      if (!Number.isFinite(size) || (isCrypto() ? !(size > 0) : !Number.isInteger(size) || size < 1)) {
+        return refuse(byMargin() ? "保证金金额要是有限正数" : isCrypto() ? "数量要是正数" : "手数要是正整数");
       }
-      const body = { symbol: options.getSymbol(), side, qty, type: override ? override.type : orderType(),
+      const body = { symbol: options.getSymbol(), side, [byMargin() ? "margin" : "qty"]: size,
+                     type: override ? override.type : orderType(),
                      clientId: newClientId() };
       if (body.type !== "market") {
         body.price = override ? override.price : Number(els.price.value);
         if (!(body.price > 0)) return refuse(body.type === "stop" ? "条件单要填触发价" : "限价单要填价格");
       }
-      if (!isCrypto() && els.autoEnabled && els.autoEnabled.checked) {
-        if (!state || state.autoStopRatio !== AUTO_STOP_RATIO) return refuse("请先重启服务，再使用自动止盈止损");
-        const loss = Number(els.autoLoss.value);
-        if (!(loss > 0) || !Number.isFinite(loss * AUTO_STOP_RATIO)) return refuse("自动止损金额要是有限正数");
-        body.autoStopLoss = loss;
+      if (!isCrypto() && els.autoLossEnabled && (els.autoLossEnabled.checked || els.autoProfitEnabled.checked)) {
+        if (!state || state.autoStopsVersion !== AUTO_STOPS_VERSION) return refuse("请先重启服务，再使用自动止盈止损");
+        for (const [enabled, input, field, label] of [
+          [els.autoLossEnabled, els.autoLoss, "autoStopLoss", "止损"],
+          [els.autoProfitEnabled, els.autoProfit, "autoTakeProfit", "止盈"],
+        ]) {
+          if (!enabled.checked) continue;
+          const value = Number(input.value);
+          if (!(value > 0) || !Number.isFinite(value)) return refuse(`自动${label}金额要是有限正数`);
+          body[field] = value;
+        }
       } else {
         const tp = readPrice(els.orderTp);
         const sl = readPrice(els.orderSl);
@@ -689,6 +776,7 @@
                       position.tp = result.tp;
                       position.sl = result.sl;
                       position.autoStopLoss = result.autoStopLoss;
+                      position.autoTakeProfit = result.autoTakeProfit;
                       render();
                       onState(state);
                     }
@@ -737,14 +825,15 @@
       });
     }
 
-    // 右键 K 线的菜单项: 按点到的价位(对齐最小变动价位)挂限价单或条件单; 没有可交易的合约时没有菜单
+    // 十字线加号的菜单项: 按选中的价位(对齐最小变动价位)挂限价单或条件单; 没有可交易的合约时没有菜单
     function menuItems(rawPrice) {
       const quote = state && state.contract && state.quote;
       if (!quote || !Number.isFinite(rawPrice)) return [];
       const at = snapPrice(rawPrice, quote.priceTick, quote.priceDecs);
       return menuChoices(quote.last, at).map(({ side, type }) => ({
         side,
-        label: `${side === "buy" ? "买入" : "卖出"}${type === "stop" ? "条件" : "限价"} ${els.qty.value} ${unit()} @ ${price(at)}`,
+        label: `${side === "buy" ? "买入" : "卖出"}${type === "stop" ? "条件" : "限价"} ` +
+          `${byMargin() ? `保证金 ${els.margin.value} USDT` : `${els.qty.value} ${unit()}`} @ ${price(at)}`,
         run: () => submit(side, { type, price: at }),
       }));
     }
@@ -770,10 +859,19 @@
            { method: "POST" }, () => `账户已重置, 初始资金 ${formatMoney(cash)}${crypto ? " USDT" : ""}`);
     }
 
-    function changeLeverage() {
+    async function changeLeverage() {
+      if (submitting) return;
       const value = Number(els.leverage.value);
-      send(`/api/paper/leverage?symbol=${encodeURIComponent(options.getSymbol())}&leverage=${value}`,
-           { method: "POST" }, () => `杠杆已改为 ${value}x`);
+      const symbol = options.getSymbol();
+      await send(`/api/paper/leverage?symbol=${encodeURIComponent(symbol)}&leverage=${value}`,
+           { method: "POST" }, () => {
+             if (state && state.symbol === symbol) state.leverage = value;
+             return `杠杆已改为 ${value}x`;
+           });
+      if (state) {
+        els.leverage.value = String(state.leverage);
+        renderSizingNote();
+      }
     }
 
     els.buy.addEventListener("click", () => submit("buy"));
@@ -788,18 +886,36 @@
     }
     els.reset.addEventListener("click", reset);
     if (els.leverage) els.leverage.addEventListener("change", changeLeverage);
-    if (els.autoEnabled) {
+    if (els.sizing && els.margin) {
+      loadSizing();
+      els.sizing.addEventListener("change", () => {
+        saveSizing();
+        if (state) renderForm();
+      });
+      els.margin.addEventListener("input", () => {
+        saveSizing();
+        renderSizingNote();
+      });
+    }
+    if (els.autoLossEnabled) {
       loadAutoStops();
       renderAutoStops();
-      els.autoEnabled.addEventListener("change", changeAutoStops);
+      els.autoLossEnabled.addEventListener("change", changeAutoStops);
+      els.autoProfitEnabled.addEventListener("change", changeAutoStops);
       els.autoLoss.addEventListener("input", changeAutoStops);
+      els.autoProfit.addEventListener("input", changeAutoStops);
     }
+    if (els.noticeClose) els.noticeClose.addEventListener("click", () => {
+      clearTimeout(noticeTimer);
+      els.notice.hidden = true;
+    });
     els.type.addEventListener("change", () => {
       // 切到限价、条件时用最新价预填, 省得从空白开始敲
       if (orderType() !== "market" && !els.price.value && state && state.quote && state.quote.last != null) {
         els.price.value = String(state.quote.last);
       }
       renderButtons();
+      renderSizingNote();
     });
     els.toggle.addEventListener("click", () => {
       setCollapsed(!collapsed());

@@ -181,6 +181,8 @@ async def symbols(exchange: str | None = None, product: str | None = None, refre
 
     - 不带参数: 按交易所分组的全部主连品种, 组内按主力合约持仓量降序, 附当前主力合约代码。
     - 带 exchange + product: 额外返回该品种未下市月份合约(持仓量降序, 标出主力)。
+    - 品种与月份附 previousVolume / previousVolumeDate: 上一交易日的日线成交量(手),
+      异步到达, 缺失为 null; 原 openInterest 与排序保持不变。
     - 查询在采集线程里发给 TqSdk 合约服务并缓存; 行情源不可用时回退到内置常用品种表
       (`source="fallback"`), 月份列表为空, 页面仍能选到常用主力。
     - 期货分组之后接加密分组(多所汇总 + 各交易所永续, 按 24 小时成交额降序, 见
@@ -336,8 +338,10 @@ async def paper_order(order: dict = Body(...)):
     市价单当场成交或返回 400(对手盘不够、不在交易时段等); 限价单够得着就成交, 否则挂单;
     条件单(stop, price 是触发价)挂着等最新价碰到触发价, 触发后按市价成交。
     同一个 clientId 只下一次, 页面双击或超时重发不会重复成交。tp/sl 是成交后挂到持仓上的止盈/止损价。
-    期货可传 autoStopLoss(元), 开仓后按整份持仓换算止损和 1.5 倍止盈, 不可与 tp/sl 同传。
-    加密合约的数量是小数的币, 按五档盘口撮合(见 paper_crypto.py)。
+    期货可分别传 autoStopLoss / autoTakeProfit(元), 开仓后按整份持仓换算对应价位, 不可与 tp/sl 同传。
+    加密合约可传 qty(币数)或 margin(USDT 保证金, 不含手续费), 二选一。
+    margin 按服务端当前杠杆换算币数并向下对齐步长: 市价按五档盘口, 限价/条件按委托价/触发价;
+    挂单后币数固定, 撮合规则见 paper_crypto.py。
     """
     try:
         if crypto_feed.is_crypto(str(order.get("symbol") or "") if isinstance(order, dict) else ""):

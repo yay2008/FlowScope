@@ -110,7 +110,7 @@ test("拖挂单改价: 会当场成交的限价、没在突破一侧的触发价
   assert.equal(dragLine(state, "order:O9", 3000), null);
 });
 
-test("右键挂单: 最新价下方买限价/卖条件, 上方卖限价/买条件, 正好在最新价上给两个限价", () => {
+test("图表挂单菜单: 最新价下方买限价/卖条件, 上方卖限价/买条件, 正好在最新价上给两个限价", () => {
   assert.deepEqual(menuChoices(3000, 2990), [{ side: "buy", type: "limit" }, { side: "sell", type: "stop" }]);
   assert.deepEqual(menuChoices(3000, 3010), [{ side: "sell", type: "limit" }, { side: "buy", type: "stop" }]);
   assert.deepEqual(menuChoices(3000, 3000), [{ side: "buy", type: "limit" }, { side: "sell", type: "limit" }]);
@@ -158,7 +158,9 @@ test("委托带的止盈止损: 只列填了的, 都没填是空串", () => {
   assert.equal(stopsText({ tp: 3100, sl: 2950 }, 0), "止盈 3100 · 止损 2950");
   assert.equal(stopsText({ tp: null, sl: 84000.5 }, 1), "止损 84000.5");
   assert.equal(stopsText({}, 0), "");
-  assert.equal(stopsText({ autoStopLoss: 100, status: "open" }, 0), "自动止损 100.00 元 · 止盈 150.00 元");
-  assert.equal(stopsText({ autoStopLoss: 200, status: "filled", autoStopApplied: true }, 0), "自动止损 200.00 元 · 止盈 300.00 元");
+  assert.equal(stopsText({ autoStopLoss: 100, status: "open" }, 0), "自动止损 100.00 元");
+  assert.equal(stopsText({ autoTakeProfit: 270, status: "open" }, 0), "自动止盈 270.00 元");
+  assert.equal(stopsText({ autoStopLoss: 200, autoTakeProfit: 270, status: "filled", autoStopApplied: true }, 0),
+    "自动止损 200.00 元 · 自动止盈 270.00 元");
   assert.equal(stopsText({ autoStopLoss: 100, status: "filled", autoStopApplied: false }, 0), "");
 });

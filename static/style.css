@@ -123,6 +123,9 @@ body { display: flex; flex-direction: column; }
 }
 .picker-row:hover, .picker-row.active { background: #262b38; border-left-color: #f0b90d; }
 .picker-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-info { flex: 1; min-width: 0; }
+.picker-info > .picker-name { display: block; }
+.picker-metrics { display: flex; flex-wrap: wrap; gap: 2px 10px; margin-top: 2px; }
 .picker-qty { color: #9598a1; font-family: Consolas, monospace; font-size: 12px; }
 /* 行内自选: 未收藏是暗色空心星, 悬停点亮, 已收藏金色实心; 提交中变淡 */
 .picker-star { color: #5a6072; padding: 0 2px 0 6px; cursor: pointer; }
@@ -143,9 +146,19 @@ body { display: flex; flex-direction: column; }
 
 /* 收藏入口只在合约选择器每行的 ☆ 上, 工具栏不再有收藏按钮 */
 
-/* 状态点: 靠右, 圆点颜色看整体, 文字太长时截断(全文在悬停提示里) */
-#status {
+/* 训练入口与连接状态一起靠右, 窄窗口换行时保持相邻。 */
+.toolbar-end {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   margin-left: auto;
+  min-width: 0;
+  max-width: 100%;
+}
+.toolbar-end > a { flex-shrink: 0; }
+
+/* 状态点: 圆点颜色看整体, 文字太长时截断(全文在悬停提示里) */
+#status {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -199,7 +212,27 @@ body { display: flex; flex-direction: column; }
 .chart-view + .chart-view { border-left: 1px solid #2a2e39; }
 /* 划线止盈止损: 鼠标在能拖的线上(或正拖着)时换成上下箭头; 库在自己的元素上写了内联光标, 要 !important 才盖得住 */
 .chart-view.paper-drag, .chart-view.paper-drag * { cursor: ns-resize !important; }
-/* 右键挂单菜单与图上操作的结果提示: 摆在鼠标旁边, 压在图表和左上角图例之上 */
+/* 十字线右端的挂单入口, 与价格轴标签相接。 */
+.paper-add {
+  position: absolute;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 2px 0 0 2px;
+  background: #4c525e;
+  color: #fff;
+  transform: translate(-100%, -50%);
+  cursor: pointer;
+}
+.paper-add[hidden] { display: none; }
+.paper-add svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1; pointer-events: none; }
+.paper-add:hover, .paper-add[aria-expanded="true"] { background: #636a78; }
+.paper-add:focus-visible { outline: 2px solid #90b4ff; outline-offset: 2px; }
+/* 挂单菜单与图上操作的结果提示: 压在图表和左上角图例之上 */
 .paper-menu {
   position: absolute;
   z-index: 40;
@@ -501,14 +534,32 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
 #watch-hint { color: #9598a1; font-size: 12px; padding: 2px 10px 6px; }
 
 #watch-items { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; min-height: 0; }
-#watch-items li { padding: 4px 8px 5px 10px; border-left: 2px solid transparent; cursor: pointer; }
-#watch-items li:hover { background: #262b38; }
-#watch-items li.active { background: #262b38; border-left-color: #f0b90d; }
-#watch-items li.dead { opacity: 0.55; }
+.watch-group-items { list-style: none; margin: 0; padding: 0; }
+.watch-group-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: 0;
+  padding: 6px 10px 4px;
+  background: #1e222d;
+  color: #9598a1;
+  font-size: 11px;
+  font-weight: 600;
+  border-bottom: 1px solid #2a2e39;
+}
+.watch-group + .watch-group { margin-top: 6px; }
+.watch-group-count { color: #6b7180; font-weight: normal; }
+#watch-items .watch-item { padding: 4px 8px 5px 10px; border-left: 2px solid transparent; cursor: pointer; }
+#watch-items .watch-item:hover { background: #262b38; }
+#watch-items .watch-item.active { background: #262b38; border-left-color: #f0b90d; }
+#watch-items .watch-item.dead { opacity: 0.55; }
 .watch-top { display: flex; align-items: baseline; gap: 6px; }
 .watch-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .watch-remove { color: #9598a1; opacity: 0; padding: 0 2px; }
-#watch-items li:hover .watch-remove { opacity: 1; }
+#watch-items .watch-item:hover .watch-remove { opacity: 1; }
 .watch-bottom {
   display: flex;
   align-items: baseline;
@@ -592,18 +643,30 @@ button.ml-params:disabled, .ml-toggle:disabled, .ml-range:disabled { cursor: def
 }
 #trade-qty { width: 52px; }
 #trade.crypto #trade-qty { width: 84px; }   /* 加密合约的数量是小数的币 */
+#trade-sizing-row { width: 100%; }
+#trade-margin { width: 84px; }
+.trade-sizing-note { width: 100%; color: #9598a1; font-size: 11px; line-height: 1.5; white-space: pre-line; }
+.trade-sizing-note[hidden] { display: none; }
 #trade-price { width: 96px; }
 /* 下单时带的止盈止损: 表单里单独一整行, 两个框平分 */
 .trade-order-stops { width: 100%; display: flex; gap: 8px; }
-.trade-order-stops[hidden], .trade-auto-stops[hidden], .trade-auto-fields[hidden], .trade-auto-note[hidden] { display: none; }
+.trade-order-stops[hidden], .trade-auto-stops[hidden], .trade-auto-note[hidden] { display: none; }
 .trade-auto-stops { width: 100%; padding: 6px; border: 1px solid #2a2e39; border-radius: 4px; }
 .trade-form .trade-auto-toggle { color: #d1d4dc; }
-#trade-auto-enabled { margin: 0 2px 0 0; accent-color: #ffa726; }
-.trade-auto-fields { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; margin-top: 6px; }
-#trade-auto-loss { width: 58px; }
-#trade-auto-profit { color: #ffa726; }
+.trade-auto-toggle input { margin: 0 2px 0 0; accent-color: #ffa726; }
+.trade-auto-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.trade-auto-row + .trade-auto-row { margin-top: 6px; }
+#trade-auto-loss, #trade-auto-profit { width: 65px; }
+.trade-auto-row input:disabled { opacity: .4; }
 .trade-auto-note { margin-top: 4px; font-size: 11px; color: #9598a1; }
 .trade-auto-note.error { color: #f7525f; }
+.trade-notice { position: fixed; right: 20px; bottom: 20px; z-index: 100;
+  display: flex; align-items: flex-start; gap: 12px; max-width: min(460px, calc(100vw - 40px));
+  padding: 14px 16px; border: 1px solid #687b94; border-radius: 6px; background: #1e2633;
+  color: #e3eaf4; box-shadow: 0 4px 20px #0008; font-size: 13px; line-height: 1.7; }
+.trade-notice[hidden] { display: none; }
+#trade-notice-text, .trade-msg { white-space: pre-line; }
+#trade-notice-close { border: 0; padding: 0 2px; background: none; color: #aebaca; font-size: 20px; cursor: pointer; }
 
 .trade-actions { display: flex; gap: 6px; }
 .trade-actions button, .trade-flatten, .trade-foot button, .trade-cancel, .trade-stops button {

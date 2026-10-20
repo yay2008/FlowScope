@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """合约目录: 品种(主连)与月份合约列表, 供前端合约选择器使用。
 
-数据全部来自 TqSdk 合约服务, 且只用静态合约查询(不订阅行情):
+名称、主力映射与持仓量来自 TqSdk 静态合约查询:
 
 - 品种: ``query_quotes(ins_class="CONT")`` 取全部主连, ``query_symbol_info`` 取中文名
   (形如「燃油主连」)与当前主力合约, 再按主力合约的昨日持仓量排序, 让活跃品种排在前面。
 - 月份: 该品种未下市合约, 同样按昨日持仓量降序, 并标出主力(与主连的标的合约一致)。
+- 昨日成交量: 异步读取实际月份合约最近三根日线, 按交易日历选上一交易日;
+  初次加载不等待日线, 缺失时返回 None, 不影响目录与图表采集。
 
 持仓量的**计边口径**必须归一, 否则菜单和自选面板的数字对不上: 静态查询的
 ``pre_open_interest`` 在上期所/能源中心/郑商所/大商所是**双边**计量, 其余交易所是单边;
@@ -21,9 +23,11 @@ SDK 不是线程安全的, 所有调用都必须落在采集线程上, 所以这
 """
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 from ingest import JOB_TIMEOUT_SEC, listed_symbols, validate_symbol
 
@@ -48,6 +52,7 @@ BILATERAL_OPEN_INTEREST_EXCHANGES = frozenset({"SHFE", "INE", "CZCE", "DCE"})
 
 CATALOG_TTL_SEC = 300      # 品种目录(含主力合约映射)的缓存时长
 MONTHS_TTL_SEC = 60        # 月份列表的缓存时长: 持仓量天天变, 歇一会儿就重取
+CST = timezone(timedelta(hours=8))
 
 EXCHANGE_RE = re.compile(r"[A-Za-z]{2,8}\Z")
 PRODUCT_RE = re.compile(r"[A-Za-z0-9]{1,8}\Z")
@@ -277,6 +282,80 @@ def fallback_catalog(error: str | None = None) -> dict:
     return {"groups": group_products(products), "source": "fallback", "error": error}
 
 
+def previous_daily_volume(serial, trading_date: str):
+    """只取指定交易日的日线成交量; 不把当日、缺失或更早的日线冒充昨日。"""
+    for row in reversed(_records(serial)):
+        try:
+            timestamp = int(row.get("datetime", 0))
+            volume = float(row.get("volume"))
+            if timestamp <= 0 or not math.isfinite(volume) or volume < 0:
+                continue
+            day = datetime.fromtimestamp(timestamp / 1e9, CST).date().isoformat()
+            if day == trading_date:
+                return volume
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+    return None
+
+
+class DailyVolumes:
+    """仅在采集线程访问; SDK 协程内订阅三根日线, 不同步等候每个合约。
+
+    不创建应用的 Feed, 不订阅 tick。API 重连后重建引用; 失败可重试。
+    日期按北京时间 18:00 的交易日切换和 SDK 交易日历计算, 跳过休市日。
+    """
+
+    def __init__(self):
+        self._api = None
+        self._series = {}
+        self._retry_at = {}
+        self._date_key = None
+        self._date = None
+
+    def snapshot(self, api, symbols, now=None):
+        if self._api is not api:
+            self._api = api
+            self._series = {}
+            self._retry_at = {}
+            self._date_key = self._date = None
+        local = now or datetime.now(CST)
+        cutoff = local.date() + timedelta(days=int(local.hour >= 18))
+        if cutoff != self._date_key:
+            calendar = _records(api.get_trading_calendar(cutoff - timedelta(days=45), cutoff))
+            days = [row["date"].date() for row in calendar if row.get("trading")]
+            self._date = max((day for day in days if day < cutoff), default=None)
+            self._date_key = cutoff
+        if self._date is None:
+            return {}, None
+        date = self._date.isoformat()
+        wanted = sorted(set(symbols) - {""})
+        pending = [symbol for symbol in wanted if symbol not in self._series
+                   and time.monotonic() >= self._retry_at.get(symbol, 0)]
+        if pending:
+            # 先占位, 防止多个菜单同时请求时重复订阅。
+            self._series.update({symbol: None for symbol in pending})
+            subscription = self._subscribe(api, pending)
+            try:
+                api.create_task(subscription)
+            except Exception:
+                subscription.close()
+                for symbol in pending:
+                    self._series.pop(symbol, None)
+                raise
+        return {symbol: previous_daily_volume(self._series.get(symbol), date)
+                for symbol in wanted}, date
+
+    async def _subscribe(self, api, symbols):
+        for symbol in symbols:
+            if self._api is not api:
+                return
+            try:
+                self._series[symbol] = api.get_kline_serial(symbol, 86400, data_length=3)
+            except Exception:
+                self._series.pop(symbol, None)
+                self._retry_at[symbol] = time.monotonic() + MONTHS_TTL_SEC
+
+
 class CatalogService:
     """带缓存与回退的合约目录。
 
@@ -293,6 +372,7 @@ class CatalogService:
         self._lock = threading.Lock()
         self._catalog: tuple[float, dict] | None = None
         self._months: dict[tuple[str, str], tuple[float, dict]] = {}
+        self._daily_volumes = DailyVolumes()
 
     async def payload(self, exchange: str | None = None, product: str | None = None,
                       refresh: bool = False) -> dict:
@@ -305,6 +385,21 @@ class CatalogService:
         if exchange_id and product_id:
             result["months"], result["monthsError"] = await self._months_payload(
                 exchange_id, product_id, self._main_symbol(catalog, exchange_id, product_id), refresh)
+        wanted = [item["mainSymbol"] for group in result["groups"] for item in group["products"]]
+        wanted.extend(item["symbol"] for item in result["months"])
+        volumes, volume_date = {}, None
+        if catalog["source"] == "live":
+            try:
+                volumes, volume_date = await self._query(lambda api: self._daily_volumes.snapshot(api, wanted))
+            except Exception:
+                pass  # 附加统计取不到时, 名称、持仓量与选择合约照常可用。
+        # 静态目录仍按原 TTL 缓存; 日线引用每次读最新值, 不把首次的空值缓存五分钟。
+        result["groups"] = [{**group, "products": [
+            {**item, "previousVolume": volumes.get(item["mainSymbol"]), "previousVolumeDate": volume_date}
+            for item in group["products"]]} for group in result["groups"]]
+        result["months"] = [{**item, "previousVolume": volumes.get(item["symbol"]),
+                              "previousVolumeDate": volume_date} for item in result["months"]]
+        result["previousVolumeDate"] = volume_date
         return result
 
     async def _catalog_payload(self, refresh: bool) -> dict:

@@ -704,7 +704,7 @@
    *   onPaperStops(change)      图上拖/双击了止盈止损线({tp: 价格} / {sl: null} 是取消)
    *   onPaperAmend(id, price)   图上拖了挂单线改价
    *   onPaperCancel(id)         图上双击了挂单线撤单
-   *   paperMenu(price)          右键主图时问页面能挂哪些单, 回 [{label, side, run}], 空数组就不弹菜单
+   *   paperMenu(price)          点击十字线加号时问页面能挂哪些单, 回 [{label, side, run}], 空数组就不弹菜单
    *                             (以上四个回 {ok, text} 或它的 Promise, text 在鼠标旁边提示几秒; 回 null 不提示)
    */
   function create({ host, tf, symbol, settings, shown: initialShown, onStatus = noop, onSuiteSetting = noop,
@@ -1007,7 +1007,7 @@
         vertLines: { color: "#1e222d" },
         horzLines: { color: "#1e222d" },
       },
-      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal, horzLine: { labelBackgroundColor: "#4c525e" } },
       timeScale: { borderColor: "#2a2e39", timeVisible: true, secondsVisible: tf < 60, rightOffset: RIGHT_OFFSET },
       localization: {
         // 后端时间戳已加 8 小时，按 UTC 格式化以保留北京时间。
@@ -1129,7 +1129,7 @@
     const PANE_LABELS = [[1, "FlowMeter"], ...(lwPane ? [[2, "FlowWave"]] : [])];
 
     // 模拟交易叠加: 成交标记(买在下方红色「B」/ 卖在上方绿色「S」, 不画箭头)与持仓均价、止盈止损、挂单价格线, 挂在 K 线上。
-    // 数据来自页面右侧交易面板的轮询, 由页面通过 setPaperState 交进来。止盈止损线、挂单线可以拖, 右键可以挂单
+    // 数据来自页面右侧交易面板的轮询, 由页面通过 setPaperState 交进来。止盈止损线、挂单线可以拖, 十字线加号可以挂单
     // (见「划线止盈止损与挂单」)。
     // 库对同一 series 的图元边距不逐侧取大, 只认最后一个给出边距的(5.2.1: s?.margins&&(r=s.margins))。
     // 截下标记插件挂上的图元, 大单图元挂在它后面、由 largeMargins 与它逐侧取大; 否则一有 B/S 就把大单留的边距冲掉。
@@ -1685,6 +1685,7 @@
     candleSeries.attachPrimitive(measurePrimitive);
 
     function setMeasurePhase(phase) {
+      clearPaperEntry();
       measurePhase = phase;
       if (phase === "off" || phase === "armed") measureA = measureB = null;
       measureBtn.classList.toggle("on", phase === "armed" || phase === "drawing");
@@ -1758,7 +1759,7 @@
     let lastPointer = null;
     let pressAt = null;
     el.addEventListener("pointerdown", (event) => {
-      pressAt = event.button === 0 && !event.target.closest(".chart-corner, .paper-menu")
+      pressAt = event.button === 0 && !event.target.closest(".chart-corner, .paper-menu, .paper-add")
         ? { x: event.clientX, y: event.clientY } : null;
     });
     el.addEventListener("pointerup", (event) => {
@@ -1773,6 +1774,12 @@
     // 用户移动光标时触发; 光标停着(包括 setCrosshairPosition 摆上去的)而本图数据变了, 库也会再报一次。
     // setCrosshairPosition 本身不触发。
     chart.subscribeCrosshairMove((param) => {
+      // 鼠标进入 DOM 按钮时库会清掉十字线; 保持选中的价位, 菜单打开后也不随鼠标或行情刷新漂移。
+      if (paperOrderPoint && (paperAddHovered || paperMenuEl)) {
+        chart.setCrosshairPosition(paperOrderPoint.price, paperOrderPoint.time, candleSeries);
+        return;
+      }
+      updatePaperEntry(param);
       lastPointer = param.point ? param : null;
       largeHoverParam = param.point && param.paneIndex === 0 ? param : null;
       showLargeTooltip(param);
@@ -1815,6 +1822,7 @@
     candleSeries.attachPrimitive(profilePrimitive);
 
     function setProfilePhase(phase) {
+      clearPaperEntry();
       profilePhase = phase;
       if (phase !== "drawing") profileDraft = null;
       profileBtn.classList.toggle("on", phase !== "off");
@@ -2103,7 +2111,7 @@
     // 盈利一侧的是止盈、另一侧是止损(见 PaperPanel.dragLine); 双击止盈/止损线取消。挂单线(限价、条件)同样拖着改价、
     // 双击撤单; 拖到会当场成交的价位时标题上提示, 松手也不提交, 原委托不动。拖的过程中线跟着鼠标走,
     // 止盈止损的标题显示到这个价位平仓的预估盈亏; 松手才提交(交给页面 onPaperStops / onPaperAmend, 被拒就按原数据画回去),
-    // 拖动中按 Esc 作罢。右键主图窗格弹出挂单菜单(菜单项由页面 paperMenu 按点到的价位给出)。
+    // 拖动中按 Esc 作罢。点击十字线右端的加号弹出挂单菜单(菜单项由页面 paperMenu 按选中的价位给出)。
     // 这些操作的结果在鼠标旁边提示几秒: 交易面板可能折叠着, 面板上的提示看不到。
     // 按下时 preventDefault: 浏览器就不再补发 mousedown/mousemove, 库(只听鼠标事件)收不到, 不会把这次拖动
     // 当成平移图表; 再在捕获阶段截住不往下传, 测量工具也不会把它当成一次点击。
@@ -2116,14 +2124,71 @@
     let paperSaving = false;   // 已松手、在等提交结果: 线停在松手的位置
     let paperTempLine = null;  // 从均价线拖出来的那条临时线
     let paperHover = "";
-    let paperMenuEl = null;    // 右键挂单菜单
+    let paperMenuEl = null;
     let paperToastEl = null;
     let paperToastTimer = null;
+    let paperPointerInside = false;
+    let paperAddHovered = false;
+    let paperOrderPoint = null;   // 加号所在的价位, 悬停按钮或打开菜单后保持不变
+    const paperAdd = document.createElement("button");
+    paperAdd.type = "button";
+    paperAdd.className = "paper-add";
+    paperAdd.hidden = true;
+    paperAdd.title = "在此价位挂单";
+    paperAdd.setAttribute("aria-label", "在十字线价位挂单");
+    paperAdd.setAttribute("aria-haspopup", "menu");
+    paperAdd.setAttribute("aria-expanded", "false");
+    paperAdd.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 4.5v7M4.5 8h7"/></svg>';
+    el.appendChild(paperAdd);
+
+    function clearPaperEntry() {
+      closePaperMenu();
+      paperAdd.hidden = true;
+      paperAddHovered = false;
+      paperOrderPoint = null;
+    }
+
+    function canPaperOrder() {
+      return paperState?.contract && paperState.quote && settings.view !== "footprint"
+        && !measuring() && profilePhase === "off" && !paperDrag && !paperSaving;
+    }
+
+    function updatePaperEntry(param) {
+      if (!paperPointerInside || !canPaperOrder() || param.paneIndex !== 0 || !param.point || !bars.length) {
+        clearPaperEntry();
+        return;
+      }
+      const pane = chart.panes()[0].getHTMLElement();
+      if (!pane) { clearPaperEntry(); return; }
+      const rect = pane.getBoundingClientRect();
+      const box = el.getBoundingClientRect();
+      const width = rect.width - chart.priceScale("right").width();
+      const { x, y } = param.point;
+      const price = candleSeries.coordinateToPrice(y);
+      if (x < 0 || x > width || y < 0 || y > rect.height || !Number.isFinite(price) || price <= 0) {
+        clearPaperEntry();
+        return;
+      }
+      // 右侧留白没有 time, 横线仍可选价; 保持横线时用最后一根 K 线作为时间锚点。
+      paperOrderPoint = { price, time: param.time ?? bars[bars.length - 1].time };
+      paperAdd.style.left = `${rect.left - box.left + width}px`;
+      paperAdd.style.top = `${rect.top - box.top + y}px`;
+      paperAdd.hidden = false;
+    }
+
+    el.addEventListener("pointerenter", () => { paperPointerInside = true; });
+    paperAdd.addEventListener("pointerenter", () => {
+      paperAddHovered = true;
+      setPaperHover("");
+    });
+    paperAdd.addEventListener("pointerleave", () => { paperAddHovered = false; });
+    // 阻止图表拖动和测量工具拿到加号的点击; 键盘 Enter / Space 仍走原生 button 的 click。
+    paperAdd.addEventListener("pointerdown", (event) => { event.stopPropagation(); });
 
     // 鼠标所在的主图窗格(不含价格轴), 回 {rect, y}; 测量中、画成交量分布中、足迹图、左上角控件和挂单菜单上都不算
     function paperPane(event) {
       if (!paperState || settings.view === "footprint" || measuring() || profilePhase !== "off") return null;
-      if (event.target && event.target.closest && event.target.closest(".chart-corner, .paper-menu")) return null;
+      if (event.target && event.target.closest && event.target.closest(".chart-corner, .paper-menu, .paper-add")) return null;
       let paneEl = null;
       try { paneEl = chart.panes()[0].getHTMLElement(); } catch (e) { return null; }
       if (!paneEl) return null;
@@ -2204,6 +2269,7 @@
     // 提交图上的改动(止盈止损、挂单改价、撤单): 等页面提交完, 按面板数据重画线, 在 at 旁边提示结果
     function commitPaperChange(action, at) {
       paperSaving = true;
+      clearPaperEntry();
       Promise.resolve()
         .then(action)
         .then((result) => showPaperToast(result, at), () => {})
@@ -2221,6 +2287,7 @@
       event.stopPropagation();
       try { el.setPointerCapture(event.pointerId); } catch (e) { /* 没有捕获也能拖, 只是移出图表后收不到 */ }
       paperDrag = { from: hit.from, pointerId: event.pointerId, startY: event.clientY, rect: hit.rect, target: null };
+      clearPaperEntry();
     }, true);
     el.addEventListener("pointermove", (event) => {
       if (!paperDrag) {
@@ -2256,9 +2323,13 @@
     document.addEventListener("keydown", (event) => {
       if (event.key !== "Escape") return;
       abandonPaperDrag();
+      const hadMenu = !!paperMenuEl;
       closePaperMenu();
+      if (hadMenu && !paperAdd.hidden) paperAdd.focus();
     });
     el.addEventListener("pointerleave", () => {
+      paperPointerInside = false;
+      if (!paperMenuEl) clearPaperEntry();
       if (!paperDrag) setPaperHover("");
     });
     el.addEventListener("dblclick", (event) => {
@@ -2274,29 +2345,33 @@
       }
     }, true);
 
-    // 右键挂单: 菜单项(价位已对齐最小变动价位)由页面按点到的价格给; 没有可交易的合约时不拦浏览器自己的菜单
+    // 加号挂单: 菜单项(价位已对齐最小变动价位)由页面给, 按钮本身只展开菜单。
     function closePaperMenu() {
-      if (!paperMenuEl) return;
-      paperMenuEl.remove();
+      if (paperMenuEl) paperMenuEl.remove();
       paperMenuEl = null;
+      paperAdd.setAttribute("aria-expanded", "false");
     }
 
-    el.addEventListener("contextmenu", (event) => {
-      closePaperMenu();
-      const pane = paperDrag || paperSaving ? null : paperPane(event);
-      const items = pane ? paperMenu(candleSeries.coordinateToPrice(pane.y)) || [] : [];
+    paperAdd.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (paperMenuEl) { closePaperMenu(); return; }
+      if (!paperOrderPoint || !canPaperOrder()) { clearPaperEntry(); return; }
+      const items = paperMenu(paperOrderPoint.price) || [];
       if (!items.length) return;
-      event.preventDefault();
-      const at = localPoint(event);
+      const rect = paperAdd.getBoundingClientRect();
+      const at = localPoint({ clientX: rect.left, clientY: rect.bottom + 4 });
       const menu = document.createElement("div");
       menu.className = "paper-menu";
+      menu.setAttribute("role", "menu");
+      menu.setAttribute("aria-label", "在选中价位挂单");
       for (const item of items) {
         const button = document.createElement("button");
         button.type = "button";
         button.className = item.side === "buy" ? "buy" : "sell";
+        button.setAttribute("role", "menuitem");
         button.textContent = item.label;
         button.addEventListener("click", () => {
-          closePaperMenu();
+          clearPaperEntry();
           Promise.resolve().then(item.run).then((result) => showPaperToast(result, at), () => {});
         });
         menu.appendChild(button);
@@ -2304,12 +2379,14 @@
       el.appendChild(menu);
       placeNear(menu, at, 0);
       paperMenuEl = menu;
+      paperAdd.setAttribute("aria-expanded", "true");
+      menu.children[0].focus();
     });
     // 点菜单外面、滚轮缩放都收起菜单(Esc 见上面)
     document.addEventListener("pointerdown", (event) => {
-      if (paperMenuEl && !paperMenuEl.contains(event.target)) closePaperMenu();
+      if (paperMenuEl && !paperMenuEl.contains(event.target) && !paperAdd.contains(event.target)) clearPaperEntry();
     }, true);
-    el.addEventListener("wheel", closePaperMenu, { passive: true });
+    el.addEventListener("wheel", clearPaperEntry, { passive: true });
 
     // ---------- 足迹图视图切换与数据 ----------
 
@@ -2332,6 +2409,7 @@
 
     // 按 settings.view 切换 K线 / 足迹图
     function setView() {
+      clearPaperEntry();
       const isFp = settings.view === "footprint";
       candleSeries.applyOptions({ visible: !isFp });
       applyEmaVisibility();
@@ -2413,6 +2491,7 @@
     }
 
     async function loadHistory(generation) {
+      clearPaperEntry();
       if (generation == null) {
         generation = ++loadGeneration;  // 用户切换开始新一轮加载；自动重试沿用原 generation。
         retryAttempts = 0;
@@ -2655,6 +2734,7 @@
       },
       refreshReadout,                  // 读数重画(模式变了)
       setPaperState(state) {
+        if (paperState?.contract !== state?.contract || !state?.quote) clearPaperEntry();
         paperState = state;
         renderPaperOverlays();
       },

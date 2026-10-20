@@ -397,7 +397,7 @@ class StopOrderTest(unittest.TestCase):
 
     def test_automatic_stops_use_the_actual_fill(self):
         account = book(fees=FeeTable())
-        account.place(order("buy", 1, "stop", 3010.0) | {"autoStopLoss": 100.0}, snap(), NOW)
+        account.place(order("buy", 1, "stop", 3010.0) | {"autoStopLoss": 100.0, "autoTakeProfit": 150.0}, snap(), NOW)
         account.match({CONTRACT: snap(last_price=3010.0, ask_price1=3012.0)}, NOW)
         position = account.positions[CONTRACT]
         self.assertEqual((position["avgPrice"], position["sl"], position["tp"]), (3012.0, 3002.0, 3027.0))
@@ -588,12 +588,98 @@ class StopTest(unittest.TestCase):
 
 
 class AutomaticStopsTest(unittest.TestCase):
+    def test_independent_amounts_only_install_enabled_stops(self):
+        for side in ("buy", "sell"):
+            for amounts, expected in (({"autoStopLoss": 100}, {"sl"}),
+                                       ({"autoTakeProfit": 270}, {"tp"}),
+                                       ({"autoStopLoss": 100, "autoTakeProfit": 270}, {"sl", "tp"})):
+                with self.subTest(side=side, amounts=amounts):
+                    account = book(fees=FeeTable())
+                    request = paper.normalize_request(order(side, 2) | amounts)
+                    placed = account.place(request, snap(), NOW)
+                    account = PaperBook(json.loads(json.dumps(account.to_dict())), FeeTable())
+                    position = account.positions[CONTRACT]
+                    self.assertEqual(set(position) & {"sl", "tp"}, expected)
+                    self.assertTrue(placed["autoStopApplied"])
+                    if "tp" in expected:
+                        profit = (position["tp"] - position["avgPrice"]) * position["qty"] * 10
+                        self.assertGreaterEqual(profit, 270)
+                        self.assertLess(profit, 290)
+                    if expected == {"sl"}:
+                        favorable = snap(last_price=3100 if side == "buy" else 2900)
+                        self.assertEqual(account.trigger_stops({CONTRACT: favorable}, NOW), [])
+                    if expected == {"tp"}:
+                        adverse = snap(last_price=2900 if side == "buy" else 3100)
+                        self.assertEqual(account.trigger_stops({CONTRACT: adverse}, NOW), [])
+
+    def test_switching_amounts_clears_disabled_side_and_manual_edit_exits_both(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 1) | {"autoStopLoss": 100, "autoTakeProfit": 270}, snap(), NOW)
+        account.place(order("buy", 1) | {"autoStopLoss": 80}, snap(), NOW)
+        position = account.positions[CONTRACT]
+        self.assertEqual(position["sl"], 2996)
+        self.assertNotIn("tp", position)
+        self.assertNotIn("autoTakeProfit", position)
+        account.place(order("buy", 1) | {"autoTakeProfit": 270}, snap(), NOW)
+        position = account.positions[CONTRACT]
+        self.assertEqual(position["tp"], 3009)
+        self.assertNotIn("sl", position)
+        self.assertNotIn("autoStopLoss", position)
+        account.place(order("sell", 1), snap(), NOW)
+        self.assertEqual(account.positions[CONTRACT]["tp"], 3014)
+        account.set_stops(CONTRACT, 3020, 2990, snap())
+        account.place(order("buy", 1), snap(), NOW)
+        position = account.positions[CONTRACT]
+        self.assertFalse({"autoStopLoss", "autoTakeProfit"} & position.keys())
+        self.assertEqual((position["tp"], position["sl"]), (3020, 2990))
+
+    def test_legacy_positions_and_pending_orders_keep_original_profit_target(self):
+        account = book(fees=FeeTable())
+        account.place(order("buy", 1) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
+        account.place(order("buy", 1, "limit", 2990) | {"autoStopLoss": 200, "autoTakeProfit": 300}, snap(), NOW)
+        legacy = json.loads(json.dumps(account.to_dict()))
+        legacy["version"] = 1
+        for record in [*legacy["positions"].values(), *legacy["orders"]]:
+            record.pop("autoTakeProfit", None)
+        migrated = PaperBook(legacy, FeeTable())
+        self.assertEqual(migrated.positions[CONTRACT]["autoTakeProfit"], 150)
+        self.assertEqual(migrated.positions[CONTRACT]["tp"], 3015)
+        self.assertEqual(migrated.orders[-1]["autoTakeProfit"], 300)
+        self.assertNotIn("autoTakeProfit", legacy["positions"][CONTRACT])
+        migrated.match({CONTRACT: snap(ask_price1=2989, last_price=2990)}, NOW)
+        position = migrated.positions[CONTRACT]
+        self.assertEqual((position["qty"], position["sl"], position["tp"]), (2, 2985, 3010))
+        self.assertEqual(migrated.to_dict()["version"], 2)
+        self.assertEqual(PaperBook(migrated.to_dict()).positions, migrated.positions)
+
+    def test_profit_only_pending_order_triggers_after_reload(self):
+        account = book(fees=FeeTable())
+        account.place(order("sell", 1, "stop", 2990) | {"autoTakeProfit": 270}, snap(), NOW)
+        account = PaperBook(account.to_dict(), FeeTable())
+        account.match({CONTRACT: snap(last_price=2989, bid_price1=2988)}, NOW)
+        self.assertEqual(account.positions[CONTRACT]["tp"], 2961)
+        self.assertNotIn("sl", account.positions[CONTRACT])
+        closed = account.trigger_stops({CONTRACT: snap(last_price=2961, ask_price1=2962)}, NOW)
+        self.assertEqual(closed[0]["reason"], "止盈")
+        self.assertEqual(account.positions, {})
+        self.assertEqual(account.trades[-1]["pnl"], 260)
+
+    def test_invalid_profit_or_conflicting_prices_is_atomic(self):
+        for value in (0, -1, True, "", "no", float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(OrderError):
+                paper.normalize_request(order("buy", 1) | {"autoTakeProfit": value})
+        account = book()
+        before = account.to_dict()
+        with self.assertRaises(OrderError):
+            account.place(order("buy", 1) | {"autoTakeProfit": 100, "sl": 2900}, snap(), NOW)
+        self.assertEqual(account.to_dict(), before)
+
     def test_long_and_short_use_actual_fill_and_total_position(self):
         for side, qty, tp, sl in (("buy", 1, 3016, 2991), ("sell", 1, 2984, 3009),
                                   ("buy", 2, 3009, 2996), ("sell", 2, 2991, 3004)):
             with self.subTest(side=side, qty=qty):
                 account = book(fees=FeeTable())
-                placed = account.place(order(side, qty) | {"autoStopLoss": 100}, snap(ask_price1=3001), NOW)
+                placed = account.place(order(side, qty) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(ask_price1=3001), NOW)
                 position = account.positions[CONTRACT]
                 self.assertEqual((position["tp"], position["sl"]), (tp, sl))
                 self.assertTrue(placed["autoStopApplied"])
@@ -601,7 +687,7 @@ class AutomaticStopsTest(unittest.TestCase):
 
     def test_add_reduce_and_reverse_recalculate_for_remaining_position(self):
         account = book(fees=FeeTable())
-        account.place(order("buy", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("buy", 1) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
         account.place(order("buy", 2), snap(ask_price1=3001), NOW)
         position = account.positions[CONTRACT]
         self.assertAlmostEqual(position["avgPrice"], 3000 + 2 / 3)
@@ -611,13 +697,13 @@ class AutomaticStopsTest(unittest.TestCase):
         position = account.positions[CONTRACT]
         self.assertFalse(reduced["autoStopApplied"])
         self.assertEqual((position["autoStopLoss"], position["sl"], position["tp"]), (100, 2995, 3009))
-        account.place(order("sell", 3) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("sell", 3) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
         position = account.positions[CONTRACT]
         self.assertEqual((position["qty"], position["avgPrice"], position["sl"], position["tp"]),
                          (-1, 2999, 3009, 2984))
         account.flatten(CONTRACT, snap(), NOW)
         self.assertEqual(account.positions, {})
-        account.place(order("sell", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("sell", 1) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
         account.place(order("buy", 2), snap(), NOW)
         self.assertNotIn("autoStopLoss", account.positions[CONTRACT])
         self.assertNotIn("sl", account.positions[CONTRACT])
@@ -627,7 +713,7 @@ class AutomaticStopsTest(unittest.TestCase):
             for tick, multiplier in ((1, 10), (0.2, 1000), (5, 100)):
                 with self.subTest(qty=qty, tick=tick):
                     position = {"qty": qty, "avgPrice": 3000 + 1 / 3, "multiplier": multiplier}
-                    stops = paper.automatic_stops(position, 100, tick)
+                    stops = paper.automatic_stops(position, 100, tick, 150)
                     loss = -(stops["sl"] - position["avgPrice"]) * qty * multiplier
                     profit = (stops["tp"] - position["avgPrice"]) * qty * multiplier
                     self.assertGreaterEqual(loss + 1e-7, 100)
@@ -639,25 +725,25 @@ class AutomaticStopsTest(unittest.TestCase):
 
     def test_manual_changes_exit_amount_mode(self):
         account = book(fees=FeeTable())
-        account.place(order("buy", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("buy", 1) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
         account.set_stops(CONTRACT, 3020, 2995, snap())
         account.place(order("buy", 1), snap(), NOW)
         self.assertNotIn("autoStopLoss", account.positions[CONTRACT])
         self.assertEqual((account.positions[CONTRACT]["tp"], account.positions[CONTRACT]["sl"]), (3020, 2995))
-        account.place(order("buy", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("buy", 1) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
         account.place(order("buy", 1) | {"tp": 3040}, snap(), NOW)
         self.assertNotIn("autoStopLoss", account.positions[CONTRACT])
-        account.place(order("buy", 1) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("buy", 1) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
         account.set_stops(CONTRACT, None, None, None)
         account.place(order("buy", 1), snap(), NOW)
         self.assertFalse({"tp", "sl", "autoStopLoss"} & account.positions[CONTRACT].keys())
 
     def test_limits_compute_on_fill_and_survive_reload(self):
         account = book(fees=FeeTable())
-        account.place(order("buy", 1, "limit", 3005) | {"autoStopLoss": 100}, snap(), NOW)
+        account.place(order("buy", 1, "limit", 3005) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
         self.assertEqual((account.positions[CONTRACT]["avgPrice"], account.positions[CONTRACT]["sl"]), (3000, 2990))
         account.flatten(CONTRACT, snap(), NOW)
-        resting = account.place(order("buy", 1, "limit", 2990) | {"autoStopLoss": 100}, snap(), NOW)
+        resting = account.place(order("buy", 1, "limit", 2990) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
         self.assertEqual(resting["status"], "open")
         account = PaperBook(json.loads(json.dumps(account.to_dict())), FeeTable())
         account.match({CONTRACT: snap(ask_price1=2989, last_price=2989)}, NOW)
@@ -669,7 +755,7 @@ class AutomaticStopsTest(unittest.TestCase):
 
     def test_reducing_resting_order_does_not_attach_automatic_stops(self):
         account = book(fees=FeeTable())
-        resting = account.place(order("sell", 1, "limit", 3010) | {"autoStopLoss": 100}, snap(), NOW)
+        resting = account.place(order("sell", 1, "limit", 3010) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
         account.place(order("buy", 2), snap(), NOW)
         account.match({CONTRACT: snap(bid_price1=3011, last_price=3010)}, NOW)
         self.assertFalse(resting["autoStopApplied"])
@@ -680,7 +766,7 @@ class AutomaticStopsTest(unittest.TestCase):
                                                    ("sell", 2985, 2984, "止盈", 150)):
             with self.subTest(side=side):
                 account = book(fees=FeeTable())
-                account.place(order(side, 1) | {"autoStopLoss": 100}, snap(), NOW)
+                account.place(order(side, 1) | {"autoStopLoss": 100, "autoTakeProfit": 150}, snap(), NOW)
                 self.assertEqual(account.trigger_stops({CONTRACT: snap(last_price=before)}, NOW), [])
                 self.assertEqual(account.trigger_stops({CONTRACT: snap(last_price=hit, bid_volume1=0, ask_volume1=0)}, NOW), [])
                 self.assertIn("平仓未成交", account.stop_errors[CONTRACT])
@@ -691,7 +777,7 @@ class AutomaticStopsTest(unittest.TestCase):
                 self.assertEqual(account.trigger_stops({CONTRACT: snap(last_price=hit)}, NOW), [])
 
     def test_invalid_amount_or_conflicting_prices_leave_no_partial_order(self):
-        for value in (0, -1, True, "", "no", float("nan"), float("inf"), 1.7e308):
+        for value in (0, -1, True, "", "no", float("nan"), float("inf")):
             with self.subTest(value=value), self.assertRaises(OrderError):
                 paper.normalize_request(order("buy", 1) | {"autoStopLoss": value})
         for request in (order("buy", 1) | {"autoStopLoss": 100, "tp": 3100},
@@ -702,7 +788,7 @@ class AutomaticStopsTest(unittest.TestCase):
                 account.place(request, snap(), NOW)
             self.assertEqual(json.dumps(account.to_dict(), sort_keys=True), original)
         account = book(fees=FeeTable())
-        request = order("buy", 1, client_id="automatic-once") | {"autoStopLoss": 100}
+        request = order("buy", 1, client_id="automatic-once") | {"autoStopLoss": 100, "autoTakeProfit": 150}
         self.assertIs(account.place(request, snap(), NOW), account.place(request, snap(), NOW))
         self.assertEqual(account.positions[CONTRACT]["qty"], 1)
 
@@ -792,7 +878,7 @@ class ServiceTest(unittest.TestCase):
     def test_state_resolves_main_contract_and_reports_session(self):
         state = self.run_async(self.service.state("KQ.m@SHFE.fu"))
         self.assertEqual(state["contract"], CONTRACT)
-        self.assertEqual(state["autoStopRatio"], 1.5)
+        self.assertEqual(state["autoStopsVersion"], 2)
         self.assertEqual((state["quote"]["ask"], state["quote"]["open"]), (3000.0, True))
         self.assertEqual(state["fee"]["mode"], "ratio")
         self.assertIsNone(state["error"])

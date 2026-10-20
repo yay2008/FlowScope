@@ -11,7 +11,6 @@
 <body>
 <div id="toolbar">
   <span class="logo">FlowScope</span>
-  <a href="training.html" style="color:#d1d4dc;text-decoration:none;padding:3px 8px;border:1px solid #3a4152;border-radius:4px">K 线训练</a>
   <div id="picker" class="picker">
     <button id="picker-trigger" class="picker-trigger" aria-haspopup="listbox" aria-expanded="false"
             title="选择品种与月份：输入即搜索（中文名/代码），↑↓ 移动，→/← 换列，Tab 切换期货/加密，Enter 确认，Esc 关闭；双击品种 = 主力。切换合约只走这里。">选择合约</button>
@@ -50,14 +49,17 @@
     <button id="trade-review-open" type="button" aria-controls="trade-review-panel" aria-expanded="false" title="按北京时间自然日复盘模拟账户的成交与资金费">AI 复盘</button>
     <label title="勾上后两张图一起发给 AI（大周期在前：先定方向再找位置）；两张图周期相同时只发鼠标所在的那张"><input id="ai-both" type="checkbox">双图</label>
   </span>
-  <!-- 状态点: 两张图的连接状态 + 合约目录/自选的提示, 细节在悬停提示里(app.js 的 showStatus) -->
-  <span id="status" class="off">连接中…</span>
+  <div class="toolbar-end">
+    <a href="training.html" style="color:#d1d4dc;text-decoration:none;padding:3px 8px;border:1px solid #3a4152;border-radius:4px">K 线训练</a>
+    <!-- 状态点: 两张图的连接状态 + 合约目录/自选的提示, 细节在悬停提示里(app.js 的 showStatus) -->
+    <span id="status" class="off">连接中…</span>
+  </div>
 </div>
 <div id="workspace">
   <aside id="watchlist">
     <div id="watch-head">
       <span>自选</span>
-      <button id="watch-toggle" title="折叠/展开自选面板">‹</button>
+      <button id="watch-toggle" title="折叠/展开自选面板" aria-controls="watch-items" aria-expanded="true" aria-label="收起自选面板">‹</button>
     </div>
     <div id="watch-hint">加载中…</div>
     <ul id="watch-items"></ul>
@@ -134,7 +136,12 @@
         <span class="trade-dim">买一</span><span id="trade-bid">—</span><span id="trade-bid-vol" class="trade-dim"></span>
       </div>
       <div class="trade-form">
-        <label><span id="trade-qty-label">手数</span><input id="trade-qty" type="number" min="1" max="500" step="1" value="1"></label>
+        <label id="trade-sizing-row" hidden>下单方式<select id="trade-sizing">
+          <option value="margin" selected>按保证金</option>
+          <option value="qty">按币数</option>
+        </select></label>
+        <label id="trade-qty-row"><span id="trade-qty-label">手数</span><input id="trade-qty" type="number" min="1" max="500" step="1" value="1"></label>
+        <label id="trade-margin-row" hidden>保证金(USDT)<input id="trade-margin" type="number" min="0.01" step="any" value="100"></label>
         <label>类型<select id="trade-type">
           <option value="market" selected>市价</option>
           <option value="limit">限价</option>
@@ -142,11 +149,15 @@
         </select></label>
         <label id="trade-price-row" hidden><span id="trade-price-label">价格</span><input id="trade-price" type="number" min="0" step="any"></label>
         <label id="trade-leverage-row" hidden title="加密合约每个合约一个杠杆(全仓); 降杠杆后保证金不够会被拒">杠杆<select id="trade-leverage"></select></label>
+        <div id="trade-sizing-note" class="trade-sizing-note" hidden></div>
         <div id="trade-auto-stops" class="trade-auto-stops" title="开仓成交后按整份持仓的均价和手数换算价格, 加仓、部分平仓后重算。只影响后续成交, 不修改已有持仓; 手动改价后退出金额模式。触发后按市价平仓, 实际盈亏会受跳动价位、价差和手续费影响">
-          <label class="trade-auto-toggle"><input id="trade-auto-enabled" type="checkbox" checked>自动止盈止损</label>
-          <div id="trade-auto-fields" class="trade-auto-fields">
-            <label>止损(元)<input id="trade-auto-loss" type="number" min="0.01" step="any" value="100"></label>
-            <span id="trade-auto-profit">止盈 150 元 · 1:1.5</span>
+          <div class="trade-auto-row">
+            <label class="trade-auto-toggle"><input id="trade-auto-loss-enabled" type="checkbox" checked>自动止损</label>
+            <label><input id="trade-auto-loss" aria-label="自动止损金额" type="number" min="0.01" step="any" value="100">元</label>
+          </div>
+          <div class="trade-auto-row">
+            <label class="trade-auto-toggle"><input id="trade-auto-profit-enabled" type="checkbox">自动止盈</label>
+            <label><input id="trade-auto-profit" aria-label="自动止盈金额" type="number" min="0.01" step="any" value="150" disabled>元</label>
           </div>
           <div id="trade-auto-note" class="trade-auto-note">整份持仓 · 不含手续费 · 价位取整</div>
         </div>
@@ -160,7 +171,7 @@
         <button id="trade-sell" class="trade-sell" title="市价: 按买一价整笔成交; 限价: 买一不低于限价就立即成交, 否则挂单; 条件: 触发价要低于最新价, 最新价跌到触发价时按市价卖出">卖出</button>
       </div>
       <button id="trade-flatten" class="trade-flatten" title="按市价平掉当前合约的全部持仓">平仓</button>
-      <div id="trade-msg" class="trade-msg"></div>
+      <div id="trade-msg" class="trade-msg" role="status"></div>
       <div class="trade-section">持仓</div>
       <div id="trade-position" class="trade-grid"></div>
       <div id="trade-stops" class="trade-stops" hidden title="按最新价触发: 多单最新价涨到止盈价或跌到止损价(空单反之)就按市价平掉全部持仓; 留空表示不设。也可以在 K 线上划线: 拖止盈/止损线改价, 从持仓均价线拖出新设, 双击线取消">
@@ -172,7 +183,7 @@
       <div class="trade-section">账户</div>
       <div id="trade-account" class="trade-grid"></div>
       <details class="trade-fold">
-        <summary class="trade-section" title="点击展开/折叠。K 线上: 拖挂单线改价, 双击挂单线撤单, 右键点价位挂限价单或条件单">委托<span id="trade-orders-count" class="trade-fold-count"></span></summary>
+        <summary class="trade-section" title="点击展开/折叠。K 线上: 拖挂单线改价, 双击挂单线撤单, 点击十字线右侧加号挂限价单或条件单">委托<span id="trade-orders-count" class="trade-fold-count"></span></summary>
         <ul id="trade-orders" class="trade-list"></ul>
       </details>
       <details class="trade-fold">
@@ -229,6 +240,10 @@
     </section>
   </div>
 </section>
+<div id="trade-notice" class="trade-notice" role="status" aria-live="polite" aria-atomic="true" hidden>
+  <span id="trade-notice-text"></span>
+  <button id="trade-notice-close" type="button" aria-label="关闭平仓提示">×</button>
+</div>
 <script src="vendor/lightweight-charts.standalone.production.js"></script>
 <script>window.LightweightCharts || document.write('<script src="https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js"><\/script>')</script>
 <script src="data-sync.js"></script>

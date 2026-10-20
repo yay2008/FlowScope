@@ -5,6 +5,7 @@
 「AI 分析」和「AI 复盘」默认用假的 DeepSeek（固定文字慢慢吐出，结果存进临时数据目录）；加 --deepseek 才按 .env 调真的。
 """
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -108,6 +109,18 @@ class CatalogApi:
 
     def wait_update(self, deadline=None):
         return True
+
+    def get_trading_calendar(self, start_dt, end_dt):
+        days = pd.date_range(start_dt, end_dt)
+        return pd.DataFrame({"date": days, "trading": days.dayofweek < 5})
+
+    def create_task(self, coroutine):
+        asyncio.run(coroutine)
+
+    def get_kline_serial(self, symbol, duration_seconds, data_length):
+        days = pd.bdate_range(end=pd.Timestamp.now(tz="Asia/Shanghai").normalize(), periods=data_length)
+        return pd.DataFrame({"datetime": [day.value for day in days],
+                             "volume": [self._fake_open_interest(symbol) * 3 + index * 100 for index in range(data_length)]})
 
 
 class PreviewQuote(SimpleNamespace):

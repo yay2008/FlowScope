@@ -22,7 +22,7 @@ const settings = {
   bandK: BAND.kDefault,   // 叠加带的带宽倍数 k(回归残差标准差的倍数), 不在工具栏: 点主图图例里的「2σ」切换
 };
 let symbol = new URLSearchParams(location.search).get("symbol") || "KQ.m@SHFE.fu";
-// 自选代码(服务端顺序即面板顺序)。常量必须早于合约选择器: picker.load() 会同步渲染
+// 自选代码(服务端顺序即各分类内的顺序)。常量必须早于合约选择器: picker.load() 会同步渲染
 // 月份行并回调 isFavorite 画 ☆, 声明放后面会踩 let 的暂时性死区。
 let favorites = [];
 
@@ -170,7 +170,7 @@ function makeChart(tf, index) {
     onBandK: setBandK,
     onCrosshair: (time, price) => syncCrosshair(chartView, time, price),
     onRangeChange: syncRanges,
-    // 图上划线改止盈止损、拖挂单改价、双击撤单、右键挂单: 交给交易面板提交(paperPanel 在下面才建, 到用户操作时早就有了)
+    // 图上划线改止盈止损、拖挂单改价、双击撤单、十字线加号挂单: 交给交易面板提交(paperPanel 在下面才建, 到用户操作时早就有了)
     onPaperStops: (change) => paperPanel.setStops(change),
     onPaperAmend: (id, price) => paperPanel.amendOrder(id, price),
     onPaperCancel: (id) => paperPanel.cancelOrder(id),
@@ -374,6 +374,12 @@ function setWatchCollapsed(collapsed) {
   } catch (error) { /* 折叠状态记不住不影响使用 */ }
   $("watchlist").classList.toggle("collapsed", collapsed);
   $("watch-toggle").textContent = collapsed ? "›" : "‹";
+  $("watch-toggle").setAttribute("aria-expanded", String(!collapsed));
+  $("watch-toggle").setAttribute("aria-label", collapsed ? "展开自选面板" : "收起自选面板");
+  if (collapsed) {
+    clearTimeout(watchTimer);
+    watchTimer = null;
+  }
 }
 const watchCollapsed = () => $("watchlist").classList.contains("collapsed");
 
@@ -399,60 +405,88 @@ const watchName = FlowData.watchLabel;
 
 function renderWatch() {
   const list = $("watch-items");
-  list.innerHTML = "";
-  for (const code of favorites) {
-    const row = watchRows.get(code) || { symbol: code, name: code };
-    const item = document.createElement("li");
-    item.classList.toggle("active", code === symbol);
-    // 只有「取过报价但没有数据」或已下市才变暗: 还没轮到第一次轮询的行不该看起来是坏的。
-    item.classList.toggle("dead", row.expired === true || (watchRows.has(code) && row.lastPrice == null));
-
-    const top = document.createElement("div");
-    top.className = "watch-top";
-    const name = document.createElement("span");
-    name.className = "watch-name";
-    name.textContent = watchName(row);
-    name.title = `${code}${row.mainSymbol ? " → " + row.mainSymbol : ""}`;
-    const remove = document.createElement("span");
-    remove.className = "watch-remove";
-    remove.textContent = "×";
-    remove.title = "移出自选";
-    remove.addEventListener("click", (event) => {
-      event.stopPropagation();
-      changeFavorite(code, false);
-    });
-    top.append(name, remove);
-
-    const bottom = document.createElement("div");
-    bottom.className = "watch-bottom";
+  list.replaceChildren();
+  // 按代码分类, 报价尚未加载或离线时分组也保持稳定。
+  const category = (code) => CRYPTO_SYMBOL.test(code) ? "crypto"
+    : /^(?:KQ\.[mi]@)?CFFEX\./.test(code) ? "financial" : "futures";
+  for (const [key, title] of [["futures", "商品期货"], ["financial", "金融期货"], ["crypto", "加密"]]) {
+    const codes = favorites.filter((code) => category(code) === key);
+    if (!codes.length) continue;
+    const group = document.createElement("li");
+    group.className = "watch-group";
+    const heading = document.createElement("h3");
+    heading.className = "watch-group-title";
     const label = document.createElement("span");
-    label.className = "watch-code";
-    // 加密合约的代码太长, 这一栏写交易所(币安 / OKX / 多所汇总)
-    label.textContent = row.venue || code.split("@").pop();
-    label.title = code;
-    const price = document.createElement("span");
-    price.textContent = FlowData.formatPrice(row.lastPrice, row.priceDecs);
-    const change = document.createElement("span");
-    const pct = row.changePct;
-    change.className = "watch-chg " + FlowData.changeClass(pct);
-    change.textContent = FlowData.formatChangePct(pct);
-    if (row.venue) change.title = "24 小时涨跌";
-    bottom.append(label, price, change);
-    item.append(top, bottom);
-
-    // 第三行: 当日成交量与成交额, 用来判断流动性。行情未就绪时不占位置。
-    const liquidity = FlowData.liquidityLabel(row);
-    if (liquidity) {
-      const flow = document.createElement("div");
-      flow.className = "watch-liquidity";
-      flow.textContent = liquidity;
-      item.append(flow);
-    }
-
-    item.addEventListener("click", () => switchSymbol(code));
-    list.appendChild(item);
+    label.textContent = title;
+    const count = document.createElement("span");
+    count.className = "watch-group-count";
+    count.textContent = String(codes.length);
+    heading.append(label, count);
+    const items = document.createElement("ul");
+    items.className = "watch-group-items";
+    items.setAttribute("aria-label", title);
+    codes.forEach((code) => items.appendChild(renderWatchItem(code)));
+    group.append(heading, items);
+    list.appendChild(group);
   }
   if (!favorites.length) setWatchHint("在「选择合约」菜单里点 ☆ 加入自选");
+}
+
+function renderWatchItem(code) {
+  const row = watchRows.get(code) || { symbol: code, name: code };
+  const item = document.createElement("li");
+  item.className = "watch-item";
+  item.classList.toggle("active", code === symbol);
+  // 只有「取过报价但没有数据」或已下市才变暗: 还没轮到第一次轮询的行不该看起来是坏的。
+  item.classList.toggle("dead", row.expired === true || (watchRows.has(code) && row.lastPrice == null));
+
+  const top = document.createElement("div");
+  top.className = "watch-top";
+  const name = document.createElement("span");
+  name.className = "watch-name";
+  name.textContent = watchName(row);
+  name.title = `${code}${row.mainSymbol ? " → " + row.mainSymbol : ""}`;
+  const remove = document.createElement("span");
+  remove.className = "watch-remove";
+  remove.textContent = "×";
+  remove.title = "移出自选";
+  remove.addEventListener("click", (event) => {
+    event.stopPropagation();
+    changeFavorite(code, false);
+  });
+  top.append(name, remove);
+
+  const bottom = document.createElement("div");
+  bottom.className = "watch-bottom";
+  const label = document.createElement("span");
+  label.className = "watch-code";
+  // 加密合约的代码太长, 这一栏写交易所(币安 / OKX / 多所汇总)
+  label.textContent = row.venue || code.split("@").pop();
+  label.title = code;
+  const price = document.createElement("span");
+  price.textContent = FlowData.formatPrice(row.lastPrice, row.priceDecs);
+  const change = document.createElement("span");
+  const pct = row.changePct;
+  change.className = "watch-chg " + FlowData.changeClass(pct);
+  change.textContent = FlowData.formatChangePct(pct);
+  if (row.venue) change.title = "24 小时涨跌";
+  bottom.append(label, price, change);
+  item.append(top, bottom);
+
+  // 第三行: 当日成交量与成交额, 用来判断流动性。行情未就绪时不占位置。
+  const liquidity = FlowData.liquidityLabel(row);
+  if (liquidity) {
+    const flow = document.createElement("div");
+    flow.className = "watch-liquidity";
+    flow.textContent = liquidity;
+    item.append(flow);
+  }
+
+  item.addEventListener("click", () => {
+    setWatchCollapsed(true);  // 先保存折叠状态, 切换合约重载后仍然隐藏。
+    switchSymbol(code);
+  });
+  return item;
 }
 
 function scheduleWatch(delay = WATCH_POLL_MS) {

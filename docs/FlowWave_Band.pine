@@ -1,0 +1,118 @@
+//@version=6
+// FlowScope 的 FlowWave 带；算法来源：static/indicators.js 的 deriveLw / deriveBand。
+// 用法：整份复制到 TradingView Pine 编辑器，保存并添加到图表。
+// 默认参数与项目一致；需使用相同品种、周期、OHLCV 和历史起点才可逐根对齐。
+// 默认第 41 根才形成通道，标准差为 0 时不画；未收盘 K 线随实时行情更新。
+// Pine 原生 plot/fill 的颜色交界与网页逐根半格绘制略有差别，不影响计算值。
+indicator("FlowScope · FlowWave 带", shorttitle = "FlowWave 带", overlay = true, max_bars_back = 500)
+
+// ---- 参数 ----
+int bandLength = input.int(21, "回归通道周期", minval = 2, maxval = 200, group = "价格通道")
+float bandK = input.float(2.0, "带宽 σ", options = [1.5, 2.0, 2.5], group = "价格通道")
+bool showMid = input.bool(false, "显示中线", group = "价格通道")
+
+int channelLength = input.int(9, "TCI 通道周期", minval = 1, maxval = 200, group = "FlowWave")
+int smoothLength = input.int(6, "TCI 平滑周期", minval = 1, maxval = 200, group = "FlowWave")
+int flowLength = input.int(3, "MFI / RSI 周期", minval = 1, maxval = 200, group = "FlowWave")
+int signalLength = input.int(6, "信号均线周期", minval = 1, maxval = 200, group = "FlowWave")
+int waveLength = input.int(21, "LSMA 周期（数据窗口）", minval = 2, maxval = 200, group = "FlowWave")
+float overbought = input.float(80.0, "超买阈值", group = "FlowWave")
+float oversold = input.float(20.0, "超卖阈值", group = "FlowWave")
+
+if oversold >= overbought
+    runtime.error("超卖阈值必须小于超买阈值。")
+
+// ---- 保留 FlowScope 的播种、缺失值和浮点计算顺序 ----
+// 窗口含 na 就输出 na，不向更早的数据寻找替代值；按从旧到新的顺序求和。
+f_sum(float source, int length) =>
+    float total = 0.0
+    for i = 0 to length - 1
+        total += source[length - 1 - i]
+    total
+
+// EMA 首个有效值播种；缺失当根输出 na，但保留上一有效值供之后续算。
+f_ema(float source, int length) =>
+    float alpha = 2.0 / (length + 1)
+    var float previous = na
+    if not na(source)
+        previous := na(previous) ? source : alpha * source + (1.0 - alpha) * previous
+    na(source) ? na : previous
+
+// RSI 的第一根变化记 0，前 length 根的均值用于 Wilder 播种。
+f_rma(float source, int length) =>
+    float seed = f_sum(source, length) / length
+    var float previous = na
+    if bar_index == length - 1
+        previous := seed
+    else if bar_index >= length
+        previous := (source + (length - 1) * previous) / length
+    previous
+
+// 等价于 ta.linreg(source, length, 0)，显式保留项目的计算次序。
+f_linreg(float source, int length) =>
+    float sx = length * (length - 1) / 2.0
+    float sxx = length * (length - 1) * (2 * length - 1) / 6.0
+    float sy = 0.0
+    float sxy = 0.0
+    for i = 0 to length - 1
+        float value = source[length - 1 - i]
+        sy += value
+        sxy += i * value
+    float slope = (length * sxy - sx * sy) / (length * sxx - sx * sx)
+    (sy - slope * sx) / length + slope * (length - 1)
+
+// ---- FlowWave 信号 ----
+float source = hlc3
+float esa = f_ema(source, channelLength)
+float deviation = source - esa
+float absDeviation = f_ema(math.abs(deviation), channelLength)
+float channelIndex = absDeviation == 0.0 ? na : deviation / (0.025 * absDeviation)
+float tci = f_ema(channelIndex, smoothLength) + 50.0
+
+float moneyFlow = source * nz(volume, 0.0)
+float positiveFlow = source > source[1] ? moneyFlow : 0.0
+float negativeFlow = source < source[1] ? moneyFlow : 0.0
+float positiveSum = f_sum(positiveFlow, flowLength)
+float negativeSum = f_sum(negativeFlow, flowLength)
+// 项目在负资金流为 0 时采用 1e10，包括成交量全为 0 的情形。
+float moneyRatio = negativeSum == 0.0 ? 1e10 : positiveSum / negativeSum
+float mfi = 100.0 - 100.0 / (1.0 + moneyRatio)
+
+float change = nz(source - source[1], 0.0)
+float avgUp = f_rma(math.max(change, 0.0), flowLength)
+float avgDown = f_rma(-math.min(change, 0.0), flowLength)
+float rsiValue = na(avgUp) or na(avgDown) or (avgUp == 0.0 and avgDown == 0.0) ? na : avgDown == 0.0 ? 100.0 : 100.0 - 100.0 / (1.0 + avgUp / avgDown)
+
+float wt1 = (tci + mfi + rsiValue) / 3.0
+float wt2 = f_sum(wt1, signalLength) / signalLength
+float wave = f_linreg(wt1, waveLength)
+
+// ---- 价格通道 ----
+// 每根残差使用当时的回归末点，不用当前一条回归直线回算整段历史。
+float mid = f_linreg(close, bandLength)
+float residual = close - mid
+float residualMean = f_sum(residual, bandLength) / bandLength
+float residualMeanSquare = f_sum(residual * residual, bandLength) / bandLength
+float sigma = math.sqrt(math.max(residualMeanSquare - residualMean * residualMean, 0.0))
+bool bandReady = not na(sigma) and sigma > 0.0
+float upper = bandReady ? mid + bandK * sigma : na
+float lower = bandReady ? mid - bandK * sigma : na
+int bandState = not bandReady or na(wt2) ? 0 : wt2 > overbought ? 1 : wt2 < oversold ? -1 : 0
+
+// ---- 绘图：中性淡轨，超买填上半带红色，超卖填下半带绿色 ----
+color quietColor = color.rgb(149, 152, 161, 72)
+color upperColor = color.rgb(242, 54, 69, 10)
+color lowerColor = color.rgb(0, 230, 118, 10)
+
+upperPlot = plot(upper, "上轨", color = quietColor, linewidth = 1, style = plot.style_linebr)
+lowerPlot = plot(lower, "下轨", color = quietColor, linewidth = 1, style = plot.style_linebr)
+midPlot = plot(bandReady ? mid : na, "中线", color = showMid ? color.rgb(149, 152, 161, 55) : na, linewidth = 1, style = plot.style_linebr, linestyle = plot.linestyle_dashed)
+plot(upper, "超买上轨", color = bandState == 1 ? upperColor : na, linewidth = 2, style = plot.style_linebr, display = display.pane)
+plot(lower, "超卖下轨", color = bandState == -1 ? lowerColor : na, linewidth = 2, style = plot.style_linebr, display = display.pane)
+fill(midPlot, upperPlot, color = bandState == 1 ? color.rgb(242, 54, 69, 84) : na, title = "超买上半带", fillgaps = false)
+fill(midPlot, lowerPlot, color = bandState == -1 ? color.rgb(0, 230, 118, 84) : na, title = "超卖下半带", fillgaps = false)
+
+// 振荡值仅在数据窗口显示，不参与主图价格轴缩放。CRVOL 不参与带的计算。
+plot(wave, "FlowWave LSMA", display = display.data_window)
+plot(wt2, "FlowWave 信号 wt2", display = display.data_window)
+plot(bandState, "带状态（1超买 / -1超卖 / 0中性）", display = display.data_window)
