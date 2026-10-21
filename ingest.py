@@ -23,6 +23,7 @@ import re
 import threading
 import time
 from collections.abc import Mapping, MutableMapping
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -57,8 +58,11 @@ JOB_REBUILD_SEC = 30.0
 # 没有行情流时(闭市、无订阅)每隔这么久做一次极短的连接自检。
 # 长连接被静默掐断时 tqsdk 不会报错, 只会让每个取新数据的调用各卡 30 秒 —— 必须主动探活。
 PROBE_INTERVAL_SEC = 60.0
+# 主力映射与行情流是否活跃无关: 无人看图、一直有 tick 时也要检查换月。
+MAIN_CONTRACT_CHECK_SEC = 60.0
 # 连接自检查的合约: 只要它在合约服务里存在即可(不订阅行情)。
 PROBE_SYMBOL = "KQ.m@SHFE.fu"
+MAIN_PREFIX = "KQ.m@"
 # 订阅失败不是永久状态: 冷却期结束后自动重订, 避免一次抖动或一次手误把合约锁死到进程重启。
 FAIL_RETRY_SEC = 30
 COMPUTE_RETRY_SEC = 1
@@ -137,6 +141,98 @@ def ensure_listed(api, symbol: str):
         raise UnknownSymbolError(f"合约 {symbol} 不存在, 请检查代码")
 
 
+def is_main(symbol: str) -> bool:
+    """主连(自动跟随主力月份的入口), 如 KQ.m@SHFE.fu。"""
+    return symbol.startswith(MAIN_PREFIX)
+
+
+def frame_records(frame) -> list[dict]:
+    """SDK 返回的 DataFrame(合约查询、K 线、交易日历) -> 行字典列表; 兼容测试里的普通列表。"""
+    if frame is None:
+        return []
+    if hasattr(frame, "to_dict"):
+        return frame.to_dict("records")
+    return list(frame)
+
+
+def main_contracts(api, symbols) -> tuple[dict[str, str], dict[str, str]]:
+    """已确认存在的主连 -> 当前实际月份, 以及解析不出的主连 -> 原因; 一个解析不出不耽误其它的。
+
+    不读取可能陈旧的 Quote 静态字段。
+    """
+    wanted = list(dict.fromkeys(symbol for symbol in symbols if is_main(symbol)))
+    if not wanted:
+        return {}, {}
+    with transient_queries(api):        # 每分钟核对一次
+        rows = frame_records(api.query_symbol_info(wanted))
+    by_symbol = {row.get("instrument_id"): row for row in rows}
+    found, errors = {}, {}
+    for symbol in wanted:
+        contract = str(by_symbol.get(symbol, {}).get("underlying_symbol") or "").strip()
+        if re.fullmatch(re.escape(symbol[len(MAIN_PREFIX):]) + r"\d{3,4}", contract) is None:
+            errors[symbol] = f"主力合约 {symbol} 的当前月份尚未就绪"
+        else:
+            found[symbol] = contract
+    return found, errors
+
+
+def data_contract(api, symbol: str) -> str:
+    """主力入口订阅实际月份的整段历史; 解析失败时不回退到拼接的主连。"""
+    ensure_listed(api, symbol)
+    if not is_main(symbol):
+        return symbol
+    found, errors = main_contracts(api, [symbol])
+    if symbol not in found:
+        raise RuntimeError(errors[symbol])
+    return found[symbol]
+
+
+class MainContracts:
+    """主连 -> 当前实际月份: 图表订阅、定期核对、自选面板、模拟交易、合约目录共用这一份,
+    换月时各处一起换。查询只在采集线程里做(调用方须已确认代码存在, 见 listed_symbols)。
+
+    MAIN_CONTRACT_CHECK_SEC 之内核对过的直接用; 过期的一次查完。查不到的沿用上一次的结果,
+    也记下这次尝试, 同样隔这么久再试 —— 采集循环每轮都调也不会变成每轮都查。
+    """
+
+    def __init__(self, ttl: float = MAIN_CONTRACT_CHECK_SEC):
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._known: dict[str, tuple[str, float]] = {}   # 主连 -> (月份, 查到它的时刻)
+        self._tried: dict[str, float] = {}               # 主连 -> 最近一次查询的时刻
+        self._errors: dict[str, str] = {}                # 主连 -> 最近一次没查到的原因
+
+    def resolve(self, api, symbols, refresh: bool = False) -> dict[str, str]:
+        """采集线程里调用: 主连 -> 当前月份(从没查到过的不在结果里); 非主连忽略。"""
+        now = time.monotonic()
+        wanted = [symbol for symbol in dict.fromkeys(symbols) if is_main(symbol)]
+        with self._lock:
+            stale = [symbol for symbol in wanted
+                     if refresh or now - self._tried.get(symbol, float("-inf")) >= self.ttl]
+        if stale:
+            try:
+                found, errors = main_contracts(api, stale)
+            except Exception as exc:
+                found, errors = {}, {symbol: f"{type(exc).__name__}: {exc}" for symbol in stale}
+            with self._lock:
+                self._tried.update(dict.fromkeys(stale, now))
+                self._known.update({symbol: (contract, now) for symbol, contract in found.items()})
+                for symbol in found:
+                    self._errors.pop(symbol, None)
+                self._errors.update(errors)
+        with self._lock:
+            return {symbol: self._known[symbol][0] for symbol in wanted if symbol in self._known}
+
+    def errors(self, symbols) -> dict[str, str]:
+        with self._lock:
+            return {symbol: self._errors[symbol] for symbol in symbols if symbol in self._errors}
+
+    def known(self) -> dict[str, tuple[str, float]]:
+        """任意线程可读: 主连 -> (月份, 查到它的时刻)。"""
+        with self._lock:
+            return dict(self._known)
+
+
 def validate_tf(tf) -> int:
     """主周期(秒) 校验; 非整数或不在可选集内时回落到默认周期。"""
     try:
@@ -180,6 +276,10 @@ class Feed:
 
     def __init__(self, symbol: str, tf: int = DEFAULT_TF_SEC):
         self.symbol = validate_symbol(symbol)
+        # symbol 保留自选/URL 的稳定标识; contract 决定 SDK 订阅与历史文件。
+        self.contract = self.symbol
+        # 主力换了月份、新月份的快照还没发出去: 发整份替换(见 _snapshot_message), 断线重连不算
+        self.rolled = False
         self.tf = validate_tf(tf)
         self.bar_ns = bar_ns_for(self.tf)
         self.klines = self.ticks = self.quote = None
@@ -223,14 +323,41 @@ class Feed:
         self.last_compute = 0.0
 
     def _new_large_detector(self):
-        """原生周期自带大额检测器; 合成周期与多所汇总没有自己的原始成交, 覆盖为 None。"""
-        return LargeTradeDetector(self.symbol)
+        """原生周期自带大额检测器; 合成周期与多所汇总没有自己的原始成交, 覆盖为 None。
+        按实际月份检测; 主连代码下写的门槛也作用于它(见 large_trades.settings_for)。"""
+        aliases = (self.symbol,) if self.symbol != self.contract else ()
+        return LargeTradeDetector(self.contract, aliases=aliases)
 
-    def subscribe(self, api: TqApi):
-        ensure_listed(api, self.symbol)   # 不存在的代码会让 get_quote 弄坏整条连接
-        self.quote = api.get_quote(self.symbol)
-        self.klines = api.get_kline_serial(self.symbol, self.tf, data_length=MAX_KLINES)
-        self.ticks = api.get_tick_serial(self.symbol, data_length=MAX_TICKS)
+    def _bind_contract(self, contract: str):
+        """换月时清掉旧月份的计算与快照缓存, 保留客户端需求、revision 和磁盘档案。"""
+        with self._state_lock:
+            if self.contract == contract:
+                return
+            self.rolled = self.contract != self.symbol     # 原来就在采某个月份: 这是换月
+            self.contract = contract
+            self.release_serials()
+            self.snapshots.clear()
+            self.footprint = None
+            self.ready.clear()
+            self.stores.clear()
+            self.latest.clear()
+            self.large_trades = self._new_large_detector()
+            self._large_synced = self._large_cache = self._large_seen = None
+            self._large_since = float("-inf")
+            self._record_state.clear()
+            self._tail_marks.clear()
+            self._klines_seen = None
+            self._computed_version = -1
+            if getattr(self, "is_rollup", False):
+                self._closed.clear()
+                self.base_revision = None
+
+    def subscribe(self, api: TqApi, contract: str | None = None):
+        """contract: FeedManager 已确认存在并解析好的实际合约(见 FeedManager._contract_for); 不给就现查。"""
+        self._bind_contract(contract or data_contract(api, self.symbol))
+        self.quote = api.get_quote(self.contract)
+        self.klines = api.get_kline_serial(self.contract, self.tf, data_length=MAX_KLINES)
+        self.ticks = api.get_tick_serial(self.contract, data_length=MAX_TICKS)
         self.analytics = TickAnalytics(self.bar_ns)
         self.lower_klines = {self.tf: self.klines}
         with self._state_lock:
@@ -267,7 +394,7 @@ class Feed:
         for ltf in wanted:
             if ltf not in self.lower_klines:
                 self.lower_klines[ltf] = api.get_kline_serial(
-                    self.symbol, ltf, data_length=min(10000, MAX_KLINES * self.tf // ltf + 1))
+                    self.contract, ltf, data_length=min(10000, MAX_KLINES * self.tf // ltf + 1))
 
     def request(self, ltf=None, footprint=False, demand=False):
         """登记数据需求; demand=True 表示来自页面/客户端的真实请求(参与闲置回收判定)。
@@ -342,7 +469,7 @@ class Feed:
 
     def _store(self, ltf):
         if ltf not in self.stores:
-            key = _csv_key(self.symbol)
+            key = _csv_key(self.contract)
             source = "" if ltf == 0 else "kline_"
             # 文件名带主周期: tf=30 时与历史文件名完全一致, 既有历史无缝沿用;
             # tf=10 是独立文件, 不与 30s 混流(bar 边界不同, 混读会毁掉 CVD)。
@@ -448,6 +575,7 @@ class Feed:
             self.error = None
             if snapshots:
                 self.ready.set()
+                self.rolled = False
         for message in messages:
             broadcast(message)
 
@@ -610,7 +738,7 @@ class Feed:
         prior = previous.get(ltf)
         kept, fresh = self._records(ltf, tail, prior)
         recs = kept + fresh
-        snapshot ={"symbol": self.symbol, "cfg": self.cfg(), "ltf": ltf,
+        snapshot ={"symbol": self.symbol, "contract": self.contract, "cfg": self.cfg(), "ltf": ltf,
                     "tf": self.tf,
                     "source": "tick" if ltf == 0 else "kline",
                     "revision": revision, "cvdBase": cvd_base,
@@ -621,7 +749,11 @@ class Feed:
         changed = [bar for bar in fresh if old.get(bar["time"]) != bar]
         cfg_changed = (prior or {}).get("cfg") != snapshot["cfg"]
         message = None
-        if changed or cfg_changed:
+        if prior is None and self.rolled:
+            # 换月后整张图替换, 不能按时间合并后留下新月份没有的旧 K 线。
+            # 断线重连后的第一份照常按时间合并: 整份替换会让页面清掉足迹、整张重画。
+            message = {"type": "snapshot", **snapshot}
+        elif changed or cfg_changed:
             message = {"type": "bars", "symbol": self.symbol, "ltf": ltf,
                        "tf": self.tf, "revision": revision, "bars": changed}
             if cfg_changed:
@@ -639,9 +771,9 @@ class FuturesRollupFeed(RollupMixin, Feed):
         super().__init__(symbol, tf)
         self._init_rollup(base_lookup, SNAPSHOT_BARS)
 
-    def subscribe(self, api: TqApi):
-        ensure_listed(api, self.symbol)
-        self.klines = api.get_kline_serial(self.symbol, self.tf, data_length=MAX_KLINES)
+    def subscribe(self, api: TqApi, contract: str | None = None):
+        self._bind_contract(contract or data_contract(api, self.symbol))
+        self.klines = api.get_kline_serial(self.contract, self.tf, data_length=MAX_KLINES)
         with self._state_lock:
             self.snapshots.clear()
             self.ready.clear()
@@ -651,7 +783,9 @@ class FuturesRollupFeed(RollupMixin, Feed):
             self._computed_version = -1
 
     def has_data(self) -> bool:
-        return self.klines is not None and len(self.klines) > 0
+        base = self.base()
+        return (self.klines is not None and len(self.klines) > 0
+                and base is not None and base.contract == self.contract)
 
     def data_changing(self, api) -> bool:
         """原生 K 线在变, 或底层 30s 又算了一轮(revision 前进)。"""
@@ -670,6 +804,23 @@ def _query_cache(api):
     data = getattr(api, "_data", None)
     cache = data.get("symbols") if isinstance(data, Mapping) else None
     return cache if isinstance(cache, MutableMapping) else None
+
+
+@contextmanager
+def transient_queries(api):
+    """这段里新发的合约查询用完就从连接缓存里删掉(见 _query_cache)。
+
+    query_symbol_info 每次都发新请求, 结果按请求留在长连接的缓存里(约 5KB 一条): 周期性的
+    查询(连接自检、主力核对、合约名、合约目录)不删, 内存就随连接寿命一直涨。query_quotes 的
+    过滤条件只有固定几组, 留在缓存里正好省掉往返(见 listed_symbols), 不要包进来。
+    """
+    before = set(_query_cache(api) or ())
+    try:
+        yield
+    finally:
+        cache = _query_cache(api)
+        for key in set(cache or ()) - before:
+            cache.pop(key, None)
 
 
 def feed_key(symbol: str, tf: int) -> tuple[str, int]:
@@ -719,6 +870,9 @@ class FeedManager:
         self._last_data_at = time.monotonic()
         self.last_probe_at = 0.0
         self.probe_error: str | None = None
+        # 主力映射(各处共用, 见 MainContracts); main_contract_error 是在采主连最近没核对上的原因
+        self.mains = MainContracts()
+        self.main_contract_error: str | None = None
         # 每轮 wait_update 之后在采集线程里调用的回调 fn(api)(模拟交易撮合挂单等)。
         # 回调只读已订阅的报价; 耗时同样计入 _busy_since, 卡住时连接自检照样能发现。
         self.loop_hooks: list = []
@@ -736,6 +890,12 @@ class FeedManager:
         if wait <= 0:
             return None
         return f"{reason}({wait:.0f} 秒后自动重试)"
+
+    def serves(self, symbol: str, tf: int, feed: Feed) -> bool:
+        """页面等快照期间这个 key 是否仍由 feed 供数: 固定月份可能改借同月份主力的 Feed(见 _retire),
+        借用的主力也可能换月或订阅失败而去掉别名(见 _drop_aliases); 不是了就要重新 ensure。"""
+        with self._lock:
+            return self.feeds.get(feed_key(symbol, tf)) is feed
 
     def start(self, loop: asyncio.AbstractEventLoop):
         self.loop = loop
@@ -838,6 +998,49 @@ class FeedManager:
         """行情流安静太久(闭市/无订阅)就该主动问一次连接还在不在。"""
         return (now - max(self._last_data_at, self.last_probe_at)) >= PROBE_INTERVAL_SEC
 
+    def _check_main_contracts(self, api):
+        """持续采集也定期核对主力(映射表到期才真的查, 见 MainContracts); 换月后重建连接,
+        释放旧月份订阅并重取整段历史。自选、模拟交易先查到的换月也在这里生效。"""
+        with self._lock:
+            feeds = [feed for feed in self._subscribed.values() if is_main(feed.symbol)]
+        if not feeds:
+            return
+        symbols = list(dict.fromkeys(feed.symbol for feed in feeds))
+        started = self._busy_since = time.monotonic()
+        try:
+            mains = self.mains.resolve(api, symbols)
+        finally:
+            self._busy_since = None
+        if time.monotonic() - started >= JOB_REBUILD_SEC:
+            self._rebuild_api.set()     # 一次往返慢到这个程度只会是连接已经不可用
+        # 某个主连没核对上只影响它自己(沿用上次的月份), 其它照常检查换月
+        errors = self.mains.errors(symbols)
+        self.main_contract_error = "; ".join(errors.values()) or None
+        changed = [feed for feed in feeds if feed.symbol in mains and feed.contract != mains[feed.symbol]]
+        if not changed:
+            return
+        changes = sorted({f"{feed.symbol}: {feed.contract} -> {mains[feed.symbol]}" for feed in changed})
+        with self._lock:
+            for feed in changed:
+                # 先换成新月份(清掉旧月份的缓存), 借用它的旧月份页面重连时才不会又借回来
+                feed._bind_contract(mains[feed.symbol])
+                self._drop_aliases(feed)
+                with feed._state_lock:
+                    feed.error = f"主力换月，正在切换到 {mains[feed.symbol]}"
+        self._rebuild_api.set()
+        print(f"[ingest] 主力换月，重建订阅: {', '.join(changes)}", flush=True)
+
+    def _contract_for(self, api, symbol: str) -> str:
+        """采集线程里调用: 订阅用的实际合约。先确认存在(见 listed_symbols); 主连用共用映射里的当前月份,
+        同一主连的几个周期一起重订时只查一次。"""
+        ensure_listed(api, symbol)
+        if not is_main(symbol):
+            return symbol
+        contract = self.mains.resolve(api, [symbol]).get(symbol)
+        if contract is None:
+            raise RuntimeError(self.mains.errors([symbol]).get(symbol) or f"主力合约 {symbol} 的当前月份尚未就绪")
+        return contract
+
     def _run_probe(self, api) -> bool:
         """极短的合约查询, 只用来确认连接还能收发; 失败即要求重建连接。
 
@@ -851,11 +1054,8 @@ class FeedManager:
         """
         self._busy_since = time.monotonic()
         try:
-            before = set(_query_cache(api) or ())
-            rows = api.query_symbol_info([PROBE_SYMBOL])
-            cache = _query_cache(api)
-            for key in set(cache or ()) - before:
-                cache.pop(key, None)
+            with transient_queries(api):
+                rows = api.query_symbol_info([PROBE_SYMBOL])
             if len(rows) != 1:
                 raise RuntimeError(f"自检合约 {PROBE_SYMBOL} 没有返回合约信息")
         except Exception as exc:
@@ -891,6 +1091,10 @@ class FeedManager:
         now = time.monotonic()
         with self._lock:
             feed = self.feeds.get(key)
+            if feed is None:
+                feed = self._main_peer(key)
+                if feed is not None:
+                    self.feeds[key] = feed
             if feed is not None:
                 feed.request(demand=True)
             self._prune(now)
@@ -898,8 +1102,9 @@ class FeedManager:
                 # 大周期的买卖量由同合约 30s 合成: 底层没在采集就一并建上, 名额要按两路算,
                 # 否则底层建好了大周期却建不了, 留下一路没人要的订阅
                 base_key = (key[0], ROLLUP_BASE_TF)
-                needed = 2 if is_rollup(key[1]) and base_key not in self.feeds else 1
-                if len(self.feeds) + needed > MAX_FEEDS:
+                needed = 2 if (is_rollup(key[1]) and base_key not in self.feeds
+                               and self._main_peer(base_key) is None) else 1
+                if len(self._feed_list()) + needed > MAX_FEEDS:
                     raise ValueError("订阅合约数量已达上限")
                 if is_rollup(key[1]):
                     self.ensure(*base_key)
@@ -910,14 +1115,77 @@ class FeedManager:
             return feed
 
     def _new_feed(self, key: tuple[str, int]) -> Feed:
+        """同一月份的各原生周期共用大额检测器, 在订阅好、知道实际月份之后接上(见 _run_api_attempt)。"""
         if not is_rollup(key[1]):
-            feed = Feed(*key)
-            peer = next((f for f in self.feeds.values() if f.symbol == key[0] and not is_rollup(f.tf)), None)
-            if peer is not None:
-                feed.large_trades = peer.large_trades
-            return feed
+            return Feed(*key)
         base_key = (key[0], ROLLUP_BASE_TF)
         return FuturesRollupFeed(key[0], key[1], lambda: self.feeds.get(base_key))
+
+    # 同一月份同一周期默认只采集、落盘一份: 固定月份的 key 指向同月份主力 Feed(别名), 推送时换回页面代码。
+    # 大额门槛不同则分别计算, 历史文件按已有记录去重。主力换月或订阅失败时去掉别名, 固定月份另建自己的。
+
+    def _feed_list(self) -> list[Feed]:
+        """必须持有 self._lock。self.feeds 里各不相同的 Feed(别名只算一个)。"""
+        return list({id(feed): feed for feed in self.feeds.values()}.values())
+
+    def _keys_of(self, feed: Feed) -> list[tuple[str, int]]:
+        """必须持有 self._lock。指向 feed 的全部 key: 它自己的, 加上借用它的固定月份。"""
+        return [key for key, value in self.feeds.items() if value is feed]
+
+    def _main_peer(self, key: tuple[str, int]) -> Feed | None:
+        """必须持有 self._lock。同周期、同月份且大额门槛相同的主力 Feed, 没有为 None。"""
+        symbol, tf = key
+        if is_main(symbol):
+            return None
+        peer = next((feed for feed in self.feeds.values()
+                     if is_main(feed.symbol) and feed.tf == tf and feed.contract == symbol
+                     and feed_key(feed.symbol, feed.tf) not in self.failed_feeds), None)
+        if peer is None:
+            return None
+        sources = peer.large_sources()
+        wanted = LargeTradeDetector(symbol).settings
+        return peer if sources and all(source.settings == wanted for source in sources) else None
+
+    def _drop_aliases(self, feed: Feed, keep=()):
+        """必须持有 self._lock。去掉借用 feed 的固定月份(keep 除外), 让这些页面重连; 常驻的、大周期还在用的
+        30s 底层下一轮另建(见 _ensure_pinned)。"""
+        own = feed_key(feed.symbol, feed.tf)
+        dropped = {key for key in self._keys_of(feed) if key != own and key not in keep}
+        for key in dropped:
+            del self.feeds[key]
+        self._resync(dropped)
+
+    def _retire(self, feed: Feed):
+        """必须持有 self._lock。固定月份的 Feed 让位给同月份的主力 Feed, 不再采集。
+        行情序列在同一连接上与主力是同一份(TqSdk 按合约复用), 不必重建连接。"""
+        key = feed_key(feed.symbol, feed.tf)
+        self._subscribed.pop(key, None)
+        self.failed_feeds.pop(key, None)
+
+    def _adopt(self, feed: Feed):
+        """必须持有 self._lock。主力 Feed 刚订阅好(当前月份已知): 去掉不再是当前月份的别名;
+        同月份已有一份固定月份的 Feed 时把它的 key 指过来, 页面重连后由主力供数。"""
+        if not is_main(feed.symbol):
+            return
+        key = (feed.contract, feed.tf)
+        self._drop_aliases(feed, keep={key})
+        other = self.feeds.get(key)
+        if other is not None and other is not feed and self._main_peer(key) is feed:
+            self._retire(other)
+            self.feeds[key] = feed
+            self._resync({key})
+
+    def _resync(self, keys):
+        """必须持有 self._lock。这些 key 上的页面改由另一个 Feed 供数: 让它们重连、重取快照。"""
+        if keys and self.loop is not None:
+            self.loop.call_soon_threadsafe(self._resync_clients, set(keys))
+
+    def _resync_clients(self, keys):
+        with self._lock:
+            clients = [(q, subscription) for q, subscription in self.clients.items()
+                       if subscription[:2] in keys]
+        for q, subscription in clients:
+            self._send_resync(q, subscription)
 
     def set_pinned(self, keys) -> list[tuple[str, int]]:
         """设置常驻采集集合: 关掉所有页面也照常订阅、计算并落盘。
@@ -929,7 +1197,18 @@ class FeedManager:
         ordered = list(dict.fromkeys(feed_key(validate_symbol(symbol), tf) for symbol, tf in keys
                                      if not is_rollup(tf)))
         with self._lock:
-            pinned = ordered[:MAX_PINNED_FEEDS]
+            # 固定月份正是某个主力当前的月份时两者共用一个 Feed(见 _main_peer), 只占一个名额
+            shared = {(feed.contract, feed.tf): feed_key(feed.symbol, feed.tf) for feed in self._feed_list()
+                      if is_main(feed.symbol) and feed.contract != feed.symbol
+                      and self._main_peer((feed.contract, feed.tf)) is feed}
+            pinned, skipped, slots = [], [], set()
+            for key in ordered:
+                slot = shared.get(key, key)
+                if slot in slots or len(slots) < MAX_PINNED_FEEDS:
+                    slots.add(slot)
+                    pinned.append(key)
+                else:
+                    skipped.append(key)
             # 常驻期间没人看图时闲置时长从创建起算, 早已超过回收期; 不重新计时, 下一轮就会
             # 被回收, 而回收已订阅的 Feed 要重建整条连接, 所有图表一起断几秒。
             for key in set(self.pinned) - set(pinned):
@@ -937,15 +1216,22 @@ class FeedManager:
                 if feed is not None:
                     feed.request(demand=True)
             self.pinned = pinned
-            self.pin_skipped = ordered[MAX_PINNED_FEEDS:]
+            self.pin_skipped = skipped
             self._ensure_pinned()
             return list(self.pinned)
 
     def _ensure_pinned(self):
-        """补建缺失的常驻 Feed; 池子满时留到页面 Feed 回收后的下一轮。"""
+        """补建缺失的常驻 Feed, 以及大周期还在用、却没了的 30s 底层(借用的主力换月或订阅失败时别名被去掉,
+        大周期的页面不会因此重连, 没人补就再也合成不出来); 池子满时留到页面 Feed 回收后的下一轮。"""
         with self._lock:
-            for key in self.pinned:
-                if key not in self.feeds and len(self.feeds) < MAX_FEEDS:
+            bases = [(feed.symbol, ROLLUP_BASE_TF) for feed in self._feed_list() if getattr(feed, "is_rollup", False)]
+            for key in dict.fromkeys([*self.pinned, *bases]):
+                if key in self.feeds:
+                    continue
+                peer = self._main_peer(key)
+                if peer is not None:
+                    self.feeds[key] = peer
+                elif len(self._feed_list()) < MAX_FEEDS:
                     self.feeds[key] = self._new_feed(key)
 
     def fail_feed(self, feed: Feed, message: str, now=None):
@@ -960,13 +1246,18 @@ class FeedManager:
                 feed.retry_at = now + FAIL_RETRY_SEC
             self.failed_feeds[key] = {"reason": message, "retry_at": now + FAIL_RETRY_SEC}
             self._subscribed.pop(key, None)
+            # 借用它的固定月份不跟着主力一起等冷却: 让它们另建自己的 Feed
+            self._drop_aliases(feed)
 
     def status_snapshot(self) -> dict:
         now = time.monotonic()
         with self._lock:
             busy = None if self._busy_since is None else round(now - self._busy_since, 1)
             return {"status": self.status, "lastError": self.last_error,
-                    "feeds": sorted(feed_label(key) for key in self.feeds),
+                    "feeds": sorted(feed_label(feed_key(feed.symbol, feed.tf)) for feed in self._feed_list()),
+                    # 借用主力 Feed 的固定月份: 别名 -> 实际供数的 Feed
+                    "aliases": {feed_label(key): feed_label(feed_key(feed.symbol, feed.tf))
+                                for key, feed in self.feeds.items() if key != feed_key(feed.symbol, feed.tf)},
                     "failedFeeds": {feed_label(k): v["reason"]
                                     for k, v in self.failed_feeds.items()},
                     # 常驻采集集合; collectSkipped 是超出名额、只在页面打开时才采集的部分
@@ -977,7 +1268,10 @@ class FeedManager:
                     "busySec": busy,
                     "quietSec": round(now - self._last_data_at, 1),
                     "lastProbeSec": round(now - self.last_probe_at, 1) if self.last_probe_at else None,
-                    "probeError": self.probe_error}
+                    "probeError": self.probe_error,
+                    "mainContracts": {feed.symbol: feed.contract for feed in self._subscribed.values()
+                                      if is_main(feed.symbol)},
+                    "mainContractError": self.main_contract_error}
 
     def _prune(self, now=None):
         """回收无人再要的 Feed, 否则 MAX_FEEDS 只增不减, 反复试错合约就会占满池子。
@@ -989,23 +1283,28 @@ class FeedManager:
         now = time.monotonic() if now is None else now
         with self._lock:
             busy = {key[:2] for key in self.clients.values()} | set(self.pinned)
-            idle = {key: feed.idle_for(now) for key, feed in self.feeds.items()
-                    if key not in busy and not feed.has_demand(now)}
-            expired = {key for key, seconds in idle.items() if seconds >= IDLE_EVICT_SEC}
+            # 按 Feed 判定: 主力和借用它的固定月份有一个还在用, 就整个留着
+            owned = {}
+            for key, feed in self.feeds.items():
+                owned.setdefault(feed, []).append(key)
+            idle = {feed: feed.idle_for(now) for feed, keys in owned.items()
+                    if busy.isdisjoint(keys) and not feed.has_demand(now)}
+            expired = {feed for feed, seconds in idle.items() if seconds >= IDLE_EVICT_SEC}
             due = self._without_kept_bases(expired)
             # 先排除留下的底层再判断: 否则一路被留下的底层每轮都会让其它订阅提前回收
-            if any(self.feeds[key] in self._sdk_feeds for key in due):
-                soon = {key for key, seconds in idle.items()
-                        if seconds >= IDLE_EVICT_SEC - EVICT_BATCH_SEC and self.feeds[key] in self._sdk_feeds}
+            if any(feed in self._sdk_feeds for feed in due):
+                soon = {feed for feed, seconds in idle.items()
+                        if seconds >= IDLE_EVICT_SEC - EVICT_BATCH_SEC and feed in self._sdk_feeds}
                 due = self._without_kept_bases(expired | soon)
-            for key in due:
-                self._forget(key)
+            for feed in due:
+                for key in owned[feed]:
+                    self._forget(key)
 
-    def _without_kept_bases(self, keys):
+    def _without_kept_bases(self, feeds):
         """必须持有 self._lock。大周期还留着, 它的 30s 底层就不能回收(只开着 WS 时底层收不到真实请求);
         与大周期同一轮回收的底层照常一起回收, 合并成一次连接重建。"""
-        kept = {(symbol, ROLLUP_BASE_TF) for symbol, tf in self.feeds if is_rollup(tf) and (symbol, tf) not in keys}
-        return {key for key in keys if key not in kept}
+        kept = {feed.base() for feed in self._feed_list() if getattr(feed, "is_rollup", False) and feed not in feeds}
+        return {feed for feed in feeds if feed not in kept}
 
     def _forget(self, key: tuple[str, int]):
         """必须在持有 self._lock 时调用。"""
@@ -1026,22 +1325,31 @@ class FeedManager:
             self.loop.call_soon_threadsafe(self._fanout, msg)
 
     def _fanout(self, msg: dict):
+        origin = (msg.get("symbol"), msg.get("tf"))
         with self._lock:
-            clients = list(self.clients.items())
-        for q, subscription in clients:
+            source = self.feeds.get(origin)
+            clients = [(q, subscription, self.feeds.get(subscription[:2]))
+                       for q, subscription in self.clients.items()]
+        for q, subscription, target in clients:
+            # 按 Feed 认订阅: 借用主力 Feed 的固定月份也收得到, 代码换回页面自己的(见 _main_peer)
+            if (target is not source) if source is not None else origin != subscription[:2]:
+                continue
             if msg.get("type") in {"footprints", "footprint_snapshot"}:
-                if (msg.get("symbol"), msg.get("tf")) != subscription[:2] or not subscription[3]:
+                if not subscription[3]:
                     continue
-            elif (msg.get("symbol"), msg.get("tf"), msg.get("ltf")) != subscription[:3]:
+            elif msg.get("ltf") != subscription[2]:
                 continue
             try:
-                q.put_nowait(msg)
+                q.put_nowait(msg if subscription[0] == origin[0] else {**msg, "symbol": subscription[0]})
             except asyncio.QueueFull:
-                # 不能静默移除后继续心跳。通知 WS 关闭，让客户端重连并重取快照。
-                self.remove_client(q)
-                while not q.empty():
-                    q.get_nowait()
-                q.put_nowait({"type": "resync", "symbol": subscription[0], "tf": subscription[1]})
+                self._send_resync(q, subscription)
+
+    def _send_resync(self, q: asyncio.Queue, subscription):
+        """不能静默移除后继续心跳。通知 WS 关闭，让客户端重连并重取快照。"""
+        self.remove_client(q)
+        while not q.empty():
+            q.get_nowait()
+        q.put_nowait({"type": "resync", "symbol": subscription[0], "tf": subscription[1]})
 
     def _run(self):
         backoff = 1
@@ -1096,13 +1404,20 @@ class FeedManager:
             if (self.feeds.get(key) is not feed or self._rebuild_api.is_set()
                     or self._subscribed.get(key) is feed):
                 return False
+            peer = self._main_peer(key)
+            if peer is not None:
+                # 主力已经在采这个月份: 借用它, 不再单独订阅
+                self._retire(feed)
+                self.feeds[key] = peer
+                self._resync({key})
+                return False
             entry = self.failed_feeds.get(key)
             if entry is not None and time.monotonic() < entry["retry_at"]:
                 return False
             # 必须在调用 SDK 前标记，部分订阅失败也可能留下 SDK 缓存。
             self._sdk_feeds.add(feed)
         try:
-            feed.subscribe(api)
+            feed.subscribe(api, self._contract_for(api, feed.symbol))
         except UnknownSymbolError as exc:
             # 代码不存在不是网络抖动, 但也可能是合约服务刚好没数据: 仍按冷却期重试,
             # 这一步只查合约服务的过滤查询, 不会拖住连接。
@@ -1119,15 +1434,25 @@ class FeedManager:
             if self.feeds.get(key) is not feed:
                 self._rebuild_api.set()
                 return False
+            if not getattr(feed, "is_rollup", False):
+                # 同一实际月份可以从主力入口或固定月份进入, 多周期共用大额检测器。主连代码另配了门槛时
+                # 两边门槛不同, 各用各的: 否则谁先订阅就用谁的门槛, 主连的配置会被固定月份盖掉。
+                peer = next((other for other in self.feeds.values()
+                             if other is not feed and not getattr(other, "is_rollup", False)
+                             and other.contract == feed.contract
+                             and other.large_trades.settings == feed.large_trades.settings), None)
+                if peer is not None:
+                    feed.large_trades = peer.large_trades
             self._subscribed[key] = feed
             self.failed_feeds.pop(key, None)
+            self._adopt(feed)
         return True
 
     def _sweep_subscriptions(self, api):
         """唯一的重试入口：每轮检查未订阅实例与冷却时间，无须页面请求或异步定时器。"""
         with self._lock:
-            pending = [feed for key, feed in self.feeds.items()
-                       if self._subscribed.get(key) is not feed]
+            pending = [feed for feed in self._feed_list()
+                       if self._subscribed.get(feed_key(feed.symbol, feed.tf)) is not feed]
         for feed in pending:
             if self._stop.is_set() or self._rebuild_api.is_set():
                 break
@@ -1157,6 +1482,9 @@ class FeedManager:
             self._run_jobs(api)
             if self._rebuild_api.is_set():
                 return True
+            self._check_main_contracts(api)
+            if self._rebuild_api.is_set():
+                return True
             if self._stop.is_set():
                 break
             # 行情流安静太久就主动探一次活: 被静默掐断的连接不会报错, 只会让之后每个取新
@@ -1171,17 +1499,16 @@ class FeedManager:
                 return True
             with self._lock:
                 # 大周期排在最后: 它由同合约 30s 合成, 要用到 30s 本轮刚算出的窗口
-                feeds = sorted(self.feeds.values(), key=lambda f: getattr(f, "is_rollup", False))
-                clients = list(self.clients.values())
-            by_key = {feed_key(f.symbol, f.tf): f for f in feeds}
-            for symbol, tf, ltf, footprint in clients:
-                feed = by_key.get((symbol, tf))
+                feeds = sorted(self._feed_list(), key=lambda f: getattr(f, "is_rollup", False))
+                # 按 key 找 Feed: 借用主力 Feed 的固定月份页面也要登记它的拆分粒度与足迹
+                clients = [(self.feeds.get((symbol, tf)), ltf, footprint)
+                           for symbol, tf, ltf, footprint in self.clients.values()]
+            for feed, ltf, footprint in clients:
                 if feed is not None:
                     feed.request(ltf=ltf, footprint=footprint, demand=False)
-            watched = {(symbol, tf) for symbol, tf, _, _ in clients}
+            watched = {feed for feed, _, _ in clients if feed is not None}
             # 看着大周期, 也就是看着合成它的 30s: 30s 要跟着每笔算, 大周期才每笔都更新
-            watched |= {(feed.symbol, ROLLUP_BASE_TF) for feed in feeds
-                        if getattr(feed, "is_rollup", False) and feed_key(feed.symbol, feed.tf) in watched}
+            watched |= {feed.base() for feed in feeds if getattr(feed, "is_rollup", False) and feed in watched}
             for feed in feeds:
                 if self._stop.is_set() or self._rebuild_api.is_set():
                     break
@@ -1203,7 +1530,7 @@ class FeedManager:
                         self._last_data_at = now
                         feed.pending = True
                     # 没人看的攒一攒再算(is_changing 只管这一轮, 所以记着 pending); 新需求、出过错的马上算
-                    due = feed.pending and (feed_key(feed.symbol, feed.tf) in watched
+                    due = feed.pending and (feed in watched
                                             or now - feed.last_compute >= IDLE_RECOMPUTE_SEC)
                     if stale or due:
                         feed.recompute(self.broadcast)

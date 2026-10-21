@@ -1,4 +1,4 @@
-"""加密永续模拟交易: 五档撮合、数量规则、限价穿价、杠杆与保证金、反手、资金费、强平、止盈止损, 以及 app 分流。"""
+"""加密永续模拟交易: 深度撮合、数量规则、限价穿价、杠杆与保证金、反手、资金费、强平、止盈止损, 以及 app 分流。"""
 import asyncio
 import json
 import os
@@ -50,7 +50,7 @@ class BookTests(unittest.TestCase):
         self.assertEqual(book.trades[-1]["liquidity"], "taker")
 
     def test_market_order_needs_depth_and_a_fresh_book(self):
-        with self.assertRaisesRegex(OrderError, "五档"):
+        with self.assertRaisesRegex(OrderError, "盘口深度不足"):
             CryptoBook().place(order("buy", 5.0), make_quote(), NOW)
         with self.assertRaisesRegex(OrderError, "盘口"):
             CryptoBook().place(order("buy", 1.0), make_quote(fresh=False), NOW)
@@ -207,7 +207,7 @@ class BookTests(unittest.TestCase):
         self.assertEqual(book.summary()["positions"][0]["sl"], 99.0)
         thin = make_quote(last=99.0, bids=((98.9, 0.5),))
         self.assertEqual(book.trigger_stops({BTC.symbol: thin}, NOW), [])
-        self.assertIn("五档", book.stop_errors[BTC.symbol])                # 吃不够, 下一轮再试
+        self.assertIn("盘口深度不足", book.stop_errors[BTC.symbol])         # 吃不够, 下一轮再试
         placed = book.trigger_stops({BTC.symbol: make_quote(last=99.0, bids=((98.9, 1.0), (98.8, 2.0)))}, NOW)
         self.assertEqual([(item["side"], item["qty"], item["reason"]) for item in placed], [("sell", 2.0, "止损")])
         self.assertAlmostEqual(placed[0]["fillPrice"], 98.85)
@@ -239,8 +239,8 @@ class BookTests(unittest.TestCase):
         self.assertEqual((placed["status"], placed["price"]), ("open", 100.5))
         self.assertFalse(book.match({BTC.symbol: make_quote(last=100.4)}, NOW))
         thin = make_quote(last=100.5, asks=((100.6, 1.0),))
-        self.assertFalse(book.match({BTC.symbol: thin}, NOW))                 # 吃不够五档: 留着重试
-        self.assertIn("五档", placed["reason"])
+        self.assertFalse(book.match({BTC.symbol: thin}, NOW))                 # 深度不够: 留着重试
+        self.assertIn("盘口深度不足", placed["reason"])
         self.assertTrue(book.match({BTC.symbol: make_quote(last=100.5, asks=((100.6, 1.0), (100.8, 1.0)))}, NOW))
         self.assertAlmostEqual(placed["fillPrice"], 100.7)
         self.assertEqual((placed["reason"], book.trades[-1]["liquidity"]), ("", "taker"))
@@ -310,12 +310,63 @@ class MarginOrderTests(unittest.TestCase):
 
     def test_margin_still_requires_fresh_and_sufficient_depth(self):
         for quote, margin, message in ((make_quote(fresh=False), 20, "盘口"),
-                                       (make_quote(), 40, "五档"),
-                                       (make_quote(asks=()), 20, "五档")):
+                                       (make_quote(), 40, "盘口深度不足"),
+                                       (make_quote(asks=()), 20, "盘口深度不足")):
             with self.subTest(margin=margin, quote=quote), self.assertRaisesRegex(OrderError, message):
                 book = CryptoBook()
                 book.place(self.request(margin), quote, NOW)
             self.assertEqual((book.orders, book.positions, book.cash), ([], {}, 10000))
+
+    def test_depth_beyond_five_levels_fills_without_repeated_clicks(self):
+        bids = [(100 - i * 0.1, 0.1) for i in range(20)]
+        asks = [(100.1 + i * 0.1, 0.1) for i in range(20)]
+        for side in ("buy", "sell"):
+            with self.subTest(side=side):
+                book = CryptoBook()
+                request = self.request(10, side, clientId=f"deep-{side}")
+                with self.assertRaisesRegex(OrderError, "盘口深度不足"):
+                    book.place(request, make_quote(bids=bids[:5], asks=asks[:5]), NOW)
+                self.assertEqual((book.orders, book.positions, book.cash), ([], {}, 10000))
+                deep = make_quote(bids=bids, asks=asks)
+                filled = book.place(request, deep, NOW + 100)
+                self.assertEqual(filled["status"], "filled")
+                self.assertGreater(filled["qty"], 0.5)       # 实际用到了第五档之后
+                self.assertLessEqual(filled["qty"] * filled["fillPrice"], 100)
+                self.assertIs(book.place(request, deep, NOW + 200), filled)
+                self.assertEqual(len(book.trades), 1)
+
+    def test_depth_error_reports_leveraged_notional_and_the_correct_side(self):
+        for side, label, available in (("buy", "卖盘", "300.50"), ("sell", "买盘", "299.80")):
+            with self.subTest(side=side):
+                book = CryptoBook()
+                book.set_leverage(BTC.symbol, 20, 125)
+                with self.assertRaises(OrderError) as raised:
+                    book.place(self.request(20, side), make_quote(), NOW)
+                self.assertIn("本单需 400.00 USDT", str(raised.exception))
+                self.assertIn(f"当前{label} 2 档可承接 {available} USDT", str(raised.exception))
+                self.assertIn("减少保证金金额", str(raised.exception))
+                self.assertEqual((book.orders, book.positions, book.cash), ([], {}, 10000))
+
+    def test_depth_error_writes_quantities_in_full_at_the_step_precision(self):
+        coin = replace(BTC, base="DOGE", step_size=1.0, min_qty=1.0)
+        quote = make_quote(asks=((0.2, 1_000_000.0), (0.21, 234_567.0)), instrument=coin)
+        with self.assertRaises(OrderError) as raised:
+            CryptoBook().place({**order("buy", 2_000_000.0), "symbol": coin.symbol}, quote, NOW)
+        self.assertIn("本单需 2,000,000 DOGE", str(raised.exception))
+        self.assertIn("可承接 1,234,567 DOGE", str(raised.exception))
+        quote = make_quote(asks=((100.1, 1000.0), (100.2, 234.5)))
+        with self.assertRaises(OrderError) as raised:
+            CryptoBook().place(order("buy", 1234.567), quote, NOW)
+        self.assertIn("本单需 1,234.567 BTC", str(raised.exception))
+        self.assertIn("可承接 1,234.500 BTC", str(raised.exception))
+
+    def test_invalidated_depth_cannot_fill_even_with_a_recent_receive_time(self):
+        raw = {"book": {"bids": [[100, 100]], "asks": [[100.1, 100]], "received": time.time(),
+                        "valid": False, "reason": "盘口连接中断，正在重新同步"}}
+        quote = quote_snapshot(BTC.symbol, BTC, raw, time.time())
+        self.assertFalse(quote["open"])
+        with self.assertRaisesRegex(OrderError, "重新同步"):
+            CryptoBook().place(self.request(20), quote, NOW)
 
     def test_minimum_quantity_notional_and_maximum_notional_are_enforced(self):
         quote = make_quote(instrument=replace(BTC, min_notional=5))
@@ -398,6 +449,16 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(state["quote"]["ask"], 100.1)
         self.assertIn((BTC.symbol, ("book", "mark", "ticker")), self.crypto.touched)
 
+    def test_panel_state_carries_five_levels_while_orders_sweep_the_full_depth(self):
+        self.crypto.raw["book"]["bids"] = [[100.0 - i * 0.1, 0.1] for i in range(400)]
+        self.crypto.raw["book"]["asks"] = [[100.1 + i * 0.1, 0.1] for i in range(400)]
+        quote = self.service.state(BTC.symbol)["quote"]
+        self.assertEqual((len(quote["bids"]), len(quote["asks"])), (5, 5))
+        self.assertEqual((quote["bid"], quote["ask"]), (100.0, 100.1))
+        placed = self.service.place(order("buy", 2.0))
+        self.assertEqual(placed["status"], "filled")              # 吃到了第五档之后
+        self.assertEqual(len(self.crypto.raw["book"]["asks"]), 400)
+
     def test_margin_orders_use_aggregate_leverage_and_persist_resolved_quantity(self):
         self.service.set_leverage("AGG.BTC", 20)
         placed = self.service.place({"symbol": "AGG.BTC", "side": "buy", "margin": 10.01})
@@ -474,7 +535,7 @@ class ServiceTests(unittest.TestCase):
             self.service.place(order("buy", 1.0) | {"symbol": "AGG.UNKNOWN"})
         with self.assertRaisesRegex(OrderError, "整数倍"):
             self.service.place(order("buy", 0.0015) | {"symbol": "AGG.BTC"})
-        with self.assertRaisesRegex(OrderError, "五档"):
+        with self.assertRaisesRegex(OrderError, "盘口深度不足"):
             self.service.place(order("buy", 6.0) | {"symbol": "AGG.BTC"})
         self.crypto.raw["book"]["received"] = time.time() - 60
         self.assertFalse(self.service.state("AGG.BTC")["quote"]["open"])

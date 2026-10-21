@@ -61,11 +61,12 @@ def _overrides(text):
     return value
 
 
-def settings_for(symbol, source):
+def settings_for(symbol, source, aliases=()):
+    """aliases: 正在采集这个合约的主连(KQ.m@SHFE.fu), 主连代码的覆盖作用于它当前的月份。"""
     settings = default_settings(source, symbol)
-    # 依次按 '*'(全部合约)、品种(SHFE.fu)、完整合约代码覆盖; 非法配置明确报错。留空等于不覆盖。
+    # 依次按 '*'(全部合约)、品种(SHFE.fu)、主连代码、完整合约代码覆盖; 非法配置明确报错。留空等于不覆盖。
     overrides = _overrides(os.getenv("LARGE_TRADE_SETTINGS", "").strip() or "{}")
-    for key in dict.fromkeys(("*", product_of(symbol), symbol)):
+    for key in dict.fromkeys(("*", product_of(symbol), *aliases, symbol)):
         settings.update({k: v for k, v in overrides.get(key, {}).items() if k in settings})
     for key in ("windowSec", "lagSec", "warmup", "quantile", "minQty", "minNotional"):
         value = settings[key]
@@ -88,10 +89,10 @@ def settings_for(symbol, source):
 _warned = set()
 
 
-def _settings_or_default(symbol, source):
+def _settings_or_default(symbol, source, aliases=()):
     """可选配置写错只让该合约退回默认门槛并提示一次, 不能让建 Feed 失败、拖垮整条采集。"""
     try:
-        return settings_for(symbol, source)
+        return settings_for(symbol, source, aliases)
     except ValueError as exc:
         if str(exc) not in _warned:
             _warned.add(str(exc))
@@ -191,10 +192,10 @@ class _EventLayer:
 
 
 class LargeTradeDetector(_EventLayer):
-    def __init__(self, symbol, source="snapshot", settings=None):
+    def __init__(self, symbol, source="snapshot", settings=None, aliases=()):
         self.symbol, self.source = symbol, source
         super().__init__(self)
-        self.settings = _settings_or_default(symbol, source) if settings is None else settings
+        self.settings = _settings_or_default(symbol, source, aliases) if settings is None else settings
         # key -> (时间ns, 价格, 量, 方向, 重置基线, 可用, 与上一条之间没丢数据)
         self.raw = {}
         self.readiness = {}    # key -> (时间ns, 已判定, 与上一条之间没丢数据); 随 raw 裁剪

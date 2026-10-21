@@ -23,6 +23,7 @@ from crypto_backfill import DAY_MS, LARGE_HISTORY_MS, Backfiller, FetchError, No
 from crypto_feed import (CandleStore, Channel, CryptoFeed, CryptoManager, Instrument, TradeBars,
                          aggregate_trades)
 from indicator import NATIVE_TFS, TZ_SHIFT_S, ltf_options
+import okx_feed
 from okx_feed import OkxAdapter
 
 DAY0 = 1_790_985_600_000            # 2026-10-03 00:00 UTC
@@ -668,6 +669,71 @@ class ChannelTests(unittest.TestCase):
             with self.assertRaises(ConnectionError):
                 channel._pump(FakeSocket([]), frozenset({"X@trade"}))
 
+    def test_okx_sequence_gap_resyncs_that_book_on_the_same_connection(self):
+        _, public = OkxAdapter().channels
+        topics = frozenset({public.topic("book", "BTC-USDT-SWAP")})
+        snapshot = okx_book_message("snapshot", -1, 10, bids=[["100", "100"]], asks=[["101", "100"]])
+        gap = okx_book_message("update", 11, 12, bids=[["100", "200"]])
+        late = okx_book_message("update", 12, 13, bids=[["100", "300"]])
+        fresh = okx_book_message("snapshot", -1, 20, bids=[["99", "100"]], asks=[["101", "100"]])
+        socket = FakeSocket([snapshot, gap, late, fresh])
+        wanted, events = {"topics": topics}, []
+
+        def emit(event):
+            events.append(event)
+            if len(events) == 3:
+                wanted["topics"] = frozenset()
+
+        channel = Channel("OKX.public", public, lambda: wanted["topics"], emit, lambda _: socket)
+        public.subscribe_messages(topics)
+        channel._pump(socket, topics)                       # 不抛 ConnectionError: 不断开整条连接
+        self.assertEqual([event[2]["valid"] for event in events], [True, False, True])
+        self.assertIn("重新同步", events[1][2]["reason"])
+        self.assertEqual(events[1][2]["bids"], [])
+        self.assertEqual(events[2][2]["bids"], [[99.0, 1.0]])
+        self.assertEqual([(json.loads(m)["op"], json.loads(m)["args"]) for m in socket.sent],
+                         [("unsubscribe", [{"channel": "books", "instId": "BTC-USDT-SWAP"}]),
+                          ("subscribe", [{"channel": "books", "instId": "BTC-USDT-SWAP"}])])
+
+    def test_disconnect_invalidates_every_published_book_for_any_venue(self):
+        """币安(以及按币安撮合的多所汇总)断线也不能拿断线前的盘口撮合。"""
+        _, public = BinanceAdapter().channels
+        topics = frozenset({public.topic("book", "BTCUSDT")})
+        depth = json.dumps({"stream": "btcusdt@depth20@100ms",
+                            "data": {"e": "depthUpdate", "s": "BTCUSDT", "E": 1,
+                                     "b": [["100", "1"]], "a": [["101", "1"]]}})
+        events = []
+
+        def emit(event):
+            events.append(event)
+            if event[2].get("valid") is False:
+                channel._stop.set()
+
+        channel = Channel("BINANCE.public", public, lambda: topics, emit,
+                          lambda _: FakeSocket([depth], drop=True))
+        with patch("builtins.print"):
+            channel._run()
+        self.assertEqual([event[:2] for event in events], [("book", BTC.symbol)] * 2)
+        self.assertEqual(events[-1][2], {"bids": [], "asks": [], "valid": False,
+                                         "reason": crypto_feed.BOOK_DROPPED})
+
+
+class QuoteCacheTests(unittest.TestCase):
+    def test_a_fresh_book_replaces_the_invalidated_one_and_its_reason(self):
+        manager = CryptoManager([OkxAdapter()])
+        symbol = "OKX.BTC-USDT-SWAP"
+        manager._apply_event(("book", symbol, {"bids": [], "asks": [], "valid": False,
+                                               "reason": crypto_feed.BOOK_DROPPED}))
+        manager._apply_event(("book", symbol, {"bids": [[100.0, 1.0]], "asks": [[100.1, 1.0]],
+                                               "time": 5, "valid": True}))
+        book = manager.quote(symbol)["book"]
+        self.assertNotIn("reason", book)
+        self.assertTrue(book["valid"])
+        manager._apply_event(("mark", symbol, {"markPrice": 100.0, "time": 5}))
+        manager._apply_event(("mark", symbol, {"fundingRate": 0.0001, "nextFundingTime": 9}))
+        self.assertEqual({key: manager.quote(symbol)["mark"][key] for key in ("markPrice", "fundingRate")},
+                         {"markPrice": 100.0, "fundingRate": 0.0001}, "标记价格与资金费率两路推送仍合在一起")
+
 
 class ManagerTests(unittest.TestCase):
     def setUp(self):
@@ -748,6 +814,9 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(market.parse('{"result": null, "id": 1}'), [])
         self.assertEqual(market.topic("trade", "BTCUSDT"), "btcusdt@aggTrade")
         self.assertIsNone(market.topic("book", "BTCUSDT"))
+        self.assertEqual(public.topic("book", "BTCUSDT"), "btcusdt@depth20@100ms")
+        self.assertIn("/public/stream?streams=btcusdt@depth20@100ms",
+                      public.url({public.topic("book", "BTCUSDT")}))
         changes = [json.loads(m) for m in market.change_messages(frozenset({"a"}), frozenset({"b"}))]
         self.assertEqual([(m["method"], m["params"]) for m in changes], [("SUBSCRIBE", ["b"]), ("UNSUBSCRIBE", ["a"])])
         self.assertIn("/market/stream?streams=", market.url({"btcusdt@aggTrade"}))
@@ -758,9 +827,12 @@ class ParserTests(unittest.TestCase):
             {"tradeId": "11", "px": "85000", "sz": "2.5", "side": "sell", "ts": "1700"}]}))
         self.assertEqual(trade[0][:4] + trade[0][5:], ("trade", "OKX.BTC-USDT-SWAP", 11, 85000.0, 1700, True))
         self.assertAlmostEqual(trade[0][4], 0.025)                      # 2.5 张 x 0.01 BTC
-        book = public.parse(json.dumps({"arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"}, "data": [
-            {"bids": [["1", "100", "0", "1"]], "asks": [["2", "50", "0", "1"]], "ts": "5"}]}))
+        public.subscribe_messages({public.topic("book", "BTC-USDT-SWAP")})
+        book = public.parse(json.dumps({"arg": {"channel": "books", "instId": "BTC-USDT-SWAP"}, "action": "snapshot",
+                                        "data": [{"bids": [["1", "100", "0", "1"]], "asks": [["2", "50", "0", "1"]],
+                                                  "ts": "5", "prevSeqId": -1, "seqId": 1}]}))
         self.assertEqual(book[0][2]["bids"], [[1.0, 1.0]])
+        self.assertEqual(book[0][2]["asks"], [[2.0, 0.5]])
         funding = public.parse(json.dumps({"arg": {"channel": "funding-rate", "instId": "BTC-USDT-SWAP"},
                                            "data": [{"fundingRate": "0.0002", "fundingTime": "99"}]}))
         self.assertEqual(funding[0][2], {"fundingRate": 0.0002, "nextFundingTime": 99})
@@ -771,6 +843,120 @@ class ParserTests(unittest.TestCase):
         args = json.loads(public.subscribe_messages({public.topic("mark", "BTC-USDT-SWAP")})[0])["args"]
         self.assertEqual(args, [{"channel": "mark-price", "instId": "BTC-USDT-SWAP"},
                                 {"channel": "funding-rate", "instId": "BTC-USDT-SWAP"}])
+
+
+def okx_book_message(action, previous, seq, *, bids=(), asks=(), timestamp=5, checksum=None):
+    item = {"bids": bids, "asks": asks, "ts": str(timestamp), "prevSeqId": previous, "seqId": seq}
+    if checksum is not None:
+        item["checksum"] = checksum
+    return json.dumps({"arg": {"channel": "books", "instId": "BTC-USDT-SWAP"}, "action": action,
+                       "data": [item]})
+
+
+class OkxDepthTests(unittest.TestCase):
+    def setUp(self):
+        _, self.public = OkxAdapter().channels
+        self.topics = frozenset({self.public.topic("book", "BTC-USDT-SWAP")})
+        messages = self.public.subscribe_messages(self.topics)
+        self.assertEqual(json.loads(messages[0])["args"],
+                         [{"channel": "books", "instId": "BTC-USDT-SWAP"}])
+
+    def snapshot(self):
+        return self.public.parse(okx_book_message("snapshot", -1, 10,
+                                                 bids=[["99", "100"], ["100", "50"]],
+                                                 asks=[["102", "100"], ["101", "50"]]))[0][2]
+
+    def test_incremental_book_replaces_and_deletes_levels_without_mutating_published_snapshots(self):
+        first = self.snapshot()
+        updated = self.public.parse(okx_book_message(
+            "update", 10, 11, bids=[["100", "0"], ["99", "200"], ["98", "25"]],
+            asks=[["101", "75"], ["103", "20"]]))[0][2]
+        self.assertEqual(first["bids"], [[100.0, 0.5], [99.0, 1.0]])
+        self.assertEqual(first["asks"], [[101.0, 0.5], [102.0, 1.0]])
+        self.assertEqual(updated["bids"], [[99.0, 2.0], [98.0, 0.25]])
+        self.assertEqual(updated["asks"], [[101.0, 0.75], [102.0, 1.0], [103.0, 0.2]])
+        self.assertTrue(updated["valid"])
+
+    def test_book_keeps_400_levels_on_each_side(self):
+        snapshot = self.public.parse(okx_book_message(
+            "snapshot", -1, 10, bids=[[str(1000 - i), "100"] for i in range(400)],
+            asks=[[str(1001 + i), "100"] for i in range(400)]))[0][2]
+        self.assertEqual((len(snapshot["bids"]), len(snapshot["asks"])), (400, 400))
+        updated = self.public.parse(okx_book_message(
+            "update", 10, 11, bids=[["1000.5", "100"]], asks=[["1000.6", "100"]]))[0][2]
+        self.assertEqual((len(updated["bids"]), len(updated["asks"])), (400, 400))
+        self.assertEqual((updated["bids"][-1][0], updated["asks"][-1][0]), (602.0, 1399.0))
+
+    def test_heartbeat_and_exchange_sequence_reset_preserve_depth(self):
+        first = self.snapshot()
+        heartbeat = self.public.parse(okx_book_message("update", 10, 10, timestamp=6))[0][2]
+        self.assertEqual(heartbeat["bids"], first["bids"])
+        self.assertEqual(heartbeat["time"], 6)
+        reset = self.public.parse(okx_book_message("update", 10, 3, asks=[["101", "200"]]))[0][2]
+        self.assertEqual(reset["asks"][0], [101.0, 2.0])
+        self.assertTrue(self.public.parse(okx_book_message("update", 3, 4)))
+
+    def assert_resync(self, events):
+        """这一个合约的盘口作废, 并在同一条连接上退订再订阅取新快照。"""
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][:2], ("book", "OKX.BTC-USDT-SWAP"))
+        self.assertEqual((events[0][2]["valid"], events[0][2]["bids"]), (False, []))
+        self.assertEqual([json.loads(m)["op"] for m in self.public.pending_messages()], ["unsubscribe", "subscribe"])
+        self.assertEqual(self.public.pending_messages(), [])
+
+    def test_sequence_gaps_and_missing_snapshots_resync_only_that_book(self):
+        with patch("builtins.print"):
+            self.assert_resync(self.public.parse(okx_book_message("update", 10, 11)))
+            self.assertEqual(self.public.parse(okx_book_message("update", 11, 12)), [], "等新快照时在途的增量不用")
+            self.assertTrue(self.snapshot()["valid"])
+            self.assert_resync(self.public.parse(okx_book_message("update", 11, 12)))
+            self.public.subscribe_messages(self.topics)
+            self.assertEqual(self.public.pending_messages(), [], "重连后从新快照开始, 不再补发旧的重订")
+            self.assert_resync(self.public.parse(okx_book_message("update", 10, 11)))
+        self.assertTrue(self.snapshot()["valid"])
+
+    def test_reconnect_and_resubscribe_discard_the_previous_sequence(self):
+        self.snapshot()
+        self.public.subscribe_messages(self.topics)
+        with patch("builtins.print"):
+            self.assert_resync(self.public.parse(okx_book_message("update", 10, 11)))
+        self.snapshot()
+        self.public.change_messages(self.topics, frozenset())
+        self.public.change_messages(frozenset(), self.topics)
+        with patch("builtins.print"):
+            self.assert_resync(self.public.parse(okx_book_message("update", 10, 11)))
+        replacement = self.public.parse(okx_book_message(
+            "snapshot", -1, 20, bids=[["98", "100"]], asks=[["103", "100"]]))[0][2]
+        self.assertEqual(replacement["bids"], [[98.0, 1.0]])
+        self.assertEqual(replacement["asks"], [[103.0, 1.0]])
+
+    def test_late_updates_after_unsubscribing_do_not_resync(self):
+        self.snapshot()
+        self.public.change_messages(self.topics, frozenset())
+        self.assertEqual(self.public.parse(okx_book_message("update", 10, 11)), [])
+        self.assertEqual(self.public.pending_messages(), [])
+
+    def test_malformed_incremental_prices_and_sizes_resync_the_book(self):
+        for row in (["NaN", "1"], ["100", "-1"], ["100", "Infinity"], ["0", "1"], ["100"]):
+            with self.subTest(row=row):
+                self.snapshot()
+                with patch("builtins.print"):
+                    self.assert_resync(self.public.parse(okx_book_message("update", 10, 11, bids=[row])))
+
+    def test_resync_without_a_new_snapshot_falls_back_to_reconnecting(self):
+        with patch("builtins.print"):
+            self.public.parse(okx_book_message("update", 10, 11))
+        with patch.object(okx_feed, "BOOK_RESYNC_SEC", 0.0), self.assertRaises(ConnectionError):
+            self.public.pending_messages()
+
+    def test_deprecated_checksum_field_is_ignored(self):
+        # OKX 2026-06-23 起 checksum 弃用、固定推 0: 不能拿它校验, 否则每份快照都会被判坏、反复重订
+        snapshot = self.public.parse(okx_book_message("snapshot", -1, 10, bids=[["99", "100"], ["100", "50"]],
+                                                      asks=[["102", "100"], ["101", "50"]], checksum=0))
+        self.assertTrue(snapshot[0][2]["valid"])
+        updated = self.public.parse(okx_book_message("update", 10, 11, bids=[["100", "0"]], checksum=0))
+        self.assertEqual((updated[0][2]["valid"], updated[0][2]["bids"]), (True, [[99.0, 1.0]]))
+        self.assertEqual(self.public.pending_messages(), [])
 
 
 class FakeHttp:

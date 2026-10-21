@@ -276,9 +276,12 @@ class FuturesRollupFeedTests(unittest.TestCase):
     def test_subscribes_only_the_native_klines(self):
         api = Mock()
         api.query_quotes.return_value = [SYMBOL]
+        api.query_symbol_info.return_value = [
+            {"instrument_id": SYMBOL, "underlying_symbol": "SHFE.fu2701"}]
         api.get_kline_serial.return_value = klines_at((T0, 1))
+        self.base._bind_contract("SHFE.fu2701")
         self.feed.subscribe(api)
-        api.get_kline_serial.assert_called_once_with(SYMBOL, 300, data_length=ingest.MAX_KLINES)
+        api.get_kline_serial.assert_called_once_with("SHFE.fu2701", 300, data_length=ingest.MAX_KLINES)
         api.get_tick_serial.assert_not_called()
         self.assertTrue(self.feed.has_data())
 

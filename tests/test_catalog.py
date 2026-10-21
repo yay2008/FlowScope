@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pandas as pd
 
 import catalog
+import ingest
 
 CONT_NAMES = {"KQ.m@SHFE.fu": "燃油主连", "KQ.m@DCE.i": "铁矿石主连", "KQ.m@XX.zz": "ZZ主连"}
 CONT_MAINS = {"KQ.m@SHFE.fu": "SHFE.fu2611", "KQ.m@DCE.i": "DCE.i2601", "KQ.m@XX.zz": "XX.zz2601"}
@@ -60,6 +61,7 @@ class FakeManager:
     def __init__(self, api=None, error=None, hang=False, status="connected"):
         self.api, self.error, self.hang, self.status = api, error, hang, status
         self.jobs = []
+        self.mains = ingest.MainContracts()
 
     async def query(self, fn, timeout=None):
         if self.status in {"stopped", "error"}:
@@ -327,7 +329,39 @@ class ServiceTests(unittest.TestCase):
         service = catalog.CatalogService(lambda: FakeManager(api=api))
         data = asyncio.run(service.symbol_label("KQ.m@SHFE.fu"))
         self.assertEqual(data, {"symbol": "KQ.m@SHFE.fu", "label": "燃油2611"})
-        self.assertEqual(api.quotes, ["KQ.m@SHFE.fu"])   # 只读一次报价, 不订阅 K线/tick
+        self.assertEqual(api.quotes, [])   # 名称/标的来自静态查询, 不订阅报价或 K线/tick
+
+    def test_label_ignores_a_stale_quote_underlying_after_rollover(self):
+        api = FakeApi()
+        api.get_quote = lambda symbol: FakeQuote(underlying="SHFE.fu2611")
+        with patch.dict(CONT_MAINS, {"KQ.m@SHFE.fu": "SHFE.fu2701"}):
+            self.assertEqual(catalog.resolve_label(api, "KQ.m@SHFE.fu"), "燃油2701")
+        self.assertEqual(api.info_calls, [["KQ.m@SHFE.fu"], ["SHFE.fu2701"]])
+
+    def test_label_poll_reuses_the_shared_main_mapping(self):
+        """顶栏每分钟问一次名字: 月份取图表、自选共用的主力映射, 一分钟内不重复查主连。"""
+        api = FakeApi()
+        manager = FakeManager(api=api)
+        service = catalog.CatalogService(lambda: manager)
+        with patch("catalog.time.monotonic", return_value=100) as clock:
+            self.assertEqual(asyncio.run(service.symbol_label("KQ.m@SHFE.fu"))["label"], "燃油2611")
+            self.assertEqual(asyncio.run(service.symbol_label("KQ.m@SHFE.fu"))["label"], "燃油2611")
+            self.assertEqual(api.info_calls, [["KQ.m@SHFE.fu"], ["SHFE.fu2611"], ["SHFE.fu2611"]])
+            clock.return_value = 100 + ingest.MAIN_CONTRACT_CHECK_SEC
+            with patch.dict(CONT_MAINS, {"KQ.m@SHFE.fu": "SHFE.fu2701"}):
+                self.assertEqual(asyncio.run(service.symbol_label("KQ.m@SHFE.fu"))["label"], "燃油2701")
+
+    def test_cached_months_follow_a_new_main_mapping_without_reordering(self):
+        api = FakeApi(months=["SHFE.fu2611", "SHFE.fu2701"],
+                      pre_open_interest={"SHFE.fu2611": 200, "SHFE.fu2701": 100})
+        service = catalog.CatalogService(lambda: FakeManager(api=api))
+        before, _ = asyncio.run(service._months_payload("SHFE", "fu", "SHFE.fu2611", False))
+        calls = len(api.info_calls)
+        after, _ = asyncio.run(service._months_payload("SHFE", "fu", "SHFE.fu2701", False))
+        self.assertEqual([row["symbol"] for row in after], [row["symbol"] for row in before])
+        self.assertEqual([row["isMain"] for row in after], [False, True])
+        self.assertEqual([row["isMain"] for row in before], [True, False])
+        self.assertEqual(len(api.info_calls), calls)
 
     def test_month_symbol_label_uses_its_own_name(self):
         service = catalog.CatalogService(lambda: FakeManager(api=FakeApi()))
@@ -354,11 +388,53 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             asyncio.run(service.symbol_label("../etc/passwd"))
 
-    def test_resolve_label_survives_a_failing_quote_lookup(self):
-        """报价取不到标的合约时, 退而使用主连自身的名字, 而不是抛错或空着。"""
+    def test_resolve_label_does_not_depend_on_live_quotes(self):
+        """闭市或报价取不到也能从静态合约服务解析当前月份。"""
         api = FakeApi(quote_error=RuntimeError("闭市无报价"))
-        self.assertEqual(catalog.resolve_label(api, "KQ.m@SHFE.fu"), "燃油主连")
+        self.assertEqual(catalog.resolve_label(api, "KQ.m@SHFE.fu"), "燃油2611")
         self.assertEqual(catalog.resolve_label(api, "SHFE.fu2611"), "燃油2611")
+
+    def test_label_falls_back_to_the_underlying_code_if_its_name_is_unavailable(self):
+        api = FakeApi()
+        original = api.query_symbol_info
+        api.query_symbol_info = lambda symbols: original(symbols) if symbols == ["KQ.m@SHFE.fu"] else []
+        self.assertEqual(catalog.resolve_label(api, "KQ.m@SHFE.fu"), "SHFE.fu2611")
+
+    def test_catalog_follows_a_rollover_seen_by_the_ingest_thread_before_its_cache_expires(self):
+        """图表、自选核对到换月后, 选择器不等目录 5 分钟缓存过期就跟着换(同一份主力映射)。"""
+        api = FakeApi(conts=["KQ.m@SHFE.fu"], months=["SHFE.fu2611", "SHFE.fu2701"])
+        manager = FakeManager(api=api)
+        service = catalog.CatalogService(lambda: manager)
+        with patch("catalog.time.monotonic", return_value=100) as clock:
+            before = asyncio.run(service.payload("SHFE", "fu"))
+            self.assertEqual(before["groups"][0]["products"][0]["mainSymbol"], "SHFE.fu2611")
+            clock.return_value = 130
+            with patch.dict(CONT_MAINS, {"KQ.m@SHFE.fu": "SHFE.fu2701"}):
+                manager.mains.resolve(api, ["KQ.m@SHFE.fu"])
+            calls = len(api.info_calls)
+            after = asyncio.run(service.payload("SHFE", "fu"))
+        self.assertEqual(after["groups"][0]["products"][0]["mainSymbol"], "SHFE.fu2701")
+        self.assertEqual({row["symbol"]: row["isMain"] for row in after["months"]},
+                         {"SHFE.fu2611": False, "SHFE.fu2701": True})
+        self.assertEqual(len(api.info_calls), calls, "目录与月份仍走缓存")
+
+    def test_periodic_queries_leave_nothing_in_the_sdk_query_cache(self):
+        """合约名每分钟问一次、目录每 5 分钟重建一次: 合约信息查询的结果不能一直留在长连接里。"""
+        api = FakeApi(conts=list(CONT_NAMES), months=["SHFE.fu2611", "SHFE.fu2701"])
+        api._data = {"symbols": {"listing": {"result": {}}}}
+        original = api.query_symbol_info
+
+        def query(symbols):
+            api._data["symbols"][f"PYSDK_api_{len(api.info_calls)}"] = {"result": {}}
+            return original(symbols)
+
+        api.query_symbol_info = query
+        self.assertEqual(catalog.resolve_label(api, "KQ.m@SHFE.fu"), "燃油2611")
+        self.assertEqual(catalog.resolve_label(api, "SHFE.fu2610"), "燃油2610")
+        self.assertTrue(catalog.ranked_products(api))
+        self.assertTrue(catalog.build_months(api, "SHFE", "fu"))
+        self.assertEqual(len(api.info_calls), 6)
+        self.assertEqual(api._data["symbols"], {"listing": {"result": {}}})
 
 
 if __name__ == "__main__":

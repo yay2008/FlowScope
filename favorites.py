@@ -166,12 +166,16 @@ def _empty_row(symbol: str) -> dict:
             "volume": None, "amount": None, "priceDecs": 0, "expired": False}
 
 
-def read_quotes(api, symbols, warm: set[str], wait_sec: float = COLD_WAIT_SEC) -> list[dict]:
+def read_quotes(api, symbols, warm: set[str], wait_sec: float = COLD_WAIT_SEC, mains=None,
+                refresh: bool = False) -> list[dict]:
     """采集线程里读报价快照(按传入顺序输出, 取不到的留空行)。
 
     ``warm`` 由调用方持有, 记录已经订阅过的合约: 只有新合约才等一次 wait_update。
     没订阅过的代码先确认合约服务里有(见 ingest.listed_symbols): 对不存在的代码调
     get_quote 会让整条连接停摆, 而不只是这一行取不到。
+    ``mains``(ingest.MainContracts): 主连换月后 Quote 的静态标的字段仍可能是旧值, 当前月份
+    取与图表共用的主力映射(refresh 时不用一分钟内的结果); 查不到时才用 Quote 里的。
+    主连自身的实时价格与成交量照旧。
     """
     known = warm | listed_symbols(api, [symbol for symbol in symbols if symbol not in warm])
     quotes = {}
@@ -190,8 +194,13 @@ def read_quotes(api, symbols, warm: set[str], wait_sec: float = COLD_WAIT_SEC) -
         except Exception:
             pass
         warm.update(cold)
-    return [quote_row(symbol, quotes[symbol]) if quotes[symbol] is not None else _empty_row(symbol)
-            for symbol in symbols]
+    current = mains.resolve(api, [symbol for symbol, quote in quotes.items() if quote is not None],
+                            refresh) if mains is not None else {}
+    rows = []
+    for symbol in symbols:
+        row = quote_row(symbol, quotes[symbol]) if quotes[symbol] is not None else _empty_row(symbol)
+        rows.append({**row, "mainSymbol": current[symbol]} if symbol in current else row)
+    return rows
 
 
 class FavoritesService:
@@ -241,8 +250,11 @@ class FavoritesService:
                 and time.monotonic() - cached[0] < self._quotes_ttl:
             return cached[2]
         try:
-            rows = await self._manager().query(
-                lambda api: read_quotes(api, wanted, self._warm, self._wait_sec), self._timeout)
+            manager = self._manager()
+            # 主力映射一分钟内查过就不再查, 3 秒一次的轮询不会变成 3 秒一次的合约查询
+            rows = await manager.query(
+                lambda api: read_quotes(api, wanted, self._warm, self._wait_sec, manager.mains, refresh),
+                self._timeout)
             payload = {"quotes": rows, "source": "live", "error": None}
         except Exception as exc:
             payload = {"quotes": [], "source": "unavailable",

@@ -364,5 +364,6 @@ class RollupMixin:
             self.error = None
             if snapshots:
                 self.ready.set()
+                self.rolled = False      # 换月后的整份替换已经发出(见 ingest.Feed._snapshot_message)
         for message in messages:
             broadcast(message)

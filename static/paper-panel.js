@@ -283,7 +283,7 @@
       els.sizingNote.textContent = margin > 0 && Number.isFinite(notional)
         ? `仓位约 ${formatMoney(notional, 2)} USDT · ${state.leverage}x\n手续费另计 · ${market ? "币数向下取整" : "挂单后币数固定"}`
         : "请输入有效保证金金额";
-      els.sizingNote.title = "币数按数量步长向下取整。市价按提交时五档盘口换算；限价/条件按委托价/触发价换算，" +
+      els.sizingNote.title = "币数按数量步长向下取整。市价按提交时的实时深度盘口换算；限价/条件按委托价/触发价换算，" +
         "挂单后改价或改杠杆不重新换算，实际保证金可能变化。账户保证金按标记价格估值；反向下单先减仓。";
     }
 
@@ -642,7 +642,8 @@
           text += ` · 资金费率 ${(quote.fundingRate * 100).toFixed(4)}%（${next} 结算）`;
         }
         els.note.textContent = text;
-        els.note.title = "模拟成交: 市价单按五档盘口逐档吃到够量, 按均价成交; 限价单挂单后要价格穿过限价才按限价成交(挂单费率)。" +
+        els.note.title = "模拟成交: 市价单按实时深度盘口逐档吃到够量, 按均价成交; 深度不足时提示本单需求与盘口容量。" +
+          "限价单挂单后要价格穿过限价才按限价成交(挂单费率)。" +
           "全仓, 权益低于维持保证金(名义金额 0.5%)按标记价强平; 到点按资金费率结算。看不到排队, 结果只作参考。";
         return;
       }

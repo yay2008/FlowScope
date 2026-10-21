@@ -35,7 +35,7 @@ function harness() {
     },
     // 每轮加载按工具栏重算本图粒度; 这里直接用 ctx.ltf 模拟"数据源已切换"
     currentLtf: () => ctx.ltf,
-    onConfig: () => {}, renderAll: () => {}, clearPaperEntry: () => {},
+    acceptDataContract: () => {}, onConfig: () => {}, renderAll: () => {}, clearPaperEntry: () => {},
     chart: {timeScale: () => ({scrollToRealTime: () => {}})},
     connectWs: () => { connected++; ctx.ws = {close: () => closed++}; },
   });

@@ -61,7 +61,7 @@
     return counts;
   }
 
-  // 二级菜单: 第一项恒为「主力」, 即使月份列表还没回来(或请求失败)也能选主力。
+  // 二级第一项跟随主力; 所有固定月份另列, 包括当前主力月份, 两者可独立选择/收藏。
   function monthOptions(product, months) {
     if (!product) return [];
     const list = months || [];
@@ -73,12 +73,14 @@
       previousVolume: main ? main.previousVolume : product.previousVolume,
       previousVolumeDate: main ? main.previousVolumeDate : product.previousVolumeDate,
       isMain: true,
+      autoFollow: !product.crypto,
+      currentSymbol: (main && main.symbol) || product.mainSymbol || "",
     }];
     for (const month of list) {
-      if (month.isMain) continue;      // 主力已经在第一项, 不重复列出
+      if (month.symbol === product.contSymbol) continue;
       options.push({ symbol: month.symbol, name: month.name, openInterest: month.openInterest,
                      previousVolume: month.previousVolume, previousVolumeDate: month.previousVolumeDate,
-                     isMain: false });
+                     isMain: !!month.isMain, autoFollow: false });
     }
     return options;
   }

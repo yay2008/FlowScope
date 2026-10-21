@@ -1,7 +1,7 @@
 /* 指标计算: 滚动统计、Volume Suite 阈值分档、LSMA × CRVOL 共振、FlowWave 回归通道、OB Zones、固定范围成交量分布。
  *
- * 纯函数, 不碰 DOM 与图表, 浏览器与 Node 回归测试共用(与 data-sync.js 同样的写法)。
- * 状态(bars / cfg / threshtype / 带宽 k)全部由调用方传入, 模块内不留全局状态。
+ * 不碰 DOM 与图表, 浏览器与 Node 回归测试共用(与 data-sync.js 同样的写法)。
+ * 参数与 OB 历史跟踪器均由调用方持有, 模块内不留全局状态。
  */
 (function (root) {
   "use strict";
@@ -274,71 +274,139 @@
 
   // ---------- OB Zones (TradingView Pine v6 移植) ----------
 
-  // 只用截至当前 bar 的 OHLC 产生信号。区域回画到最近一根反向 K 线, created 才是真正触发的 bar。
-  // 成交量改用本项目 buy/sell(跟随顶部拆分粒度), 缺失保留 null, 不按整根阴阳伪造买卖量。
-  // 全量重建避免实时末根回撤、历史补齐或窗口裁剪后留下旧区域, 与 Pine 的实时 rollback 行为一致。
-  function deriveObZones(bars, options = {}) {
+  const OB_SERIES = ["zUp", "zDn", "bullCreate", "bearCreate"];
+  const emptyObSeries = () => Object.fromEntries(OB_SERIES.map((key) => [key, []]));
+
+  // 原版连续实体 Z 的逐根状态。批量计算和实时跟踪共用, 触发与生命周期规则不变。
+  function createObEngine(options, keepHistory = true) {
     const { zLen, maxAge, preventOverlap } = normalizeObOptions(options);
-    const n = bars.length;
-    const up = new Array(n), down = new Array(n);
-    for (let i = 0; i < n; i++) {
-      const body = bars[i].close - bars[i].open;
-      up[i] = body > 0 ? (i ? up[i - 1] : 0) + body : 0;
-      down[i] = body < 0 ? (i ? down[i - 1] : 0) - body : 0;
+    const moments = () => ({ values: [], count: 0, sum: 0, sum2: 0, same: 0, previous: null });
+    let state = { index: 0, up: 0, down: 0, upStats: moments(), downStats: moments(),
+      zUp: null, zDn: null, previousClose: null, lastDown: null, lastUp: null, zones: [], active: [] };
+    const copy = (s) => {
+      const zones = s.zones.map((z) => ({ ...z }));
+      return { ...s, zones, active: zones.filter((z) => z.status === "active"),
+        upStats: { ...s.upStats, values: s.upStats.values.slice() },
+        downStats: { ...s.downStats, values: s.downStats.values.slice() } };
+    };
+    function zScore(stats, value) {
+      // 与 rollingZ 相同的加减顺序、总体标准差；保留原 obZ 的全等窗口 na 修正。
+      const slot = stats.count % zLen, old = stats.values[slot];
+      stats.sum += value; stats.sum2 += value * value;
+      if (stats.count >= zLen) { stats.sum -= old; stats.sum2 -= old * old; }
+      stats.values[slot] = value;
+      stats.same = stats.count > 0 && value === stats.previous ? stats.same + 1 : 0;
+      stats.previous = value;
+      stats.count++;
+      if (stats.count < zLen || stats.same >= zLen - 1) return null;
+      const mean = stats.sum / zLen;
+      const sd = Math.sqrt(Math.max(stats.sum2 / zLen - mean * mean, 0));
+      return sd === 0 ? null : (value - mean) / sd;
     }
-    // Pine ta.stdev 默认总体标准差(除以 n); 标准差为零时 Z 为 na。
-    const zUp = obZ(up, zLen), zDn = obZ(down, zLen);
-    const bullCreate = new Array(n).fill(false), bearCreate = new Array(n).fill(false);
-    const zones = [];
-    let active = [], lastDown = null, lastUp = null;
-    const crossed = (z, i) => i > 0 && z[i] != null && z[i - 1] != null &&
-      z[i] > 4 && z[i - 1] <= 4 && z[i - 1] !== 0;
-    const create = (start, i, side) => {
-      if (start == null) return false;
-      const b = bars[start], top = b.high, bottom = b.low;
+    const crossed = (z, previous) => z != null && previous != null && z > 4 && previous <= 4 && previous !== 0;
+    function create(anchor, i, side) {
+      if (!anchor) return false;
+      const { index: start, bar: b } = anchor, top = b.high, bottom = b.low;
       if (!Number.isFinite(top) || !Number.isFinite(bottom) || top < bottom) return false;
       // 严格相交才挡住, 边界相接允许; 多空区域互相检查。
-      if (preventOverlap && active.some((z) => top > z.bottom && bottom < z.top)) return false;
+      if (preventOverlap && state.active.some((z) => top > z.bottom && bottom < z.top)) return false;
       const volume = (v) => Number.isFinite(v) && v >= 0 ? v : null;
       const zone = { side, start, created: i, end: i, top, bottom, status: "active",
                      buy: volume(buyOf(b)), sell: volume(sellOf(b)), unknown: volume(b.unknown),
                      coverage: b.coverage ?? null };
-      zones.push(zone);
-      active.push(zone);
+      state.zones.push(zone);
+      state.active.push(zone);
       return true;
-    };
-    for (let i = 0; i < n; i++) {
-      const b = bars[i];
-      if (b.close < b.open) lastDown = i;
-      if (b.close > b.open) lastUp = i;
+    }
+    function push(b) {
+      const i = state.index++, body = b.close - b.open;
+      state.up = body > 0 ? state.up + body : 0;
+      state.down = body < 0 ? state.down - body : 0;
+      const zUp = zScore(state.upStats, state.up), zDn = zScore(state.downStats, state.down);
+      const row = { zUp, zDn, bullCreate: false, bearCreate: false };
+      if (b.close < b.open) state.lastDown = { index: i, bar: b };
+      if (b.close > b.open) state.lastUp = { index: i, bar: b };
       // 原脚本先创建再失效: 在本根到期/突破的旧区域仍会阻止本根的重叠新区域。
-      if (crossed(zUp, i)) bullCreate[i] = create(lastDown, i, "bull");
-      if (crossed(zDn, i)) bearCreate[i] = create(lastUp, i, "bear");
-      active = active.filter((z) => {
+      if (crossed(zUp, state.zUp)) row.bullCreate = create(state.lastDown, i, "bull");
+      if (crossed(zDn, state.zDn)) row.bearCreate = create(state.lastUp, i, "bear");
+      state.active = state.active.filter((z) => {
         z.end = i;
-        const previous = i ? bars[i - 1].close : null;
+        const previous = state.previousClose;
         const mitigated = previous != null && (z.side === "bull"
           ? b.close < z.bottom && previous < z.bottom : b.close > z.top && previous > z.top);
         const expired = i - z.start >= maxAge;   // 从反向 K 线起算, 不是从信号根起算
         if (mitigated || expired) z.status = mitigated ? "mitigated" : "expired";
         return z.status === "active";
       });
+      // 图表只画最近166组；更早但仍有效的区域必须继续参与防重叠。
+      if (!keepHistory && state.zones.length > OB.maxDrawZones) {
+        const cutoff = state.zones.length - OB.maxDrawZones;
+        state.zones = state.zones.filter((z, j) => j >= cutoff || z.status === "active");
+      }
+      state.previousClose = b.close;
+      state.zUp = zUp; state.zDn = zDn;
+      return row;
     }
-    // Pine 只 array.remove, 没有 box.delete: 失效区域留在历史上, 右端停在失效的 bar。
-    return { zones, zUp, zDn, bullCreate, bearCreate };
+    return { push, zones: () => state.zones,
+      checkpoint: () => copy(state), restore: (value) => { state = copy(value); } };
   }
 
-  // rollingZ 用累加再减的滚动和: 一段连续阴线(距离全为 0)之后浮点残差会让标准差略大于 0,
-  // 前一根 Z 成了极小的非零数而不是 na, 下一根阳线就被误判为上穿。窗口内各值完全相同时
-  // 真实标准差恰为 0, 按 Pine 记为 na。
-  function obZ(values, n) {
-    const z = rollingZ(values, n);
-    let same = 0;   // 截至本根, 连续与前一根相等的根数
-    for (let i = 0; i < values.length; i++) {
-      same = i > 0 && values[i] === values[i - 1] ? same + 1 : 0;
-      if (same >= n - 1) z[i] = null;
+  // 只用截至当前 bar 的 OHLC 产生信号。start 是回画锚点, created 才是真正触发的 bar。
+  // 成交量只用于量条；此纯函数按传入的完整历史计算, 图表裁剪由下面的跟踪器处理。
+  function deriveObZones(bars, options = {}) {
+    const engine = createObEngine(options), series = emptyObSeries();
+    for (const bar of bars) {
+      const row = engine.push(bar);
+      for (const key of OB_SERIES) series[key].push(row[key]);
     }
-    return z;
+    // Pine 只 array.remove, 没有 box.delete: 失效区域留在历史上, 右端停在失效的 bar。
+    return { zones: engine.zones(), ...series };
+  }
+
+  // 每张图一个实例。计算起点不随800根显示窗口前移；只保存OB所需字段。
+  // 正常行情只推进新根/回滚末根，历史修订或参数改变才从本次保留的起点重放。
+  function createObTracker() {
+    const fields = ["time", "open", "high", "low", "close", "buy", "sell", "unknown", "coverage"];
+    let history = [], engine = null, beforeLast = null, key = "", source = null, series = emptyObSeries();
+    function reset() { history = []; engine = null; beforeLast = null; key = ""; source = null; series = emptyObSeries(); }
+    function update(bars, options = {}, volumeSource = null) {
+      if (!bars.length) { reset(); return { zones: [], ...emptyObSeries(), historyCount: 0 }; }
+      if (source !== volumeSource) {
+        // 改买卖口径不能丢价格历史；无法重取的旧锚点量标为缺失, 不混用两个口径。
+        history = history.map((b) => ({ ...b, buy: null, sell: null, unknown: null, coverage: "missing" }));
+        engine = null; source = volumeSource;
+      }
+      let lo = 0, hi = history.length;
+      while (lo < hi) { const mid = (lo + hi) >>> 1; if (history[mid].time < bars[0].time) lo = mid + 1; else hi = mid; }
+      const offset = lo;
+      const incoming = bars.map((b) => Object.fromEntries(fields.map((f) => [f, b[f] ?? null])));
+      let unchanged = 0;
+      while (unchanged < incoming.length && offset + unchanged < history.length &&
+        fields.every((f) => incoming[unchanged][f] === history[offset + unchanged][f])) unchanged++;
+      const changed = offset + unchanged, oldLength = history.length;
+      history.length = changed;
+      history.push(...incoming.slice(unchanged));
+      const nextKey = JSON.stringify(normalizeObOptions(options));
+      let start = changed;
+      if (!engine || key !== nextKey || changed < oldLength - 1 || history.length < oldLength) {
+        engine = createObEngine(options, false); series = emptyObSeries(); start = 0;
+      } else if (changed === oldLength - 1) {
+        engine.restore(beforeLast);
+        for (const name of OB_SERIES) series[name].length = changed;
+      }
+      key = nextKey;
+      for (let i = start; i < history.length; i++) {
+        if (i === history.length - 1) beforeLast = engine.checkpoint();
+        const row = engine.push(history[i]);
+        for (const name of OB_SERIES) series[name].push(row[name]);
+      }
+      const zones = engine.zones().filter((z) => z.end >= offset).map((z) => ({ ...z,
+        start: z.start - offset, created: z.created - offset, end: z.end - offset,
+        startTime: history[z.start].time, createdTime: history[z.created].time }));
+      return { zones, ...Object.fromEntries(OB_SERIES.map((name) => [name, series[name].slice(offset)])),
+        historyStart: history[0].time, historyCount: history.length };
+    }
+    return { update, reset };
   }
 
   // 成交量条与 Pine 一样: 较长的一条到区域中点, 另一条按买卖比例缩短, 端点按 bar 下标向下取整。
@@ -620,7 +688,7 @@
   const api = {
     LW, BAND, MODE_CHOICES, THRESH_CHOICES, EMA_PERIODS, HTF_EMA_PERIODS, OB, VP, buyOf, sellOf, deltaOf,
     rollingSma, rollingZ, ema, htfBucket, htfEma, rma, rsi, linreg, smaStrict, channelIndex,
-    deriveLw, deriveBand, deriveObZones, normalizeObOptions, obVolumeEnds, derive, levelOf, volumeProfile,
+    deriveLw, deriveBand, deriveObZones, createObTracker, normalizeObOptions, obVolumeEnds, derive, levelOf, volumeProfile,
     colorFor, buildSuiteData, buildPulseData, buildBandData,
   };
   if (typeof module === "object" && module.exports) module.exports = api;

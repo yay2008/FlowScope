@@ -5,8 +5,9 @@
 一张 0.01 BTC)折成币, 才能和币安的量相加。
 
 - 推送: 逐笔成交要走 business 通道的 ``trades-all``(每笔一条, 编号连续); public 通道的 ``trades``
-  会把同一笔吃单合并。行情、五档盘口、标记价格、资金费率在 public 通道。连接 30 秒没有数据会被
-  断开, 空闲时发 "ping" 保活。
+  会把同一笔吃单合并。行情、400 档盘口、标记价格、资金费率在 public 通道。盘口按 seqId/prevSeqId
+  合并增量, 断档就只把这一个合约的盘口作废、单独重订取新快照(checksum 字段 2026-06-23 起已弃用、
+  固定推 0, 不再核对)。连接 30 秒没有数据会被断开, 空闲时发 "ping" 保活。
 - REST: 合约列表; ``history-trades`` 每次 100 笔、限频 20 次/2 秒, 只能往更早翻 —— 补一天
   (约 130 万笔)要 20 多分钟, 所以整天的尽量用归档包。
 - 归档包: static.okx.com 每日一个, **按北京时间切日**, 约在次日 07:30(北京时间)之后发布, 没有校验文件;
@@ -16,8 +17,10 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import time
 import zipfile
+from bisect import bisect_left, insort
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -33,6 +36,9 @@ ARCHIVE = "https://static.okx.com/cdn/okex/traderecords/trades/daily"
 PAGE = 100                  # history-trades 每次最多 100 笔
 REQUEST_GAP_SEC = 0.11      # 限频 20 次/2 秒
 SUBSCRIBE_CHUNK = 50
+BOOK_LEVELS = 400
+BOOK_RESYNC_SEC = 10.0      # 单独重订的盘口这么久还没收到新快照, 整条连接重连
+BOOK_RESYNC_REASON = "盘口序号断档，正在重新同步"
 BEIJING = timezone(timedelta(hours=8))
 # 合约列表取不到时内置的合约: 合约, 币, 价格步长, 数量步长(张), 合约面值(交易所公布的参数)。
 BUILTIN = (("BTC-USDT-SWAP", "BTC", 0.1, 0.01, 0.01),)
@@ -56,6 +62,46 @@ def _number(value):
     return None if value in (None, "") else float(value)
 
 
+class _BookSide:
+    """一侧盘口: 价格升序存放(买盘倒着读), 增量只改动到的档位。"""
+
+    def __init__(self, descending: bool):
+        self.descending = descending
+        self.prices: list[float] = []
+        self.levels: dict[float, float] = {}   # 价格 -> 数量(张)
+
+    def apply(self, rows):
+        """rows 是已校验的 (价格, 数量); 数量为 0 删档。只留最好的 BOOK_LEVELS 档。"""
+        for price, qty in rows:
+            if qty == 0:
+                if self.levels.pop(price, None) is not None:
+                    del self.prices[bisect_left(self.prices, price)]
+                continue
+            if price not in self.levels:
+                insort(self.prices, price)
+            self.levels[price] = qty
+        excess = len(self.prices) - BOOK_LEVELS
+        if excess > 0:
+            dropped = self.prices[:excess] if self.descending else self.prices[-excess:]
+            self.prices = self.prices[excess:] if self.descending else self.prices[:-excess]
+            for price in dropped:
+                del self.levels[price]
+
+    def best(self) -> list[float]:
+        """从最好的一档起的价格。"""
+        return self.prices[::-1] if self.descending else self.prices
+
+    def rows(self, contract_value: float) -> list[list[float]]:
+        return [[price, self.levels[price] * contract_value] for price in self.best()]
+
+
+def _level(row) -> tuple[float, float]:
+    price, qty = float(row[0]), float(row[1])
+    if not math.isfinite(price) or price <= 0 or not math.isfinite(qty) or qty < 0:
+        raise ValueError("无效盘口价量")
+    return price, qty
+
+
 class OkxChannel:
     """一路推送连接(见 crypto_feed.Channel): topic 写成 "频道|合约", 连上后发 subscribe。"""
 
@@ -67,6 +113,10 @@ class OkxChannel:
         self._url = url
         self.kinds = kinds               # 报价种类 -> OKX 频道(一个种类可能要订两个频道)
         self.adapter = adapter
+        self._books = {}                 # instId -> 已验证连续的盘口 {"seqId", "bids", "asks"}(数量仍按张)
+        self._book_symbols = set()
+        self._resync: dict[str, float] = {}   # 单独重订、等新快照的 instId -> 重订时刻
+        self._outbox: list[str] = []          # 要在这条连接上发出去的重订消息(见 pending_messages)
 
     def topic(self, kind: str, inst_id: str) -> str | None:
         channels = self.kinds.get(kind)
@@ -90,10 +140,69 @@ class OkxChannel:
                 for index in range(0, len(args), SUBSCRIBE_CHUNK)]
 
     def subscribe_messages(self, topics) -> list[str]:
+        self._books.clear()              # 每次连接必须从新快照开始
+        self._resync.clear()
+        self._outbox.clear()
+        self._book_symbols = {arg["instId"] for arg in self._args(topics) if arg["channel"] == "books"}
         return self._messages("subscribe", topics)
 
     def change_messages(self, current, wanted) -> list[str]:
+        for arg in self._args(current ^ wanted):
+            if arg["channel"] == "books":
+                self._books.pop(arg["instId"], None)
+                self._resync.pop(arg["instId"], None)
+        self._book_symbols = {arg["instId"] for arg in self._args(wanted) if arg["channel"] == "books"}
         return self._messages("subscribe", wanted - current) + self._messages("unsubscribe", current - wanted)
+
+    def pending_messages(self) -> list[str]:
+        """Channel 每轮取走要发的重订消息; 重订后迟迟等不到新快照就整条连接重连。"""
+        now = time.monotonic()
+        late = sorted(inst_id for inst_id, since in self._resync.items() if now - since >= BOOK_RESYNC_SEC)
+        if late:
+            raise ConnectionError(f"OKX {', '.join(late)} 盘口重订后 {BOOK_RESYNC_SEC:.0f} 秒没收到新快照")
+        messages, self._outbox = self._outbox, []
+        return messages
+
+    def _resubscribe_book(self, inst_id, problem) -> tuple:
+        """作废这一个合约的盘口, 在同一条连接上退订再订阅它的 books 取新快照; 其它合约照常。"""
+        self._books.pop(inst_id, None)
+        self._resync[inst_id] = time.monotonic()
+        args = [{"channel": "books", "instId": inst_id}]
+        self._outbox += [json.dumps({"op": "unsubscribe", "args": args}),
+                         json.dumps({"op": "subscribe", "args": args})]
+        print(f"[crypto] OKX {inst_id} 盘口需要重新同步({problem})，单独重订", flush=True)
+        return ("book", symbol_of(inst_id), {"bids": [], "asks": [], "valid": False, "reason": BOOK_RESYNC_REASON})
+
+    def _book_update(self, inst_id, action, item, contract_value):
+        """books 初始 400 档快照 + 100ms 增量: 零数量删档, prevSeqId 必须接上上一条。接不上的不交给撮合,
+        只重订这一个合约(见 _resubscribe_book)。推送里的 checksum 已弃用、恒为 0, 不能拿来校验。"""
+        if inst_id in self._resync and action != "snapshot":
+            return None                  # 重订之前已在途的增量: 等新快照
+        try:
+            seq, previous = int(item["seqId"]), int(item["prevSeqId"])
+            book = self._books.get(inst_id)
+            if action == "snapshot":
+                if seq < 0 or previous != -1:
+                    raise ValueError("无效快照序号")
+                book = {"bids": _BookSide(True), "asks": _BookSide(False)}
+            elif action == "update":
+                if book is None or previous != book["seqId"]:
+                    raise ValueError("盘口增量序号不连续")
+            else:
+                raise ValueError("未知盘口更新类型")
+            rows = {side: [_level(row) for row in item[side]] for side in ("bids", "asks")}
+            stamp = int(item["ts"])
+            # 先校验整条再改: 出错时旧盘口原样作废, 不会改到一半
+            for side, levels in rows.items():
+                book[side].apply(levels)
+            book["seqId"] = seq
+        except (KeyError, TypeError, ValueError, IndexError, OverflowError) as exc:
+            return self._resubscribe_book(inst_id, exc)
+        self._books[inst_id] = book
+        self._resync.pop(inst_id, None)
+        return ("book", symbol_of(inst_id), {"bids": book["bids"].rows(contract_value),
+                                             "asks": book["asks"].rows(contract_value),
+                                             "time": stamp, "valid": True})
 
     def parse(self, raw) -> list[tuple]:
         if raw == "pong":
@@ -114,6 +223,11 @@ class OkxChannel:
         symbol = symbol_of(inst_id)
         size = self.adapter.contract_values.get(inst_id)
         channel = arg.get("channel")
+        if channel == "books" and size is not None:
+            if inst_id not in self._book_symbols:
+                return []                # 取消订阅后可能还有已在途的增量, 不拿它重订
+            events = [self._book_update(inst_id, message.get("action"), item, size) for item in data]
+            return [event for event in events if event is not None]
         try:
             if channel == "trades-all":
                 if size is None:
@@ -129,10 +243,6 @@ class OkxChannel:
                                             "amount": volume * last,
                                             "changePct": (last - opened) / opened * 100 if opened else None,
                                             "time": int(item["ts"])})]
-            if channel == "books5" and size is not None:
-                return [("book", symbol, {"bids": [[float(row[0]), float(row[1]) * size] for row in item["bids"]],
-                                          "asks": [[float(row[0]), float(row[1]) * size] for row in item["asks"]],
-                                          "time": int(item["ts"])})]
             if channel == "mark-price":
                 return [("mark", symbol, {"markPrice": float(item["markPx"]), "time": int(item["ts"])})]
             if channel == "funding-rate":
@@ -151,7 +261,7 @@ class OkxAdapter:
         self.contract_values = {inst_id: value for inst_id, _, _, _, value in BUILTIN}
         self.channels = [
             OkxChannel("business", BUSINESS_WS, {"trade": ["trades-all"]}, self),
-            OkxChannel("public", PUBLIC_WS, {"ticker": ["tickers"], "book": ["books5"],
+            OkxChannel("public", PUBLIC_WS, {"ticker": ["tickers"], "book": ["books"],
                                              "mark": ["mark-price", "funding-rate"]}, self),
         ]
         self._last_request = 0.0

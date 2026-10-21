@@ -680,12 +680,17 @@ class RelativeLayerTests(unittest.TestCase):
 class FeedIntegrationTests(unittest.TestCase):
     def test_futures_native_periods_and_rollup_share_detector_and_publish_revisions(self):
         import ingest
+        from test_feed_lifecycle import ScriptedApi
+        from test_period import Clock
         manager = ingest.FeedManager()
         small = manager._new_feed(("SHFE.fu2611", 10))
         manager.feeds[(small.symbol, 10)] = small
         big = manager._new_feed((small.symbol, 30))
         manager.feeds[(big.symbol, 30)] = big
         rollup = manager._new_feed((big.symbol, 60))
+        api = ScriptedApi(manager, Clock())
+        for feed in (small, big):               # 订阅好、知道实际月份后接上同一个检测器
+            self.assertTrue(manager._run_api_attempt(api, feed))
         self.assertIs(small.large_trades, big.large_trades)
         self.assertIs(rollup.large_sources()[0], big.large_trades)
         d = small.large_trades

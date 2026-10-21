@@ -4,7 +4,7 @@
 合约代码沿用 TradingView 的写法 ``BINANCE.BTCUSDT.P``。
 
 - 推送: ``/market`` 路径收逐笔成交(aggTrade, ``m=true`` 表示买方挂单即主动卖)、24 小时行情与
-  标记价格/资金费率; 五档盘口(depth5@500ms)只在 ``/public`` 路径上有。2026-10 实测旧路径
+  标记价格/资金费率; 20 档盘口(depth20@100ms)只在 ``/public`` 路径上有。2026-10 实测旧路径
   ``/ws/``、``/stream`` 能握手却收不到任何消息, 所以必须带 ``/market``、``/public``。
   同一条连接上可以随时 SUBSCRIBE / UNSUBSCRIBE, 增减合约不用断线。
 - REST(fapi): 合约列表与最近的逐笔成交。部分地区返回 451(开发服务器就是), 此时只用归档包。
@@ -127,7 +127,7 @@ class BinanceAdapter:
     def __init__(self):
         self.channels = [
             BinanceChannel("market", MARKET_WS, {"trade": "aggTrade", "ticker": "ticker", "mark": "markPrice@1s"}),
-            BinanceChannel("public", PUBLIC_WS, {"book": "depth5@500ms"}),
+            BinanceChannel("public", PUBLIC_WS, {"book": "depth20@100ms"}),
         ]
 
     def builtin_instruments(self) -> list[Instrument]:

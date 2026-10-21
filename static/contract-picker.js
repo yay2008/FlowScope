@@ -1,6 +1,6 @@
 /* 自研合约二级级联菜单(不用原生 <select>)。
  *
- * 结构: 一级 = 品种(交易所吸顶分组, 按持仓量降序), 二级 = 该品种的月份(第一项恒为★主力)。
+ * 结构: 一级 = 品种(交易所吸顶分组, 按持仓量降序), 二级 = 自动换月主力 + 全部固定月份。
  *       一级上面是分类页签(期货 / 加密), 一次只列一个分类; 只有一个分类时不显示页签。
  * 交互: 悬停/点击品种即出月份; 点击月份即切换; 键盘 ↑↓ 移动、→/← 换列、Tab/Shift+Tab 换分类、
  *       Enter 确认、Esc 关闭; 打开菜单时停在当前合约所属的分类;
@@ -361,7 +361,7 @@
           appendFuturesInfo(item, name, qty, product, "主力合约");
         }
         // 品种行上的 ☆ 收藏的是它的主力(主连), 与二级第一项是同一个合约; 加密永续就是它本身
-        appendStar(item, product.contSymbol, product.crypto ? "" : "该品种主力", productStars);
+        appendStar(item, product.contSymbol, product.crypto ? "" : "主力 · 自动换月", productStars);
         item.addEventListener("mouseenter", () => selectProduct(index, false));
         item.addEventListener("click", () => selectProduct(index, true));
         item.addEventListener("dblclick", () => pick(product.contSymbol));   // 双击 = 直接主力
@@ -370,7 +370,7 @@
       });
     }
 
-    function appendFuturesInfo(item, name, interest, data, prefix = "") {
+    function appendFuturesInfo(item, name, interest, data, prefix = "", detail = "") {
       const info = node("picker-info");
       const metrics = node("picker-metrics");
       const volume = doc.createElement("span");
@@ -382,7 +382,13 @@
         (data.previousVolumeDate ? ` · ${data.previousVolumeDate}` : "") +
         (valid ? "" : " · 暂无数据");
       metrics.append(interest, volume);
-      info.append(name, metrics);
+      info.append(name);
+      if (detail) {
+        const description = node("picker-detail");
+        description.textContent = detail;
+        info.append(description);
+      }
+      info.append(metrics);
       item.append(info);
     }
 
@@ -413,7 +419,7 @@
       if (!product) return;
       const state = monthState.get(productKey(product));
       const head = node("picker-months-head");
-      head.textContent = `${product.crypto ? "永续" : "月份"} · ${product.name}` +
+      head.textContent = `${product.crypto ? "永续" : "主力 / 固定月份"} · ${product.name}` +
         (state && state.status === "loading" ? "（加载中…）" : "");
       el.months.append(head);
       core.monthOptions(product, (state && state.months) || []).forEach((option, index) => {
@@ -422,17 +428,24 @@
         const name = doc.createElement("span");
         name.className = "picker-name";
         name.textContent = product.crypto ? `${product.name} · ${product.exchangeName}`
-          : (option.isMain ? "★ " : "") + (option.name || option.symbol);
-        name.title = option.symbol;
+          : option.autoFollow ? "主力 · 自动换月" : (option.name || option.symbol);
+        name.title = product.crypto ? option.symbol : option.autoFollow
+          ? `自动跟随主力月份 · ${option.symbol}${option.currentSymbol ? " → " + option.currentSymbol : ""}`
+          : `固定月份 · ${option.symbol}`;
         if (product.crypto) item.append(name);
         else {
           const interest = doc.createElement("span");
           interest.className = "picker-qty";
           interest.textContent = `昨仓 ${flow.formatOpenInterest(option.openInterest)}`;
           interest.title = "昨日持仓量（手，单边）";
-          appendFuturesInfo(item, name, interest, option);
+          const current = option.name !== product.name ? option.name : option.currentSymbol;
+          const detail = option.autoFollow
+            ? (current ? `当前：${current}` : "自动跟随主力月份")
+            : "固定月份" + (option.isMain ? " · 当前主力" : "");
+          appendFuturesInfo(item, name, interest, option, "", detail);
         }
-        appendStar(item, option.symbol, option.isMain && !product.crypto ? "该品种主力" : "", monthStars);
+        appendStar(item, option.symbol, product.crypto ? "" :
+          option.autoFollow ? "主力 · 自动换月" : "固定月份", monthStars);
         item.addEventListener("mouseenter", () => {
           level = "month";
           monthIndex = index;

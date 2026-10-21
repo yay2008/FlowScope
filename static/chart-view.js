@@ -714,6 +714,7 @@
                     profiles: initialProfiles = [], onProfilesChange = noop,
                     obOptions: initialObOptions = {}, onObOptionsChange = noop }) {
     let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
+    let dataContract = symbol; // 自选主力的稳定代码与实际采集月份可以不同。
     let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
     let derived = null;   // 派生数组(rolling sma/zscore 等)
     // 本图实际请求的拆分粒度, 协议: 0=tick, 正数=实际小周期 K线。每轮加载时按工具栏定下, 推送消息按它过滤
@@ -736,6 +737,7 @@
                     ...initialShown };
     if (!FlowLargeTrades.MIN_RADIUS_OPTIONS.includes(shown.largeMinRadius)) shown.largeMinRadius = 8;
     let obOptions = FlowIndicators.normalizeObOptions(initialObOptions);
+    const obTracker = FlowIndicators.createObTracker();
 
     // ---------- 容器: 图表本身 + 左上角的周期下拉框和主图指标图例 ----------
 
@@ -1169,7 +1171,8 @@
     function derive() {
       derived = FlowIndicators.derive(bars, cfg, settings.bandK);
       derived.htfEma = deriveHtfEma();
-      derived.ob = obVisible() ? FlowIndicators.deriveObZones(bars, obOptions) : null;
+      const ob = obTracker.update(bars, obOptions, barsLtf);
+      derived.ob = obVisible() ? ob : null;
     }
 
     function levelOf(kind, i) {
@@ -1404,12 +1407,12 @@
       onObOptionsChange();
     }
 
-    // OB 默认关闭: 只在显示时随行情重算(见 derive); 开关、视图或参数变了在这里现算, 隐藏时丢掉结果。
+    // 隐藏时也维护计算状态，避免再次开启时丢失已裁剪历史的防重叠影响。
     function obVisible() {
       return shown.ob && settings.view !== "footprint";
     }
     function refreshOb() {
-      if (derived) derived.ob = obVisible() ? FlowIndicators.deriveObZones(bars, obOptions) : null;
+      if (derived) derived.ob = obVisible() ? obTracker.update(bars, obOptions, barsLtf) : null;
       renderObZones();
     }
 
@@ -1422,7 +1425,8 @@
       const bull = active.filter((z) => z.side === "bull").length;
       const last = bars.length - 1;
       const signal = result.bullCreate[last] ? " · 新多区" : result.bearCreate[last] ? " · 新空区" : "";
-      obReadout.textContent = bars.length <= obOptions.zLen ? "预热中" : `多 ${bull} / 空 ${active.length - bull}${signal}`;
+      obReadout.textContent = result.historyCount <= obOptions.zLen ? "预热中" : `多 ${bull} / 空 ${active.length - bull}${signal}`;
+      obReadout.title = `计算历史 ${result.historyCount} 根；未收盘信号可撤回。`;
     }
 
     // 区域文字和量条端点只随 OB 结果变; 每帧(拖动、十字光标)只换算坐标, 不重复格式化。
@@ -1541,6 +1545,19 @@
     let htfLoad = null;              // 进行中的请求 {htf, controller}
     let htfRetryTimer = null;
     let htfRefresh = false;          // 推送断开过: 重连拿到快照后重要一次
+    function acceptDataContract(data) {
+      const next = data.contract || symbol;
+      if (next === dataContract) return;
+      dataContract = next;
+      obTracker.reset();
+      htfLoad?.controller.abort();
+      htfLoad = null;
+      clearTimeout(htfRetryTimer);
+      htfHistories.clear();
+      htfRefresh = true;
+      largeStrengthMemo.clear();
+    }
+
     async function loadHtfHistory(refresh = false, attempt = 0) {
       const htf = htfOf();
       if (!htfEmaShown() || (!refresh && htfHistories.has(htf)) || htfLoad?.htf === htf) return;
@@ -1549,12 +1566,14 @@
       const load = { htf, controller: new AbortController() };
       htfLoad = load;
       try {
+        // 按本图代码要(主力的大周期 Feed 跟着换月), 不按实际月份要: 否则后端另建一套固定月份的订阅
         const resp = await fetch(`/api/history?symbol=${encodeURIComponent(symbol)}&ltf=0&tf=${htf}`,
                                  { signal: load.controller.signal });
         const data = resp.ok ? await resp.json() : null;
         if (htfLoad !== load) return;
         htfLoad = null;
-        if (data?.pending) {         // 后端还没合成好: 过一会儿再要, 次数同本图加载
+        // 换月前后大周期与本图可能一时对不上月份: 不混用, 同还没合成好一样过一会儿再要
+        if (data?.pending || (data && (data.contract || symbol) !== dataContract)) {
           if (attempt < RETRY_MAX_ATTEMPTS) htfRetryTimer = setTimeout(() => loadHtfHistory(refresh, attempt + 1), RETRY_DELAY_MS);
           return;
         }
@@ -2417,7 +2436,7 @@
       loadHtfHistory();        // 足迹图下不要大周期历史, 切回 K 线时补上
       fpSeries.applyOptions({ visible: isFp });
       applyBandVisibility();   // 足迹图下强制隐藏叠加带, 切回 K 线按开关恢复
-      refreshOb();             // 足迹图下不算 OB, 切回 K 线现算
+      refreshOb();             // 足迹图下只隐藏 OB，继续维护计算历史。
       setObPanel(false);
       renderLargeTrades();
       renderLegend();          // 足迹图下主图指标全部隐藏, 图例跟着收起
@@ -2538,6 +2557,7 @@
           }, 3000);
           return;
         }
+        acceptDataContract(data);
         cfg = data.cfg;
         bars = data.bars;
         barsLtf = data.ltf;
@@ -2617,6 +2637,7 @@
               onStatus(false, msg.error || "行情源: " + (msg.status?.lastError || msg.status?.status || "未知"));
             } else if (synced) onStatus(true, "已连接");
           } else if (msg.symbol === symbol && msg.type === "snapshot" && msg.ltf === ltf && msg.tf === tf) {
+            acceptDataContract(msg);
             cfg = msg.cfg;
             bars = FlowData.mergeBars([], msg.bars);
             barsLtf = msg.ltf;
@@ -2659,6 +2680,7 @@
       setMeasurePhase("off");   // 量的是旧周期的 bar, 换周期就清掉
       setProfilePhase("off");   // 画了一半的作罢; 画好的按时间记, 新周期的数据到了按它重算
       bars = [];
+      obTracker.reset();
       barsLtf = null;
       largeStrengthMemo.clear();
       largePoints = [];

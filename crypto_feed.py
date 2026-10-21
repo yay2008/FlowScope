@@ -55,6 +55,7 @@ RECOMPUTE_SEC = 0.5        # 有页面在看的合约: 有新成交时最多每�
 IDLE_RECOMPUTE_SEC = 5.0   # 没人看的合约: 有 bar 走完才算(要落盘), 否则最多每这么久算一次
 RECV_TIMEOUT_SEC = 0.25    # 收消息的等待上限, 也决定停止与订阅变更的响应速度
 STALE_SEC = 60.0           # 连接着却这么久一条消息都没有, 当作连接已死, 主动重连
+BOOK_DROPPED = "盘口连接中断，正在重新同步"   # 断线时作废盘口的说明(模拟交易拒单时给出)
 OPEN_TIMEOUT_SEC = 10.0
 MAX_BACKOFF_SEC = 60
 TRIM_SLACK = 100           # 内存里的 bar 超出窗口这么多根才裁一次, 不必每笔成交都裁
@@ -744,8 +745,10 @@ class Channel:
     """一路行情 WebSocket: 自己一个线程, 只管连接、订阅增减与解析, 事件交给管理线程。
 
     spec 由交易所适配器提供(见 binance_feed / okx_feed): url(topics)、subscribe_messages(topics)、
-    change_messages(current, wanted)、parse(raw) -> 事件列表、ping(空闲时发的保活消息, 可为 None)。
+    change_messages(current, wanted)、parse(raw) -> 事件列表、ping(空闲时发的保活消息, 可为 None);
+    可选 pending_messages() -> 要在这条连接上补发的消息(OKX 单独重订一个合约的盘口)。
     要订阅的 topic 由 wanted() 给出(管理线程算好的集合), 为空时不连接。
+    断线时把这条连接发布过的盘口全部作废: 重连收到新盘口之前, 模拟交易不能拿断线前的盘口撮合。
     """
 
     def __init__(self, key: str, spec, wanted, emit, connect=_connect):
@@ -760,6 +763,7 @@ class Channel:
         self.last_error: str | None = None
         self.connects = 0
         self.last_message_at: float | None = None
+        self._books: set[str] = set()      # 这条连接发布过盘口的合约, 断线时作废
 
     def start(self):
         if self._thread is None or not self._thread.is_alive():
@@ -804,6 +808,10 @@ class Channel:
                 self.status = "error"
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 print(f"[crypto] {self.key} 行情连接断开: {self.last_error}", flush=True)
+            finally:
+                for symbol in sorted(self._books):
+                    self.emit(("book", symbol, {"bids": [], "asks": [], "valid": False, "reason": BOOK_DROPPED}))
+                self._books.clear()
             if self._stop.wait(backoff):
                 break
             backoff = min(backoff * 2, MAX_BACKOFF_SEC)
@@ -827,9 +835,14 @@ class Channel:
             if raw is not None:
                 last_message = self.last_message_at = now
                 for event in self.spec.parse(raw):
+                    if event[0] == "book":
+                        self._books.add(event[1])
                     self.emit(event)
             elif now - last_message >= STALE_SEC:
                 raise ConnectionError(f"{STALE_SEC:.0f} 秒没有收到行情")
+            pending = getattr(self.spec, "pending_messages", None)
+            for message in pending() if pending is not None else ():
+                socket.send(message)
             ping = self.spec.ping
             if ping is not None and now - max(last_message, last_ping) >= self.spec.ping_sec:
                 socket.send(ping)
@@ -945,6 +958,10 @@ class CryptoManager:
     def feed_retry_error(self, feed) -> str | None:
         """接口与 FeedManager 一致; 加密行情没有订阅冷却, 连接问题看 status_snapshot。"""
         return None
+
+    def serves(self, symbol: str, tf: int, feed) -> bool:
+        """接口与 FeedManager 一致; 加密没有借用别的 Feed 的别名, 拿到的 Feed 一直是它。"""
+        return True
 
     def _ensure_rollup(self, symbol: str, tf: int):
         """大周期: 底层 30s(单个交易所或多所汇总)没在采集就一并建上, 再建合成 Feed。"""
@@ -1246,8 +1263,14 @@ class CryptoManager:
                 self._dirty.add(symbol)
         else:
             with self._lock:
-                entry = self.quotes.setdefault(symbol, {}).setdefault(kind, {})
-                entry.update(event[2])
+                quotes = self.quotes.setdefault(symbol, {})
+                if kind == "book":
+                    # 每条都是整份盘口: 换掉而不是合并, 断线作废时的说明不会留到重连之后
+                    quotes[kind] = entry = dict(event[2])
+                else:
+                    # 标记价格与资金费率是两路推送, 合进同一份
+                    entry = quotes.setdefault(kind, {})
+                    entry.update(event[2])
                 entry["received"] = time.time()    # 本地收到的时刻: 判断盘口新不新鲜, 不受两边时钟差影响
 
     def _apply_results(self, now: float):

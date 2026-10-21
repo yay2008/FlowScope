@@ -17,12 +17,15 @@ import ingest
 class FakeApi:
     """只实现自选报价用到的两个 SDK 方法。"""
 
-    def __init__(self, quotes=None, missing=()):
+    def __init__(self, quotes=None, missing=(), mains=None, info_error=None):
         self.quotes = dict(quotes or {})
         self.missing = set(missing)
         self.waits = 0
         self.calls = []
         self.listings = []
+        self.mains = dict(mains or {})
+        self.info_calls = []
+        self.info_error = info_error
 
     def get_quote(self, symbol):
         self.calls.append(symbol)
@@ -30,10 +33,19 @@ class FakeApi:
             raise RuntimeError("合约不存在")
         return self.quotes[symbol]
 
-    def query_quotes(self, exchange_id=None, product_id=None, **kwargs):
+    def query_quotes(self, exchange_id=None, product_id=None, ins_class=None, **kwargs):
         """"合约是否存在"的过滤查询: 有报价的合约都算存在。"""
         self.listings.append((exchange_id, product_id))
-        return [symbol for symbol in self.quotes if symbol not in self.missing]
+        return [symbol for symbol in self.quotes if symbol not in self.missing
+                and (ins_class != "CONT" or symbol.startswith("KQ.m@"))]
+
+    def query_symbol_info(self, symbols):
+        self.info_calls.append(list(symbols))
+        if self.info_error is not None:
+            raise self.info_error
+        return [{"instrument_id": symbol, "underlying_symbol": self.mains.get(symbol, ""),
+                 "instrument_name": getattr(self.quotes.get(symbol), "instrument_name", symbol),
+                 "pre_open_interest": 0} for symbol in symbols]
 
     def wait_update(self, deadline=None):
         self.waits += 1
@@ -47,6 +59,7 @@ class FakeManager:
         self.api = api if api is not None else FakeApi()
         self.error = error
         self.calls = 0
+        self.mains = ingest.MainContracts()
 
     async def query(self, fn, timeout=None):
         self.calls += 1
@@ -217,6 +230,64 @@ class ServiceTests(unittest.TestCase):
         data = asyncio.run(self.service(manager).watch([]))
         self.assertEqual(data, {"quotes": [], "source": "live", "error": None})
         self.assertEqual(manager.calls, 0)
+
+    def test_rollover_uses_shared_mapping_and_keeps_live_prices_and_fixed_months(self):
+        symbol = "KQ.m@SHFE.fu"
+        api = FakeApi({
+            symbol: quote(instrument_name="燃油主连", ins_class="CONT",
+                          underlying_symbol="SHFE.fu2611", last_price=4860, volume=221053),
+            "SHFE.fu2611": quote(last_price=5752),
+        }, mains={symbol: "SHFE.fu2611"})
+        manager = FakeManager(api)
+        service = fav.FavoritesService(lambda: manager, self.store, quotes_ttl=1, wait_sec=0)
+        wanted = [symbol, "SHFE.fu2611"]
+        with patch("favorites.time.monotonic", return_value=100) as clock:
+            before = asyncio.run(service.watch(wanted))
+            self.assertEqual(before["quotes"][0]["mainSymbol"], "SHFE.fu2611")
+            self.assertEqual(api.info_calls, [[symbol]])     # 只问主连, 不重建合约目录
+            api.mains[symbol] = "SHFE.fu2701"
+            clock.return_value = 102
+            asyncio.run(service.watch(wanted))
+            self.assertEqual(len(api.info_calls), 1)  # 每次报价轮询不重复查主力映射
+            clock.return_value = 100 + ingest.MAIN_CONTRACT_CHECK_SEC
+            after = asyncio.run(service.watch(wanted))
+            self.assertEqual(len(api.info_calls), 2)
+            self.assertEqual(manager.mains.resolve(api, [symbol]), {symbol: "SHFE.fu2701"})  # 图表读到的同一份
+            self.assertEqual(len(api.info_calls), 2)
+        self.assertEqual([row["symbol"] for row in after["quotes"]], wanted)
+        self.assertEqual(after["quotes"][0]["mainSymbol"], "SHFE.fu2701")
+        self.assertEqual(after["quotes"][0]["lastPrice"], 4860)
+        self.assertEqual(after["quotes"][0]["volume"], 221053)
+        self.assertEqual(after["quotes"][1]["mainSymbol"], "")
+        self.assertEqual(after["quotes"][1]["lastPrice"], 5752)
+        self.assertEqual(api.quotes[symbol].underlying_symbol, "SHFE.fu2611")  # 不改 SDK 对象
+        self.assertEqual(set(api.calls), set(wanted))  # 不另订阅月份行情
+
+    def test_refresh_bypasses_both_quote_and_main_mapping_caches(self):
+        symbol = "KQ.m@SHFE.fu"
+        api = FakeApi({symbol: quote(ins_class="CONT", underlying_symbol="SHFE.fu2611")},
+                      mains={symbol: "SHFE.fu2611"})
+        service = self.service(FakeManager(api))
+        asyncio.run(service.watch([symbol]))
+        api.mains[symbol] = "SHFE.fu2701"
+        data = asyncio.run(service.watch([symbol], refresh=True))
+        self.assertEqual(data["quotes"][0]["mainSymbol"], "SHFE.fu2701")
+
+    def test_mapping_failure_does_not_hide_live_quotes(self):
+        symbol = "KQ.m@SHFE.fu"
+        api = FakeApi({symbol: quote(ins_class="CONT", underlying_symbol="SHFE.fu2611",
+                                     last_price=4860)}, info_error=RuntimeError("合约服务暂不可用"))
+        data = asyncio.run(self.service(FakeManager(api)).watch([symbol]))
+        self.assertEqual(data["source"], "live")
+        self.assertEqual(data["quotes"][0]["lastPrice"], 4860)
+        self.assertEqual(data["quotes"][0]["mainSymbol"], "SHFE.fu2611")
+
+    def test_unknown_main_never_reaches_the_info_query(self):
+        """写错的主连(合约服务里没有)不能拿去 query_symbol_info: 会让整条连接停摆。"""
+        api = FakeApi({"KQ.m@SHFE.fu": quote(ins_class="CONT")}, missing={"KQ.m@SHFE.fu"})
+        data = asyncio.run(self.service(FakeManager(api)).watch(["KQ.m@SHFE.fu"]))
+        self.assertEqual(data["quotes"][0]["lastPrice"], None)
+        self.assertEqual(api.info_calls, [])
 
     def test_unavailable_ingest_thread_still_lists_the_codes(self):
         service = self.service(FakeManager(error=RuntimeError("行情线程未就绪(error)")))

@@ -80,10 +80,13 @@ test("各分类命中数: 没有命中的分类也给 0", () => {
   assert.deepEqual(countByCategory(null, "x"), { futures: 0, crypto: 0 });
 });
 
-test("二级第一项恒为★主力, 即使月份列表为空或还没回来", () => {
+test("二级第一项自动跟随主力, 当前主力也能作为固定月份单独选择", () => {
   const withMonths = monthOptions(PRODUCTS[0], MONTHS);
-  assert.deepEqual(withMonths.map((o) => o.symbol), ["KQ.m@SHFE.fu", "SHFE.fu2701"]);
+  assert.deepEqual(withMonths.map((o) => o.symbol), ["KQ.m@SHFE.fu", "SHFE.fu2611", "SHFE.fu2701"]);
+  assert.deepEqual(withMonths.map((o) => o.autoFollow), [true, false, false]);
+  assert.equal(withMonths[0].currentSymbol, "SHFE.fu2611");
   assert.equal(withMonths[0].isMain, true);
+  assert.equal(withMonths[1].isMain, true);
   assert.equal(withMonths[0].openInterest, 428100);
   const withoutMonths = monthOptions(PRODUCTS[0], []);
   assert.deepEqual(withoutMonths.map((o) => o.symbol), ["KQ.m@SHFE.fu"]);
@@ -103,8 +106,8 @@ test("月份选项保留昨日成交量与日期, 月份未到时沿用主力的
   const options = monthOptions(product, MONTHS.map((month, i) => ({
     ...month, previousVolume: i ? 200 : 0, previousVolumeDate: "2026-10-20",
   })));
-  assert.deepEqual(options.map((item) => item.previousVolume), [0, 200]);
-  assert.deepEqual(options.map((item) => item.previousVolumeDate), ["2026-10-20", "2026-10-20"]);
+  assert.deepEqual(options.map((item) => item.previousVolume), [0, 0, 200]);
+  assert.deepEqual(options.map((item) => item.previousVolumeDate), ["2026-10-20", "2026-10-20", "2026-10-20"]);
 });
 
 test("一级上下键移动并请求预取对应品种的月份", () => {

@@ -171,8 +171,11 @@ function createChartStub() {
   };
 }
 
-function createLocalStorage() {
+// 页面默认左 30s、右 5m; 多数用例按 10s、30s 两张图写(10s 有足迹图、两图差 3 倍), 所以默认先记下这两个周期,
+// 测默认周期的用例传 { chartTfs: null }。
+function createLocalStorage({ chartTfs = "[10,30]" } = {}) {
   const data = new Map();
+  if (chartTfs) data.set("flowscope.chartTfs", chartTfs);
   return {
     getItem: (key) => (data.has(key) ? data.get(key) : null),
     setItem: (key, value) => data.set(key, String(value)),
@@ -305,6 +308,47 @@ test("合约选择器加载完成后自选状态可用(isFavorite 不踩暂时�
   assert.ok(picker, "ContractPicker 应挂在全局");
   // 目录已经画过一次月份(含 ☆), 再强制重绘一次也必须能取到自选状态
   assert.doesNotThrow(() => context.document.getElementById("picker-months"));
+});
+
+test("主力换月后顶部名称自动更新, 自选收起仍刷新, 后台暂停并在返回时补取", async () => {
+  let month = "2611";
+  let requests = 0;
+  const context = runBrowser({ fetch: (url, init) => {
+    if (String(url).split("?")[0] === "/api/symbol") {
+      requests += 1;
+      return Promise.resolve(jsonResponse({ symbol: "KQ.m@SHFE.fu", label: `燃油${month}` }));
+    }
+    return stubFetch(url, init);
+  } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const timers = new Map();
+  let nextTimer = 0;
+  context.setTimeout = (fn, delay) => {
+    const id = ++nextTimer;
+    timers.set(id, { fn, delay });
+    return id;
+  };
+  context.clearTimeout = (id) => timers.delete(id);
+  vm.runInContext("setWatchCollapsed(true)", context);
+  await vm.runInContext("labelOf(symbol)", context);
+  const timerId = vm.runInContext("labelTimer", context);
+  assert.equal(timers.get(timerId).delay, 60000);
+  month = "2701";
+  await timers.get(timerId).fn();
+  assert.equal(context.document.getElementById("picker-trigger").textContent, "燃油2701");
+  assert.equal(vm.runInContext("symbolLabel", context), "燃油2701");
+  const nextLabelTimer = vm.runInContext("labelTimer", context);
+  context.document.hidden = true;
+  context.document.handlers.visibilitychange.forEach((fn) => fn());
+  assert.equal(timers.has(nextLabelTimer), false);
+  const beforeHidden = requests;
+  await vm.runInContext("labelOf(symbol)", context);
+  assert.equal(requests, beforeHidden);
+  context.document.hidden = false;
+  month = "2705";
+  context.document.handlers.visibilitychange.forEach((fn) => fn());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(context.document.getElementById("picker-trigger").textContent, "燃油2705");
 });
 
 test("模拟交易面板加载后在 K 线上画出持仓均价、止盈与挂单价格线", async () => {
@@ -858,18 +902,18 @@ function paneSelectsOf(context, index) {
   return findAll(vm.runInContext(`charts[${index}].el`, context), (node) => node.className === "pane-select");
 }
 
-test("工具栏的周期下拉框已移除: 默认 10s、30s 两张图左右并排, 各自左上角有周期下拉框, 下面是本图的主图指标图例", () => {
+test("工具栏的周期下拉框已移除: 默认 30s、5m 两张图左右并排, 各自左上角有周期下拉框, 下面是本图的主图指标图例", () => {
   const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
   assert.ok(!html.includes('id="tf"'), "工具栏的周期下拉框应已移除");
   assert.ok(!html.includes('id="main-legend"'), "主图图例由图表组件建, 每张图一份");
   const app = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
   assert.ok(!app.includes('$("tf")'), "app.js 不应再绑定周期下拉框");
 
-  const context = runBrowser();
-  assert.equal(vm.runInContext("charts.map((c) => c.tf).join()", context), "10,30", "左 10s、右 30s");
+  const context = runBrowser({ localStorage: createLocalStorage({ chartTfs: null }) });
+  assert.equal(vm.runInContext("charts.map((c) => c.tf).join()", context), "30,300", "左 30s、右 5m");
   const corners = findAll(context.document.getElementById("chart"), (node) => node.className === "chart-corner");
   const selects = corners.map((corner) => corner.children[0].children[0]);
-  assert.deepEqual(selects.map((select) => select.value), ["10", "30"]);
+  assert.deepEqual(selects.map((select) => select.value), ["30", "300"]);
   assert.deepEqual(selects[0].children.map((o) => o.textContent),
                    ["10s", "30s", "1m", "5m", "15m", "1h", "4h"]);
   for (const corner of corners) {
@@ -1113,7 +1157,7 @@ test("OB Zones: 主图显隐独立持久化, 数量和量条正确, 切足迹隐
   const context = runBrowser({ localStorage: storage });
   feedObBars(context);
   assert.equal(obPrimitiveOf(1)._geometry().length, 0);
-  assert.equal(vm.runInContext("charts[1].derived.ob", context), null, "默认隐藏时不随行情重算");
+  assert.equal(vm.runInContext("charts[1].derived.ob", context), null, "默认隐藏绘图结果，内部仍维护历史状态");
   clickEye(context, 1, "ob");
   const [g] = obPrimitiveOf(1)._geometry();
   assert.deepEqual([g.x1, g.x2, g.buyX, g.sellX], [99 * 6, 109 * 6, 104 * 6, 100 * 6]);
@@ -1214,6 +1258,75 @@ test("OB Zones: 图元按实际价格坐标绘制、裁掉画外区域, 两条�
   assert.deepEqual(fills.slice(1), [["#00ffbb4d", 10, 20, 140, 20], ["#ff11004d", 10, 40, 35, 20]]);
   assert.deepEqual(texts, [["多 · ▲: 80 | ▼: 20", 297, 58]]);
 });
+
+for (const maxAge of [500, 2000]) {
+  test(`OB Zones: 隐藏期间滚动裁剪、模拟断线重连和补齐快照保持一致（年龄${maxAge}）`, async () => {
+    let price = 100;
+    const all = Array.from({ length: 921 }, (_, i) => {
+      const after = [100, 550].find((at) => i > at && i <= at + 40);
+      const body = [100, 550].includes(i) ? 20 : after != null ? ((i - after) % 2 ? -1 : 0) : (i % 2 ? -1 : 1);
+      const open = price; price += body;
+      return { time: 1700000000 + i * 30, open, close: price, high: Math.max(open, price) + 1,
+        low: Math.min(open, price) - 1, volume: 100, buy: 80, sell: 20, unknown: 0, coverage: "complete" };
+    });
+    const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+      colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
+    const contract = "SHFE.fu2611", sockets = [], timers = new Map();
+    const context = runBrowser({ fetch: (url) => String(url).startsWith("/api/history")
+      ? Promise.resolve(jsonResponse({ contract, cfg, bars: all.slice(0, 800), ltf: 0 })) : stubFetch(url) });
+    context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
+    let timerId = 0;
+    context.setTimeout = (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay }); return id; };
+    context.clearTimeout = (id) => timers.delete(id);
+    await new Promise((resolve) => setImmediate(resolve));
+    const socket = sockets.find((s) => new URL(s.url).searchParams.get("tf") === "30");
+    const send = (target, msg) => target.onmessage({ data: JSON.stringify({ symbol: "KQ.m@SHFE.fu", contract,
+      tf: 30, ltf: 0, cfg, ...msg }) });
+    const result = () => JSON.parse(vm.runInContext("JSON.stringify(charts[1].derived.ob)", context));
+    const checkFull = (history) => {
+      context.obFullHistory = history;
+      const expected = JSON.parse(vm.runInContext(`JSON.stringify((() => {
+        const full = FlowIndicators.deriveObZones(obFullHistory, charts[1].obOptions());
+        const from = obFullHistory.length - charts[1].bars.length;
+        return { zones: full.zones.filter(z => z.end >= from).map(z => ({ ...z,
+          start: z.start-from, created: z.created-from, end: z.end-from,
+          startTime: obFullHistory[z.start].time, createdTime: obFullHistory[z.created].time })),
+          ...Object.fromEntries(["zUp", "zDn", "bullCreate", "bearCreate"].map(k => [k, full[k].slice(from)])),
+          historyStart: obFullHistory[0].time, historyCount: obFullHistory.length };
+      })())`, context));
+      assert.deepEqual(result(), expected);
+    };
+    const age = obInput(context, 1, "maxAge");
+    age.value = String(maxAge); age.handlers.change[0]();
+    send(socket, { type: "snapshot", revision: 0, bars: all.slice(0, 800) });
+    for (let i = 800; i < 901; i++) send(socket, { type: "bars", revision: i - 799, bars: [all[i]] });
+    assert.equal(vm.runInContext("charts[1].derived.ob", context), null, "隐藏期间只维护状态");
+    clickEye(context, 1, "ob");
+    assert.equal(vm.runInContext("charts[1].bars.length", context), 800);
+    assert.equal(result().historyCount, 901);
+    assert.deepEqual(result().zones.map(z => z.status), [maxAge === 500 ? "expired" : "active"]);
+    checkFull(all.slice(0, 901));
+    const beforeReconnect = result();
+    const geometry = JSON.stringify(obPrimitiveOf(1)._geometry());
+    socket.onclose();
+    const reconnect = [...timers.values()].find(timer => timer.delay === 3000);
+    assert.ok(reconnect, "断线后安排重连");
+    reconnect.fn();
+    const nextSocket = sockets.at(-1);
+    assert.notEqual(nextSocket, socket);
+    send(nextSocket, { type: "snapshot", revision: 0, bars: all.slice(101, 901) });
+    assert.deepEqual(result(), beforeReconnect, "相同数据重连后全部区域和Z序列不变");
+    assert.equal(JSON.stringify(obPrimitiveOf(1)._geometry()), geometry, "实际绘图坐标和量条不变");
+    send(nextSocket, { type: "snapshot", revision: 1, bars: all.slice(-800) });
+    checkFull(all); // 补上断线期间的20根，不丢之前已经接收的历史。
+    send(socket, { type: "snapshot", revision: 999, bars: all.slice(0, 800) });
+    checkFull(all); // 旧连接迟到消息不能覆盖新连接。
+    const newContractBars = all.slice(-800).map(b => ({ ...b, open: b.open + 1000, close: b.close + 1000,
+      high: b.high + 1000, low: b.low + 1000 }));
+    send(nextSocket, { type: "snapshot", contract: "SHFE.fu2701", revision: 2, bars: newContractBars });
+    checkFull(newContractBars); // 实际换月必须重置，不能继承旧月份区域。
+  });
+}
 
 test("大额成交: 买卖两侧各画一个点, 大小按该侧量, 对冲不抵消, 只有未知方向不画, 悬停保留买卖明细", () => {
   const storage = createLocalStorage();
@@ -1868,6 +1981,82 @@ const pickHtf = (ctx, index, value) => {
   htfPickOf(ctx, index).value = value;
   htfPickOf(ctx, index).handlers.change[0]();
 };
+
+for (const pendingOldHistory of [false, true]) {
+  test(`主力换月整段替换 K 线, 清掉${pendingOldHistory ? "正在请求的" : "已缓存的"}旧月份大周期历史`, async () => {
+    const symbol = "KQ.m@SHFE.fu";
+    const oldContract = "SHFE.fu2611", newContract = "SHFE.fu2701";
+    const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+      colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
+    const start = 1700000100;
+    const makeBars = (price, first = 0) => Array.from({ length: 120 - first }, (_, i) => ({
+      time: start + (first + i) * 30, open: price, high: price + 1, low: price - 1, close: price,
+      volume: 100, buy: 60, sell: 40, delta: 20, cvd: (i + 1) * 20, coverage: "complete",
+    }));
+    const oldBars = makeBars(5700), newBars = makeBars(4800, 2);
+    const seed = (price) => Array.from({ length: 100 }, (_, i) => ({ time: start - (100 - i) * 300, close: price }));
+    const requests = [], sockets = [];
+    const context = runBrowser({ fetch: (url, init) => {
+      const request = new URL(String(url), "http://local/");
+      if (request.pathname !== "/api/history") return stubFetch(url);
+      if (["10", "30"].includes(request.searchParams.get("tf"))) {
+        return Promise.resolve(jsonResponse({ symbol, contract: oldContract, cfg, bars: oldBars, ltf: 0 }));
+      }
+      return new Promise((resolve) => requests.push({ symbol: request.searchParams.get("symbol"),
+        tf: request.searchParams.get("tf"), signal: init.signal, resolve }));
+    } });
+    context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
+    const timers = [];
+    context.setTimeout = (fn, delay) => { timers.push({ fn, delay }); return timers.length; };
+    const flush = () => new Promise((resolve) => setImmediate(resolve));
+    await flush();
+    const socket = sockets.find((s) => new URL(s.url).searchParams.get("tf") === "30");
+    const send = (contract, bars, revision) => socket.onmessage({ data: JSON.stringify({
+      type: "snapshot", symbol, contract, tf: 30, ltf: 0, revision, cfg, bars,
+    }) });
+    const values = () => JSON.parse(JSON.stringify(htfSeriesOf(1).map((s) => s.data.map((p) => p.value))));
+    const expected = (history = []) => JSON.parse(vm.runInContext(
+      `JSON.stringify(FlowIndicators.htfEma(charts[1].bars, 300, [21, 55], ${JSON.stringify(history)}).lines.map(line => line.slice(-100)))`,
+      context));
+    send(oldContract, oldBars, 1);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].symbol, symbol, "大周期按主力代码要, 不另建固定月份的订阅");
+    if (!pendingOldHistory) {
+      requests[0].resolve(jsonResponse({ contract: oldContract, bars: seed(6000) }));
+      await flush();
+      assert.deepEqual(values(), expected(seed(6000)), "旧月份的大周期历史已参与指标");
+      assert.notDeepEqual(values(), expected());
+    }
+
+    send(newContract, newBars, 2);
+    assert.deepEqual(JSON.parse(vm.runInContext("JSON.stringify(charts[1].bars)", context)), newBars,
+      "旧月份独有的前两根必须删除, 不能按时间合并");
+    assert.deepEqual(values(), expected(), "新月份先只用自己的 K 线重算, 不混旧月份的大周期种子");
+    assert.equal(requests.length, 2);
+    assert.deepEqual([requests[1].symbol, requests[1].tf], [symbol, "300"]);
+    if (pendingOldHistory) {
+      assert.equal(requests[0].signal.aborted, true, "取消旧月份仍在途的请求");
+      requests[0].resolve(jsonResponse({ contract: oldContract, bars: seed(6000) }));
+      await flush();
+      assert.deepEqual(values(), expected(), "即使旧请求迟到也不能写回新月份的指标");
+    }
+    // 后端的大周期还没切到新月份: 不拿旧月份的收盘价播种, 过一会儿再要
+    requests[1].resolve(jsonResponse({ contract: oldContract, bars: seed(6000) }));
+    await flush();
+    assert.deepEqual(values(), expected(), "大周期还是旧月份时不能播种新月份的指标");
+    const retry = timers.findLast((timer) => timer.delay === 5000);
+    assert.ok(retry, "月份对不上时排一次重试");
+    retry.fn();
+    assert.equal(requests.length, 3);
+    assert.deepEqual([requests[2].symbol, requests[2].tf], [symbol, "300"]);
+    requests[2].resolve(jsonResponse({ contract: newContract, bars: seed(4700) }));
+    await flush();
+    assert.deepEqual(values(), expected(seed(4700)), "新月份历史就绪后重新播种大周期 EMA");
+    socket.onmessage({ data: JSON.stringify({ type: "bars", symbol, tf: 30, ltf: 0, revision: 1, bars: oldBars }) });
+    assert.deepEqual(JSON.parse(vm.runInContext("JSON.stringify(charts[1].bars)", context)), newBars,
+      "旧 revision 的增量不能写回");
+  });
+}
 
 test("大周期EMA: 下拉框列出比本图大的周期(默认至少 4 倍的最小一档), 粗线按所选大周期画、画线范围自己切; 选择和开关只管本图、记进 localStorage", async () => {
   const storage = createLocalStorage();
@@ -2927,12 +3116,11 @@ test("切换周期: 本图按新周期重新请求, 顶栏状态换成新周期�
   assert.equal(tfSelectOf(reloaded, 1).value, "300");
 });
 
-test("记下的周期不合法(旧版、手改)就回到默认的左 10s、右 30s", () => {
+test("记下的周期不合法(旧版、手改)就回到默认的左 30s、右 5m", () => {
   for (const saved of ["[10,45]", "[60]", "oops"]) {
-    const localStorage = createLocalStorage();
-    localStorage.setItem("flowscope.chartTfs", saved);
+    const localStorage = createLocalStorage({ chartTfs: saved });
     const context = runBrowser({ localStorage });
-    assert.equal(vm.runInContext("charts.map((c) => c.tf).join()", context), "10,30", saved);
+    assert.equal(vm.runInContext("charts.map((c) => c.tf).join()", context), "30,300", saved);
   }
 });
 

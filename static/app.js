@@ -1,6 +1,6 @@
 /* FlowScope 前端: 页面级逻辑
  * 工具栏、合约选择器、自选面板、模拟交易面板在这里; 图表本身(K线/指标/足迹图与数据推送)是 chart-view.js 里
- * 可实例化的组件, 每张图一个主周期, 左上角的下拉框切换。页面放两张图左右并排(默认 10s、30s):
+ * 可实例化的组件, 每张图一个主周期, 左上角的下拉框切换。页面放两张图左右并排(默认 30s、5m):
  * 共用状态 settings(工具栏的视图/买卖口径, FlowMeter 窗格的模式/阈值)两张图共用, 十字光标与可视时间范围联动,
  * 主图指标的显示开关和读数每张图各管各的。
  */
@@ -44,9 +44,9 @@ if (CRYPTO_SYMBOL.test(symbol)) {
 // 左右两张图, 周期各自在左上角切换。后端按 (symbol, tf) 各出一份快照, 每张图各自加载、各自连推送。
 
 // 两张图的周期记在 localStorage(切合约是整页重载, 不记的话每次都被打回默认), 读不到或不合法就用默认的
-// 左 10s、右 30s。chartTfs 跟着切换更新, 早于 charts 声明: 建图时就会报连接状态(见 setChartStatus)。
+// 左 30s、右 5m。chartTfs 跟着切换更新, 早于 charts 声明: 建图时就会报连接状态(见 setChartStatus)。
 const CHART_TFS_KEY = "flowscope.chartTfs";
-const DEFAULT_CHART_TFS = [10, 30];
+const DEFAULT_CHART_TFS = [30, 300];
 
 function loadChartTfs() {
   try {
@@ -312,7 +312,15 @@ $("cvd-source").addEventListener("change", (e) => {
 // 选择结果统一写回 URL 的 symbol 参数, 由页面重载完成切换与重连。
 
 // 合约展示名: 写到选择器按钮上, 取不到就留着按钮按目录显示的名字, 不阻塞图表加载。
+const LABEL_POLL_MS = 60000;
+let labelTimer = null;
+let labelPending = false;
+
 async function labelOf(target) {
+  clearTimeout(labelTimer);
+  labelTimer = null;
+  if (labelPending || document.hidden) return;
+  labelPending = true;
   try {
     const data = await fetchJson(`/api/symbol?symbol=${encodeURIComponent(target)}`);
     if (symbol === target && data && data.label) {
@@ -320,6 +328,13 @@ async function labelOf(target) {
       picker.setLabel(data.label);
     }
   } catch (error) { /* 按钮上已经有目录给的名字或原始代码 */ }
+  finally {
+    labelPending = false;
+    // 名称更新不依赖自选是否展开; 长时间开着图也能跟随主力换月。
+    if (symbol === target && target.startsWith("KQ.m@") && !document.hidden) {
+      labelTimer = setTimeout(() => labelOf(target), LABEL_POLL_MS);
+    }
+  }
 }
 
 function switchSymbol(target) {
@@ -576,8 +591,13 @@ $("watch-toggle").addEventListener("click", () => {
 });
 // 页面切到后台就不再轮询, 回来立刻补一次。
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) clearTimeout(watchTimer);
-  else scheduleWatch(0);
+  if (document.hidden) {
+    clearTimeout(watchTimer);
+    clearTimeout(labelTimer);
+  } else {
+    scheduleWatch(0);
+    labelOf(symbol);
+  }
 });
 
 // ---------- 模拟交易(右侧面板; 撮合与账户在服务端 paper.py) ----------

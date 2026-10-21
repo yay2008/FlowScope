@@ -13,7 +13,7 @@
   <span class="logo">FlowScope</span>
   <div id="picker" class="picker">
     <button id="picker-trigger" class="picker-trigger" aria-haspopup="listbox" aria-expanded="false"
-            title="选择品种与月份：输入即搜索（中文名/代码），↑↓ 移动，→/← 换列，Tab 切换期货/加密，Enter 确认，Esc 关闭；双击品种 = 主力。切换合约只走这里。">选择合约</button>
+            title="选择主力或固定月份：主力自动换月；输入即搜索（中文名/代码），↑↓ 移动，→/← 换列，Tab 切换期货/加密，Enter 确认，Esc 关闭；双击品种 = 自动换月主力。">选择合约</button>
     <div id="picker-popup" class="picker-popup" hidden>
       <div class="picker-search-bar">
         <input id="picker-search" type="text" placeholder="搜索品种 / 代码，如 燃油、fu、rb" spellcheck="false" autocomplete="off">
@@ -21,9 +21,9 @@
       <div id="picker-tabs" class="picker-tabs" role="tablist" aria-label="分类" hidden></div>
       <div class="picker-columns">
         <div id="picker-products" class="picker-col" role="listbox" aria-label="品种"></div>
-        <div id="picker-months" class="picker-col" role="listbox" aria-label="月份"></div>
+        <div id="picker-months" class="picker-col" role="listbox" aria-label="主力与月份"></div>
       </div>
-      <div id="picker-foot" class="picker-foot">↑↓ 移动 · →/← 换列 · Tab 换分类 · Enter 确认 · Esc 关闭 · 双击品种=主力 · ☆ 加自选</div>
+      <div id="picker-foot" class="picker-foot">主力自动换月 · 固定月份不换月 · ☆ 加自选<br>↑↓ 移动 · →/← 换列 · Tab 换分类 · Enter 确认 · 双击品种选主力</div>
     </div>
   </div>
   <label>视图
@@ -64,7 +64,7 @@
     <div id="watch-hint">加载中…</div>
     <ul id="watch-items"></ul>
   </aside>
-  <!-- 10s、30s 两张图由 chart-view.js 在这里创建, 左右并排 -->
+  <!-- 两张图(默认 30s、5m)由 chart-view.js 在这里创建, 左右并排 -->
   <div id="chart">
     <!-- AI 看图分析的浮层(ai-panel.js): 盖在图表上, 标题栏拖动、右下角拉大小 -->
     <div id="ai-panel" class="ai-panel" hidden>

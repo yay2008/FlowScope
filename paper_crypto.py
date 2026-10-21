@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
-"""加密永续的模拟交易: U 本位、全仓、单向净持仓; 按推送的五档盘口撮合, 计手续费、资金费, 爆仓强平。
+"""加密永续的模拟交易: U 本位、全仓、单向净持仓; 按推送的深度盘口撮合, 计手续费、资金费, 爆仓强平。
 
 和期货模拟账户(paper.py)分开记账: 币种(USDT 对人民币)、数量(小数的币对整数手)、杠杆、
 24 小时交易、资金费都不一样, 放在一个账户里没有意义。账户在 ``data/paper/crypto.json``,
 同样是临时文件 + ``os.replace`` 原子替换(复用 paper.PaperStore)。
 
-规则(结果只作参考 —— 看不到排队, 五档盘口 500ms 一次):
+规则(结果只作参考 —— 看不到排队, 币安 20 档 / OKX 400 档盘口, 100ms 推送):
 
 - 数量以币计(OKX 也折成币), 必须是数量步长的整数倍、不少于最小下单量; 名义金额不少于最小下单金额。
 - 可按保证金金额(USDT, 不含手续费)下单: 金额乘当前杠杆后换算币数并向下对齐步长;
-  市价按五档盘口换算, 限价/条件按委托价/触发价换算, 挂单后币数固定。
-- 市价单: 按五档盘口逐档吃到够为止, 按成交均价成交(吃单费率); 五档都吃完还不够就拒单。
-- 限价单: 下单时就够得着(买: 卖一不高于限价)且五档里限价以内的量够, 立即按均价成交(吃单费率);
+  市价按深度盘口换算, 限价/条件按委托价/触发价换算, 挂单后币数固定。
+- 市价单: 按深度盘口逐档吃到够为止, 按成交均价成交(吃单费率); 可见盘口都吃完还不够就拒单并显示缺口。
+- 限价单: 下单时就够得着(买: 卖一不高于限价)且盘口里限价以内的量够, 立即按均价成交(吃单费率);
   否则挂单, 之后最新价或对手一档**穿过**限价才按限价成交(挂单费率), 碰到不算。
-- 条件单与改价同期货账户(规则见 paper.py): 最新价碰到触发价后按五档盘口市价成交(吃单费率), 五档不够就留着重试;
+- 条件单与改价同期货账户(规则见 paper.py): 最新价碰到触发价后按深度盘口市价成交(吃单费率), 深度不够就留着重试;
   挂单改价不能改到当场成交。
 - 杠杆每个合约一个(默认 10 倍), 初始保证金 = 名义金额 / 杠杆。开仓(含反手的开仓部分)要求成交后
   权益仍够付全部持仓的初始保证金; 只减仓不查。
@@ -21,7 +21,7 @@
   服务没开着的时候错过的结算不补。
 - 强平: 权益低于全部持仓的维持保证金(名义金额 x MAINTENANCE_RATE)时, 按标记价格平掉全部持仓。
 - 估值(浮动盈亏、保证金、强平)按标记价格, 没有标记价格时用最新价。
-- 止盈止损同期货账户(规则见 paper.py): 按**最新价**触发, 触发后按五档盘口市价平掉全部持仓, 吃不够就每轮重试;
+- 止盈止损同期货账户(规则见 paper.py): 按**最新价**触发, 触发后按深度盘口市价平掉全部持仓, 吃不够就每轮重试;
   下单时也能带, 成交后挂到持仓上。
 - 多所汇总保留图表代码, 模拟交易映射到对应的币安 USDT 永续, 与币安单所视图共用持仓与杠杆。
 """
@@ -48,6 +48,7 @@ MAX_NOTIONAL = 10_000_000.0       # 单笔名义金额上限, 防手滑
 # 交易所默认(最低一档)费率: (挂单, 吃单)
 FEES = {"BINANCE": (0.0002, 0.0005), "OKX": (0.0002, 0.0005)}
 BOOK_STALE_SEC = 15.0             # 盘口多久没更新就不撮合(断线、还没订阅上)
+PANEL_LEVELS = 5                  # 页面数据里的盘口只带五档; 完整深度(OKX 400 档)只在撮合里用
 WATCH_SEC = 30                    # 面板在看的合约, 盘口/标记价格再订阅多久
 HOLD_SEC = 60                     # 有持仓或挂单的合约, 每轮续订这么久
 MAX_FUNDINGS = 500
@@ -85,15 +86,33 @@ def sweep(levels, qty: float, limit: float | None, side: str) -> float | None:
     return None
 
 
+def depth_problem(quote: dict, side: str, *, qty=None, notional=None) -> str:
+    """说明当前对手盘能承接多少, 按保证金下单时比较的是乘杠杆后的仓位金额。"""
+    levels = quote["asks"] if side == "buy" else quote["bids"]
+    label = "卖盘" if side == "buy" else "买盘"
+    if notional is not None:
+        available = sum((Decimal(str(price)) * Decimal(str(size)) for price, size in levels), Decimal(0))
+        needed, capacity = f"{notional:,.2f} USDT", f"{available:,.2f} USDT"
+        sizing = "保证金金额"
+    else:
+        # 按数量步长的位数写全, 不用 :g(6 位有效数字, 大数还会变成 1.23457e+06)
+        available = sum((Decimal(str(size)) for _, size in levels), Decimal(0))
+        digits, unit = quote.get("qtyDecs") or 0, quote.get("unit", "")
+        needed, capacity = (f"{Decimal(str(qty)):,.{digits}f} {unit}", f"{available:,.{digits}f} {unit}")
+        sizing = "数量"
+    return (f"盘口深度不足: 本单需 {needed}，当前{label} {len(levels)} 档可承接 {capacity}；"
+            f"请减少{sizing}或稍后重试")
+
+
 def quote_snapshot(symbol: str, instrument, raw: dict, now: float) -> dict:
     """推送缓存(manager.quote) -> 撮合与页面要用的字段; 缺数据留 None。"""
     book, ticker, mark = raw.get("book") or {}, raw.get("ticker") or {}, raw.get("mark") or {}
     bids, asks = book.get("bids") or [], book.get("asks") or []
     received = book.get("received")
-    fresh = received is not None and now - received <= BOOK_STALE_SEC
+    fresh = received is not None and now - received <= BOOK_STALE_SEC and book.get("valid", True)
     times = [item.get("time") for item in (book, ticker, mark) if item.get("time")]
     return {"contract": symbol, "name": instrument.label, "open": fresh,
-            "reason": "" if fresh else "盘口还没收到(或已断线)",
+            "reason": "" if fresh else book.get("reason") or "盘口还没收到(或已断线)",
             "datetime": _stamp(max(times)) if times else "",
             "last": ticker.get("last"), "bids": bids, "asks": asks,
             "bid": bids[0][0] if bids else None, "bidVolume": bids[0][1] if bids else None,
@@ -212,7 +231,7 @@ class CryptoBook:
         if kind == "market":
             price = sweep(book, qty, None, side)
             if price is None:
-                raise OrderError("五档盘口的量不够这笔市价单")
+                raise OrderError(depth_problem(quote, side, qty=qty))
             self._check_notional(qty, price, quote)
             self._check_funds(quote["contract"], side, qty, price, taker, quote)
         else:
@@ -278,7 +297,7 @@ class CryptoBook:
         return position
 
     def trigger_stops(self, quotes: dict, now_ms: int) -> list[dict]:
-        """最新价碰到止盈/止损价的持仓按市价全部平掉; 平不掉(盘口断了、五档不够)下一轮再试。返回平仓委托。"""
+        """最新价碰到止盈/止损价的持仓按市价全部平掉; 平不掉(盘口断了、深度不够)下一轮再试。返回平仓委托。"""
         placed = []
         for symbol, position in list(self.positions.items()):
             quote = quotes.get(symbol)
@@ -299,7 +318,7 @@ class CryptoBook:
     def match(self, quotes: dict, now_ms: int) -> bool:
         """用最新报价检查挂单(按挂单费率成交)与条件单(触发后按盘口吃单); 返回有没有状态变化。
 
-        条件单触发了却吃不够五档, 原因写在委托的 reason 上(只改内存), 价格回去了就清掉。
+        条件单触发了却吃不够盘口, 原因写在委托的 reason 上(只改内存), 价格回去了就清掉。
         """
         changed = False
         for order in self.orders:
@@ -316,7 +335,7 @@ class CryptoBook:
                 book = quote["asks"] if order["side"] == "buy" else quote["bids"]
                 price = sweep(book, order["qty"], None, order["side"])
                 if price is None:
-                    order["reason"] = "已触发, 未成交: 五档盘口的量不够"
+                    order["reason"] = "已触发, 未成交: " + depth_problem(quote, order["side"], qty=order["qty"])
                     continue
                 fee_rate, liquidity = taker, "taker"
             elif self._trades_through(order, quote):
@@ -393,7 +412,7 @@ class CryptoBook:
                 qty += size
                 remaining -= cost
             if remaining > 0:
-                raise OrderError("五档盘口的量不够这笔保证金金额的市价单")
+                raise OrderError(depth_problem(quote, side, notional=budget))
         step = Decimal(str(quote["qtyStep"]))
         qty = (qty / step).to_integral_value(rounding=ROUND_FLOOR) * step
         if qty <= 0 or qty < Decimal(str(quote["minQty"])):
@@ -647,7 +666,10 @@ class CryptoPaperService:
             maker, taker = FEES.get(venue_of(contract), FEES["BINANCE"])
             return {**book.summary(), "mode": "crypto", "symbol": value,
                     "contract": contract if instrument is not None else None,
-                    "quote": quote, "leverage": book.leverage_of(contract),
+                    # 面板每秒轮询, 不能每次都带上几百档深度
+                    "quote": quote and {**quote, "bids": quote["bids"][:PANEL_LEVELS],
+                                        "asks": quote["asks"][:PANEL_LEVELS]},
+                    "leverage": book.leverage_of(contract),
                     "fee": {"mode": "crypto", "maker": maker, "taker": taker}, "feeSource": None,
                     "orders": open_orders + finished[::-1], "trades": book.trades[-50:][::-1],
                     "contractTrades": [trade for trade in book.trades if trade["contract"] == contract][-500:],

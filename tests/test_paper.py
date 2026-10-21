@@ -828,10 +828,18 @@ class FakeApi:
         self.gets = []
         self.listings = 0
         self.waits = 0
+        self.mains = {}         # 合约服务里主连当前的标的(主力映射查这里, 不看报价对象)
+        self.info_calls = []
 
     def query_quotes(self, exchange_id=None, product_id=None, **kwargs):
         self.listings += 1
         return list(self.quotes)
+
+    def query_symbol_info(self, symbols):
+        self.info_calls.append(list(symbols))
+        return [{"instrument_id": symbol,
+                 "underlying_symbol": self.mains.get(symbol, self.quotes[symbol].underlying_symbol)}
+                for symbol in symbols]
 
     def get_quote(self, symbol):
         self.gets.append(symbol)
@@ -847,6 +855,7 @@ class FakeManager:
         self.api = api
         self.error = None
         self.calls = 0
+        self.mains = ingest.MainContracts()
 
     async def query(self, fn, timeout=None):
         self.calls += 1
@@ -886,6 +895,17 @@ class ServiceTest(unittest.TestCase):
         # 确认过存在之后, 轮询不再排查询任务, 报价由采集循环刷新
         self.run_async(self.service.state("KQ.m@SHFE.fu"))
         self.assertEqual(self.manager.calls, 1)
+
+    def test_main_follows_the_shared_mapping_not_a_stale_quote_underlying(self):
+        """长连接上主连 Quote 的标的字段可能停在旧月份: 下单与图表、自选用同一份主力映射。"""
+        self.quotes["SHFE.fu2701"] = raw_quote()
+        self.api.mains["KQ.m@SHFE.fu"] = "SHFE.fu2701"
+        state = self.run_async(self.service.state("KQ.m@SHFE.fu"))
+        self.assertEqual(state["contract"], "SHFE.fu2701")
+        self.assertEqual(self.manager.mains.resolve(self.api, ["KQ.m@SHFE.fu"]), {"KQ.m@SHFE.fu": "SHFE.fu2701"})
+        calls = len(self.api.info_calls)
+        self.service.on_loop(self.api)
+        self.assertEqual(len(self.api.info_calls), calls, "一分钟内每轮撮合不再查主力映射")
 
     def test_unknown_symbol_is_not_requeried_every_poll(self):
         state = self.run_async(self.service.state("SHFE.fu9999"))

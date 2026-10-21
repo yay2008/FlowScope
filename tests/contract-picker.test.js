@@ -222,8 +222,9 @@ test("期货同时显示昨仓与昨量, 主力和月份各用自己的成交量
   assert.match(el.products.textContent, /昨仓 42\.8万昨量 123\.5万/);
   assert.match(el.products.textContent, /昨仓 314\.5万昨量 0/);
   assert.match(el.products.textContent, /昨仓 59\.0万昨量 —/);
-  assert.match(el.months.textContent, /★ 燃油2611昨仓 42\.8万昨量 123\.5万/);
-  assert.match(el.months.textContent, /燃油2701昨仓 26\.7万昨量 45\.6万/);
+  assert.match(el.months.textContent, /主力 · 自动换月当前：燃油2611昨仓 42\.8万昨量 123\.5万/);
+  assert.match(el.months.textContent, /燃油2611固定月份 · 当前主力昨仓 42\.8万昨量 123\.5万/);
+  assert.match(el.months.textContent, /燃油2701固定月份昨仓 26\.7万昨量 45\.6万/);
   const row = el.products.children.find((child) => child.attributes.id);
   assert.match(row.children[0].children[1].children[1].title, /2026-10-19/);
 });
@@ -286,13 +287,13 @@ test("输入即过滤一级, 并自动预取第一个命中品种的月份", asy
   assert.equal(rowIds(el.products).length, 1);
   await flush();
   assert.ok(calls.includes("/api/symbols?exchange=SHFE&product=rb"));
-  assert.match(el.months.textContent, /★ 螺纹2701/);
+  assert.match(el.months.textContent, /主力 · 自动换月当前：螺纹2701/);
   el.search.value = "zzz";
   el.search.dispatch("input");
   assert.match(el.products.textContent, /没有匹配的品种/);
 });
 
-test("悬停品种(带防抖)后右侧出现★主力和具体月份", async () => {
+test("悬停品种(带防抖)后右侧出现自动换月主力和固定月份", async () => {
   const { el, picker, calls } = setup();
   picker.load();
   await flush();
@@ -303,7 +304,7 @@ test("悬停品种(带防抖)后右侧出现★主力和具体月份", async () 
   await sleep(180);
   assert.ok(calls.includes("/api/symbols?exchange=SHFE&product=rb"));
   await flush();
-  assert.match(el.months.textContent, /月份 · 螺纹/);
+  assert.match(el.months.textContent, /主力 \/ 固定月份 · 螺纹/);
 });
 
 test("键盘: ↓ 移动一级, → 进二级, ↓ 选月份, Enter 切换", async () => {
@@ -314,9 +315,9 @@ test("键盘: ↓ 移动一级, → 进二级, ↓ 选月份, Enter 切换", asy
   el.search.dispatch("keydown", { key: "ArrowDown" });   // 移到"螺纹"
   await flush();
   el.search.dispatch("keydown", { key: "ArrowRight" });  // 进二级
-  el.search.dispatch("keydown", { key: "ArrowDown" });   // 螺纹只有一个月份, 停在第一条
+  el.search.dispatch("keydown", { key: "ArrowDown" });   // 主力入口之后是当前主力的固定月份
   el.search.dispatch("keydown", { key: "Enter" });
-  assert.deepEqual(picked, ["KQ.m@SHFE.rb"]);            // rb 的月份列表里第一项是主力
+  assert.deepEqual(picked, ["SHFE.rb2701"]);
   assert.equal(picker.isOpen(), false);
 });
 
@@ -336,7 +337,7 @@ test("键盘: 一级直接回车 = 该品种主力; 二级选具体月份", asyn
   await flush();
   second.el.search.dispatch("keydown", { key: "ArrowDown" });
   second.el.search.dispatch("keydown", { key: "Enter" });
-  assert.deepEqual(second.picked, ["SHFE.fu2701"]);
+  assert.deepEqual(second.picked, ["SHFE.fu2611"]);     // 固定当前主力月份, 后续不跟着换月
 });
 
 test("点击月份行直接切换, 点同一个合约不重复跳转", async () => {
@@ -345,7 +346,7 @@ test("点击月份行直接切换, 点同一个合约不重复跳转", async () 
   await flush();
   picker.open();
   const monthRows = el.months.children.filter((child) => child.attributes.id);
-  monthRows[1].dispatch("click");
+  monthRows[2].dispatch("click");
   assert.deepEqual(picked, ["SHFE.fu2701"]);
   const again = setup();
   again.picker.setSymbol("SHFE.fu2701");
@@ -353,7 +354,7 @@ test("点击月份行直接切换, 点同一个合约不重复跳转", async () 
   await flush();
   again.picker.open();
   const rows = again.el.months.children.filter((child) => child.attributes.id);
-  rows[1].dispatch("click");
+  rows[2].dispatch("click");
   assert.deepEqual(again.picked, []);                    // 已经是这个合约, 不触发切换
 });
 
@@ -390,7 +391,7 @@ test("没有缓存且目录失败时给出可手填的提示", async (t) => {
   assert.equal(statuses[statuses.length - 1][0], "合约目录加载失败（6/6），可直接手填合约");
 });
 
-test("月份请求失败时二级只剩★主力可选, 并说明原因", async () => {
+test("月份请求失败时自动换月主力仍可选, 并说明原因", async () => {
   const { el, picker, picked } = setup({
     fetchJson: (url) => (url.startsWith("/api/symbols?")
       ? Promise.reject(new Error("合约查询超时"))
@@ -399,7 +400,7 @@ test("月份请求失败时二级只剩★主力可选, 并说明原因", async 
   picker.load();
   await flush();
   picker.open();
-  assert.match(el.months.textContent, /★ 燃油2611|★ 燃油/);
+  assert.match(el.months.textContent, /主力 · 自动换月当前：SHFE.fu2611/);
   assert.match(el.months.textContent, /月份列表暂不可用（稍后自动重试）：合约查询超时/);
   el.search.dispatch("keydown", { key: "Enter" });
   assert.deepEqual(picked, ["KQ.m@SHFE.fu"]);            // 主力仍然选得动
@@ -434,7 +435,7 @@ test("月份失败不是永久状态: 冷却期过后重新打开会再试一次
   picker.open();
   await flush();
   assert.equal(calls.filter((url) => url.startsWith("/api/symbols?")).length, attempts + 1);
-  assert.match(el.months.textContent, /★ 燃油2611/);
+  assert.match(el.months.textContent, /主力 · 自动换月当前：燃油2611/);
   assert.doesNotMatch(el.months.textContent, /暂不可用/);
 });
 
@@ -465,7 +466,7 @@ test("服务端把月份失败包成 200 + monthsError 时, 冷却期过后也�
   picker.open();
   await flush();
   assert.equal(calls.filter((url) => url.startsWith("/api/symbols?")).length, attempts + 1);
-  assert.match(el.months.textContent, /★ 燃油2611/);
+  assert.match(el.months.textContent, /主力 · 自动换月当前：燃油2611/);
   assert.doesNotMatch(el.months.textContent, /暂不可用/);
 });
 
@@ -602,7 +603,7 @@ test("传了 isFavorite/onToggleFavorite 才显示行内 ☆", async () => {
   picker.load();
   await flush();
   assert.equal(stars(el.products).length, 3);            // 每个品种一行
-  assert.equal(stars(el.months).length, 2);              // 主力 + 一个月份
+  assert.equal(stars(el.months).length, 3);              // 自动主力 + 两个固定月份
   assert.deepEqual(stars(el.products).map((s) => s.textContent), ["☆", "☆", "☆"]);
 });
 
@@ -622,7 +623,7 @@ test("点行内 ☆ 只收藏, 不切换合约也不关菜单", async () => {
   picker.load();
   await flush();
   picker.open();
-  const monthStar = stars(el.months)[1];
+  const monthStar = stars(el.months)[2];
   monthStar.dispatch("click");
   assert.deepEqual(toggled, ["SHFE.fu2701"]);             // 收藏的是那一行的具体月份
   assert.deepEqual(picked, []);                           // 没有切换合约

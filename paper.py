@@ -1007,12 +1007,14 @@ class PaperService:
     def _resolve(self, api, symbol: str) -> tuple[str, dict | None]:
         """代码 -> (实际合约, 报价快照)。主连换成当前标的月份合约: 主连本身不能下单。
 
-        调用前 symbol 必须已经确认存在; 标的合约来自 TqSdk 自己的报价, 不必再查。
+        调用前 symbol 必须已经确认存在。当前月份取与图表、自选共用的主力映射(ingest.MainContracts,
+        一分钟内查过的不再查): 长连接上 Quote 的标的字段可能停在旧月份; 映射查不到时才用它。
         """
         ref = self._ref(api, symbol)
         contract = symbol
         if split_cont_symbol(symbol) is not None:
-            contract = str(getattr(ref, "underlying_symbol", "") or "")
+            contract = (self._manager().mains.resolve(api, [symbol]).get(symbol)
+                        or str(getattr(ref, "underlying_symbol", "") or ""))
             if not contract:
                 return symbol, None    # 主连报价还没下发, 不知道标的是谁
             ref = self._ref(api, contract)

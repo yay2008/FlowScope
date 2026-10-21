@@ -145,13 +145,18 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_
     if ltf not in ltf_options(tf):
         ltf = 0
     feed = require_feed(symbol, tf)
-    source = manager_for(feed.symbol)
+    # 固定月份可能借用同月份主力的 Feed(见 FeedManager._main_peer): 快照按页面要的代码返回
+    symbol = validate_symbol(symbol)
+    source = manager_for(symbol)
 
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
+        if not source.serves(symbol, tf, feed):
+            # 等的时候换了供数的 Feed: 改借同月份主力, 或借用的主力换月了(再等下去拿到的是新月份)
+            feed = require_feed(symbol, tf)
         snapshot = feed.snapshot_for(ltf)
         if snapshot is not None:
-            return snapshot
+            return {**snapshot, "symbol": symbol}
         # 订阅失败(含冷却期内的重试中)都走这里, 不再等到 90 秒超时才回话。
         retry_error = source.feed_retry_error(feed)
         if retry_error:
@@ -162,7 +167,7 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_
         if source.status_snapshot()["status"] == "error":
             break
         await asyncio.sleep(0.2)
-    return {"symbol": feed.symbol, "cfg": feed.cfg(), "tf": tf, "ltf": ltf,
+    return {"symbol": symbol, "cfg": feed.cfg(), "tf": tf, "ltf": ltf,
             "bars": [], "pending": True, "status": source.status_snapshot()}
 
 
@@ -297,13 +302,16 @@ async def footprint(symbol: str = DEFAULT_SYMBOL, tf: int = DEFAULT_TF_SEC):
     """
     tf = validate_tf(tf)
     feed = require_feed(symbol, tf)
-    source = manager_for(feed.symbol)
+    symbol = validate_symbol(symbol)
+    source = manager_for(symbol)
 
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
+        if not source.serves(symbol, tf, feed):
+            feed = require_feed(symbol, tf)
         snapshot = feed.footprint_snapshot()
         if snapshot is not None:
-            return snapshot
+            return {**snapshot, "symbol": symbol}
         retry_error = source.feed_retry_error(feed)
         if retry_error:
             raise HTTPException(status_code=400, detail=retry_error)
@@ -313,7 +321,7 @@ async def footprint(symbol: str = DEFAULT_SYMBOL, tf: int = DEFAULT_TF_SEC):
         if source.status_snapshot()["status"] == "error":
             break
         await asyncio.sleep(0.2)
-    return {"symbol": feed.symbol, "tickSize": None, "bars": [], "pending": True,
+    return {"symbol": symbol, "tickSize": None, "bars": [], "pending": True,
             "status": source.status_snapshot()}
 
 
@@ -553,6 +561,8 @@ async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, f
         # 先注册，再读取快照。期间入队的旧增量可由 revision 排除，避免 REST→WS 空窗。
         deadline = time.monotonic() + 90
         while True:
+            if not source.serves(symbol, tf, feed):
+                feed = source.ensure(symbol, tf)   # 等的时候换了供数的 Feed(见 history)
             snapshot = feed.snapshot_for(ltf)
             fp = feed.footprint_snapshot() if footprint else None
             if snapshot is not None and (not footprint or fp is not None):
@@ -561,7 +571,9 @@ async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, f
                 await websocket.close(code=1013, reason="等待行情超时，请重试")
                 return
             await asyncio.sleep(0.1)
-        await websocket.send_json({"type": "snapshot", **snapshot, "footprint": fp})
+        # 借用主力 Feed 的固定月份: 快照里的代码换回本页的, 页面按代码认消息
+        await websocket.send_json({"type": "snapshot", **snapshot, "symbol": symbol,
+                                   "footprint": fp and {**fp, "symbol": symbol}})
         bar_revision = snapshot["revision"]
         fp_revision = fp["revision"] if fp else -1
         while True:

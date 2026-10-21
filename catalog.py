@@ -29,7 +29,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
-from ingest import JOB_TIMEOUT_SEC, listed_symbols, validate_symbol
+from ingest import JOB_TIMEOUT_SEC, MAIN_PREFIX, frame_records, listed_symbols, transient_queries, validate_symbol
 
 # 交易所展示顺序按国内期货成交量习惯排列, 与交易所代码一一对应。
 EXCHANGES = (
@@ -43,7 +43,7 @@ EXCHANGES = (
 EXCHANGE_NAMES = dict(EXCHANGES)
 EXCHANGE_ORDER = {code: index for index, (code, _) in enumerate(EXCHANGES)}
 CONT_SUFFIX = "主连"
-CONT_PREFIX = "KQ.m@"
+CONT_PREFIX = MAIN_PREFIX
 
 # 静态合约查询的 pre_open_interest 是双边计量的交易所(TqSdk ins_schema 的定义)。
 # 其余交易所(中金所/广期所)与报价对象一样是单边, 不需要归一。实测中金所/广期所
@@ -147,15 +147,6 @@ def _number(value) -> float:
     return 0.0 if number != number else number  # NaN != NaN
 
 
-def _records(info) -> list[dict]:
-    """query_symbol_info 返回 DataFrame; 兼容测试里的普通列表。"""
-    if info is None:
-        return []
-    if hasattr(info, "to_dict"):
-        return info.to_dict("records")
-    return list(info)
-
-
 def exchange_of(symbol: str) -> str:
     """``SHFE.fu2611`` -> ``SHFE``; 没有交易所前缀时返回空串。"""
     return symbol.partition(".")[0].strip().upper()
@@ -192,16 +183,17 @@ def build_products(api, symbols=None) -> list[dict]:
         api.query_quotes(ins_class="CONT", expired=False))
     if not conts:
         return []
-    cont_rows = {_text(row.get("instrument_id")): row
-                 for row in _records(api.query_symbol_info(conts))}
-    mains = [_text(cont_rows.get(symbol, {}).get("underlying_symbol")) for symbol in conts]
-    open_interest = {}
-    wanted = sorted({main for main in mains if main})
-    if wanted:
-        for row in _records(api.query_symbol_info(wanted)):
-            symbol = _text(row.get("instrument_id"))
-            open_interest[symbol] = single_side_open_interest(
-                symbol, row.get("pre_open_interest"))
+    with transient_queries(api):         # 目录每 5 分钟重建一次
+        cont_rows = {_text(row.get("instrument_id")): row
+                     for row in frame_records(api.query_symbol_info(conts))}
+        mains = [_text(cont_rows.get(symbol, {}).get("underlying_symbol")) for symbol in conts]
+        open_interest = {}
+        wanted = sorted({main for main in mains if main})
+        if wanted:
+            for row in frame_records(api.query_symbol_info(wanted)):
+                symbol = _text(row.get("instrument_id"))
+                open_interest[symbol] = single_side_open_interest(
+                    symbol, row.get("pre_open_interest"))
     products = []
     for symbol, main in zip(conts, mains):
         parts = split_cont_symbol(symbol)
@@ -253,8 +245,9 @@ def build_months(api, exchange_id: str, product_id: str, main_symbol: str = "") 
                                     product_id=product_id, expired=False))
     if not symbols:
         return []
-    rows = {_text(row.get("instrument_id")): row
-            for row in _records(api.query_symbol_info(symbols))}
+    with transient_queries(api):
+        rows = {_text(row.get("instrument_id")): row
+                for row in frame_records(api.query_symbol_info(symbols))}
     months = []
     for symbol in symbols:
         row = rows.get(symbol, {})
@@ -284,7 +277,7 @@ def fallback_catalog(error: str | None = None) -> dict:
 
 def previous_daily_volume(serial, trading_date: str):
     """只取指定交易日的日线成交量; 不把当日、缺失或更早的日线冒充昨日。"""
-    for row in reversed(_records(serial)):
+    for row in reversed(frame_records(serial)):
         try:
             timestamp = int(row.get("datetime", 0))
             volume = float(row.get("volume"))
@@ -321,7 +314,7 @@ class DailyVolumes:
         local = now or datetime.now(CST)
         cutoff = local.date() + timedelta(days=int(local.hour >= 18))
         if cutoff != self._date_key:
-            calendar = _records(api.get_trading_calendar(cutoff - timedelta(days=45), cutoff))
+            calendar = frame_records(api.get_trading_calendar(cutoff - timedelta(days=45), cutoff))
             days = [row["date"].date() for row in calendar if row.get("trading")]
             self._date = max((day for day in days if day < cutoff), default=None)
             self._date_key = cutoff
@@ -406,7 +399,7 @@ class CatalogService:
         with self._lock:
             cached = self._catalog
         if cached is not None and not refresh and time.monotonic() - cached[0] < self._catalog_ttl:
-            return cached[1]
+            return self._with_known_mains(*cached)
         error = None
         try:
             data = await self._query(lambda api: group_products(ranked_products(api)))
@@ -415,10 +408,22 @@ class CatalogService:
             # 行情源不可用时选择器仍然要能用: 回退到内置常用品种, 错误只作提示。
             error = f"{type(exc).__name__}: {exc}"
             data = fallback_catalog(error)
-        if data["source"] == "live":
-            with self._lock:
-                self._catalog = (time.monotonic(), data)
+            return self._with_known_mains(float("-inf"), data)
+        with self._lock:
+            self._catalog = (time.monotonic(), data)
         return data
+
+    def _with_known_mains(self, built_at: float, catalog: dict) -> dict:
+        """采集线程比这份目录更晚核对过的主力月份(ingest.MainContracts, 图表、自选也用它)优先:
+        换月后选择器不必等目录缓存过期, 和图表、自选同时换。持仓量排序不变。"""
+        newer = {symbol: contract for symbol, (contract, at) in self._manager().mains.known().items()
+                 if at > built_at}
+        if not newer:
+            return catalog
+        return {**catalog, "groups": [
+            {**group, "products": [{**item, "mainSymbol": newer.get(item["contSymbol"], item["mainSymbol"])}
+                                   for item in group["products"]]}
+            for group in catalog["groups"]]}
 
     async def _months_payload(self, exchange_id: str, product_id: str, main_symbol: str,
                               refresh: bool) -> tuple[list[dict], str | None]:
@@ -426,7 +431,8 @@ class CatalogService:
         with self._lock:
             cached = self._months.get(key)
         if cached is not None and not refresh and time.monotonic() - cached[0] < self._months_ttl:
-            return cached[1], None
+            return [{**month, "isMain": bool(main_symbol) and month["symbol"] == main_symbol}
+                    for month in cached[1]], None
         try:
             months = await self._query(
                 lambda api: build_months(api, exchange_id, product_id, main_symbol))
@@ -452,8 +458,9 @@ class CatalogService:
         任何一步取不到就回退到原始代码, 展示位永远有东西可显示。
         """
         value = validate_symbol(symbol)
+        mains = self._manager().mains
         try:
-            label = await self._query(lambda api: resolve_label(api, value))
+            label = await self._query(lambda api: resolve_label(api, value, mains))
         except Exception:
             label = ""
         return {"symbol": value, "label": label or value}
@@ -463,7 +470,16 @@ class CatalogService:
         return await self._manager().query(fn, self._timeout)
 
 
-def resolve_label(api, symbol: str) -> str:
+def _info(api, symbol: str) -> dict:
+    """一个合约的静态信息; 查不到为空。"""
+    try:
+        rows = frame_records(api.query_symbol_info([symbol]))
+    except Exception:
+        rows = []
+    return next((row for row in rows if _text(row.get("instrument_id")) == symbol), {})
+
+
+def resolve_label(api, symbol: str, mains=None) -> str:
     """合约的展示名(采集线程里执行): 主连先解析出标的合约, 再取它的中文名。
 
     为什么不直接读 quote 的 ``instrument_name``: 主连的报价对象来自一次 ``get_quote``
@@ -478,20 +494,18 @@ def resolve_label(api, symbol: str) -> str:
             return symbol
     except Exception:
         return symbol
-    contract = symbol
-    if split_cont_symbol(symbol) is not None:
-        try:
-            underlying = _text(getattr(api.get_quote(symbol), "underlying_symbol", ""))
-        except Exception:
-            underlying = ""
-        if underlying:
-            contract = underlying
-    try:
-        rows = _records(api.query_symbol_info([contract]))
-    except Exception:
-        rows = []
-    name = _text(rows[0].get("instrument_name")) if rows else ""
-    return name or contract
+    with transient_queries(api):         # 页面每分钟问一次主连的名字
+        if split_cont_symbol(symbol) is None:
+            return _text(_info(api, symbol).get("instrument_name")) or symbol
+        # 主连的当前月份取与图表、自选共用的主力映射(mains: ingest.MainContracts), 换月时一起换;
+        # 没有时现查合约服务。长连接的 Quote.underlying_symbol 可能停在连接建立时的月份, 不用它。
+        contract = mains.resolve(api, [symbol]).get(symbol) if mains is not None else None
+        if not contract:
+            info = _info(api, symbol)
+            contract = _text(info.get("underlying_symbol"))
+            if not contract:
+                return _text(info.get("instrument_name")) or symbol
+        return _text(_info(api, contract).get("instrument_name")) or contract
 
 
 def ranked_products(api) -> list[dict]:
