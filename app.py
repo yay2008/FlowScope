@@ -10,8 +10,9 @@ import asyncio
 import mimetypes
 import os
 import time
+from typing import Annotated
 
-from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -27,6 +28,7 @@ from crypto_backfill import Backfiller
 from favorites import FavoriteStore, FavoritesService, MAX_FAVORITES
 from indicator import CFG, DEFAULT_TF_SEC, NATIVE_TFS, ltf_options
 from ingest import FeedManager, validate_symbol, validate_tf
+from history_paging import read_history_page
 from okx_feed import OkxAdapter
 from paper import DEFAULT_CASH, PaperService, PaperStore
 from paper_crypto import CryptoPaperService
@@ -134,7 +136,10 @@ async def _shutdown():
 
 
 @app.get("/api/history")
-async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_TF_SEC):
+async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_TF_SEC,
+                  before: Annotated[int | None, Query(ge=1, le=253402300799)] = None,
+                  limit: Annotated[int, Query(ge=1, le=2000)] = 800,
+                  since: Annotated[int | None, Query(ge=1, le=253402300799)] = None):
     """返回最近 N 根 bar 的完整快照; 订阅未就绪时最多等 90 秒(闭市回填慢)。
 
     tf : 主图周期(秒), 10 或 30; 非法值回落到 30
@@ -149,6 +154,15 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_
     symbol = validate_symbol(symbol)
     source = manager_for(symbol)
 
+    if before is not None:
+        try:
+            if isinstance(source, FeedManager) and ltf > 0 and since is None:
+                await source.backfill_history(symbol, tf, ltf, before, limit)
+            page = await source.query(lambda _: read_history_page(source, symbol, tf, ltf, before, limit, since))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return JSONResponse(page, headers={"Cache-Control": "no-store"})
+
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         if not source.serves(symbol, tf, feed):
@@ -156,6 +170,17 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_
             feed = require_feed(symbol, tf)
         snapshot = feed.snapshot_for(ltf)
         if snapshot is not None:
+            if isinstance(source, FeedManager) and ltf > 0:
+                try:
+                    await source.backfill_history(symbol, tf, ltf)
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=503, detail=f"历史 K 线回补失败: {exc}") from exc
+                if not source.serves(symbol, tf, feed):
+                    feed = require_feed(symbol, tf)
+                    continue
+                snapshot = feed.snapshot_for(ltf)
+                if snapshot is None:
+                    continue
             return {**snapshot, "symbol": symbol}
         # 订阅失败(含冷却期内的重试中)都走这里, 不再等到 90 秒超时才回话。
         retry_error = source.feed_retry_error(feed)

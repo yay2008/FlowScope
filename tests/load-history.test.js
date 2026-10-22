@@ -23,7 +23,7 @@ function harness() {
     retryTimer: null, retryAttempts: 0, RETRY_MAX_ATTEMPTS: 24, RETRY_DELAY_MS: 5000,
     loadGeneration: 0, loadController: null, wsGeneration: 0, reconnectTimer: null,
     watchdog: null, ws: null, symbol: "SHFE.review", ltf: 0, tf: 30,
-    cfg: null, bars: [], barRevision: -1, fpRevision: -1,
+    cfg: null, bars: [], barRevision: -1, fpRevision: -1, historyRevision: 0, historyBackfill: null,
     onStatus: (ok, text) => statuses.push(text),
     clearTimeout: id => timers.delete(id),
     setTimeout: (fn, delay) => { timers.set(++timerId, {fn, delay}); return timerId; },
@@ -35,6 +35,7 @@ function harness() {
     },
     // 每轮加载按工具栏重算本图粒度; 这里直接用 ctx.ltf 模拟"数据源已切换"
     currentLtf: () => ctx.ltf,
+    resetOlderHistory: () => {}, queueOlderHistory: () => {}, queueHistoryRefresh: () => {},
     acceptDataContract: () => {}, onConfig: () => {}, renderAll: () => {}, clearPaperEntry: () => {},
     chart: {timeScale: () => ({scrollToRealTime: () => {}})},
     connectWs: () => { connected++; ctx.ws = {close: () => closed++}; },

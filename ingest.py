@@ -33,6 +33,7 @@ from tqsdk import TqApi, TqAuth
 from indicator import (CFG, DEFAULT_TF_SEC, ROLLUP_BASE_TF, TF_OPTIONS, TZ_SHIFT_S, bar_ns_for, is_rollup,
                        ltf_options, build_bars, build_bars_from_ltf, bars_to_records)
 from history_store import HistoryStore
+from futures_backfill import CHUNK_SECONDS, KlineBackfiller
 from rollup import RollupMixin, candles_from_klines
 from tick_analytics import TickAnalytics
 from large_trades import LargeTradeDetector, decorate_bars
@@ -302,6 +303,9 @@ class Feed:
         self._computed_version = -1
         self.revision = 0
         self.stores = {}
+        self._volumes = None
+        self.history_revision = 0
+        self.history_backfill = {}
         # 各粒度最近一次合并历史、算好 CVD 的完整窗口(连同那一轮的 revision); 大周期由它合成,
         # 只认最近一轮算出来的(见 latest_window)。
         self.latest = {}
@@ -340,6 +344,9 @@ class Feed:
             self.footprint = None
             self.ready.clear()
             self.stores.clear()
+            self._volumes = None
+            self.history_revision = 0
+            self.history_backfill.clear()
             self.latest.clear()
             self.large_trades = self._new_large_detector()
             self._large_synced = self._large_cache = self._large_seen = None
@@ -486,6 +493,26 @@ class Feed:
             self.stores[ltf] = HistoryStore(os.path.join(DATA_DIR, f"{stem}_v3.csv"), legacy)
         return self.stores[ltf]
 
+    def volume_history(self):
+        """原生 K 线成交量的独立档案, 只供覆盖核对, 不参与买卖量或 CVD。
+
+        复用追加/去重/增量索引格式: buy 列存总量、sell 恒为零。它与 tick 历史完全隔离,
+        不能为了回补 TV 口径而给 tick 口径伪造买卖量。
+        """
+        if self._volumes is None:
+            path = os.path.join(DATA_DIR, f"{_csv_key(self.contract)}_{self.tf}s_volume_v1.csv")
+            self._volumes = HistoryStore(path)
+        self._volumes.refresh()
+        return self._volumes
+
+    def save_kline_volumes(self, klines, final=False):
+        rows = candles_from_klines(klines)
+        if not final:
+            rows = rows.iloc[:-1]
+        rows = rows.assign(buy=rows.volume, sell=0.0, unknown=0.0,
+                           coverage="complete", hasBaseline=True)
+        self.volume_history().save_completed(rows, final=True)
+
     def recompute(self, broadcast):
         with self._state_lock:
             now = time.monotonic()
@@ -512,6 +539,8 @@ class Feed:
         valid_klines = self.klines.dropna(subset=["datetime", "close"])
         if valid_klines.empty:
             return
+        if any(ltf > 0 for ltf in ltfs):
+            self.save_kline_volumes(valid_klines)
         first_bar_ns = int(valid_klines.datetime.iloc[0])
         # 检测器本轮已喂完 tick, 这时才取它的改动; 大额汇总只重做改到的那几根(见 _records)
         self._start_round()
@@ -738,10 +767,13 @@ class Feed:
         prior = previous.get(ltf)
         kept, fresh = self._records(ltf, tail, prior)
         recs = kept + fresh
+        history_source = self.base() if getattr(self, "is_rollup", False) else self
+        history_source = history_source or self
         snapshot ={"symbol": self.symbol, "contract": self.contract, "cfg": self.cfg(), "ltf": ltf,
                     "tf": self.tf,
                     "source": "tick" if ltf == 0 else "kline",
-                    "revision": revision, "cvdBase": cvd_base,
+                    "revision": revision, "cvdBase": cvd_base, "historyRevision": history_source.history_revision,
+                    "historyBackfill": history_source.history_backfill.get(ltf),
                     "bars": recs}
         self._record_state[ltf] = (self._round, snapshot, tail)
         old = {b["time"]: b for b in (prior or {}).get("bars", [])}
@@ -876,6 +908,8 @@ class FeedManager:
         # 每轮 wait_update 之后在采集线程里调用的回调 fn(api)(模拟交易撮合挂单等)。
         # 回调只读已订阅的报价; 耗时同样计入 _busy_since, 卡住时连接自检照样能发现。
         self.loop_hooks: list = []
+        self._history_backfiller = None
+        self._history_revision = 0
 
     def feed_retry_error(self, feed: Feed) -> str | None:
         """失败 Feed 未过冷却期时给出可重试的错误文案; 否则返回 None(可以重订)。"""
@@ -908,6 +942,9 @@ class FeedManager:
 
     def stop(self):
         self._stop.set()
+        if self._history_backfiller is not None:
+            self._history_backfiller.stop()
+            self._history_backfiller = None
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=5)
@@ -955,6 +992,86 @@ class FeedManager:
         except (asyncio.TimeoutError, asyncio.CancelledError):
             future.cancel()
             raise RuntimeError(f"合约查询超时({timeout:.0f} 秒)") from None
+
+    def _history_plan(self, symbol, tf, ltf, before, limit):
+        """仅检查本次主图请求的已收盘部分; 大周期取同合约 30s 的档案。"""
+        from history_paging import read_history_page
+
+        feed = self.ensure(symbol, tf)
+        if feed.klines is None:
+            raise RuntimeError("历史 K 线尚未就绪")
+        candles = candles_from_klines(feed.klines)
+        if candles.empty:
+            raise RuntimeError("历史 K 线尚未就绪")
+        end = before if before is not None else int(candles.time.iloc[-1]) + tf
+        page = read_history_page(self, symbol, tf, ltf, end, limit)
+        now = time.time() + TZ_SHIFT_S
+        base = feed.base() if getattr(feed, "is_rollup", False) else feed
+        available = base.history_backfill.get(ltf, {}).get("availableSince", float("-inf"))
+        missing = [bar for bar in page["bars"]
+                   if bar["time"] + tf <= now and bar["coverage"] != "complete"]
+        if not missing or all(bar["time"] < available for bar in missing):
+            return None
+        return base, base.contract, int(missing[0]["time"]), int(missing[-1]["time"]) + tf
+
+    def _apply_history(self, base, contract, ltf, main, lower):
+        """在采集线程保存回补结果并更新全部同合约周期, 主力换月后的迟到结果不并入新月份。"""
+        if base.contract != contract:
+            return False
+        limitation = main.attrs.get("historyLimit")
+        feeds = sorted([f for f in self._feed_list() if f.contract == contract and
+                        (f is base or (getattr(f, "is_rollup", False) and f.base() is base))],
+                       key=lambda f: getattr(f, "is_rollup", False))
+        status_changed = any(feed.history_backfill.get(ltf) != limitation for feed in feeds)
+        for feed in feeds:
+            if limitation is None:
+                feed.history_backfill.pop(ltf, None)
+            else:
+                feed.history_backfill[ltf] = limitation
+        volume_revision = base.volume_history().revision
+        base.save_kline_volumes(main, final=True)
+        bars = build_bars_from_ltf(main, lower, ltf, bar_ns=base.bar_ns)
+        store = base._store(ltf)
+        store.refresh()
+        before = store.revision
+        store.save_completed(store.merge(bars), final=True)
+        if not bars.coverage.eq("complete").any() and limitation is None:
+            raise RuntimeError("小周期历史不足或成交量核对不通过，请重试")
+        if store.revision == before and base.volume_history().revision == volume_revision and not status_changed:
+            return True
+        self._history_revision += 1
+        for feed in feeds:
+            feed.history_revision = self._history_revision
+            feed.request(ltf=ltf)
+            feed._computed_version = -1
+            if feed.has_data():
+                feed.recompute(self.broadcast)
+            # 前端还可能保留着早于实时 800 根的分页历史, 累计基准变化时整段重新读取。
+            self.broadcast({"type": "history", "symbol": feed.symbol, "contract": contract,
+                            "tf": feed.tf, "ltf": ltf, "historyRevision": feed.history_revision,
+                            "historyBackfill": limitation})
+        return True
+
+    async def backfill_history(self, symbol, tf, ltf, before=None, limit=SNAPSHOT_BARS):
+        """HTTP 首次加载/向左翻页均按主图范围回补, 下载不占用实时 SDK 线程。"""
+        if ltf <= 0:
+            return
+        plan = await self.query(lambda _: self._history_plan(symbol, tf, ltf, before, limit))
+        if plan is None:
+            return
+        base, contract, since, end = plan
+        if self._history_backfiller is None:
+            self._history_backfiller = KlineBackfiller()
+        # 大周期可能跨数月: 分周下载并逐段保存, 失败后重试可复用已完成部分。
+        while since < end:
+            until = min(end, since + CHUNK_SECONDS)
+            main, lower = await self._history_backfiller.fetch(contract, base.tf, ltf, since, until)
+            applied = await self.query(lambda _: self._apply_history(base, contract, ltf, main, lower))
+            if not applied:
+                raise RuntimeError("主力合约已换月，请重新加载历史")
+            if main.attrs.get("historyLimit"):
+                break  # 免费序列已取到最大窗口, 继续请求更早区间不会产生新数据。
+            since = until
 
     def _run_jobs(self, api):
         """执行排队中的查询; 单个查询失败只结算它自己, 不影响采集循环。"""

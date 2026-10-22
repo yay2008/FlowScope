@@ -732,6 +732,11 @@
     let loadController = null;
     let retryTimer = null;
     let retryAttempts = 0;
+    let olderRequest = null, olderTimer = null;
+    let olderHasMore = true, olderError = "", restoringRange = false;
+    let historyRevision = 0, historyDirty = false;
+    let historyRefresh = null, historyRefreshTimer = null;
+    let historyBackfill = null;
     const shown = { ema: true, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false,
                     bandMid: false, ob: false, large: true, largeMinRadius: 8,
                     ...initialShown };
@@ -787,6 +792,17 @@
     cornerRow.append(badge, measureBtn, profileBtn, measureHint, priceReadout);
     corner.appendChild(cornerRow);
     el.appendChild(corner);
+    const historyHint = document.createElement("button");
+    historyHint.type = "button";
+    historyHint.className = "history-hint";
+    historyHint.hidden = true;
+    historyHint.setAttribute("aria-live", "polite");
+    historyHint.addEventListener("click", () => {
+      olderError = "";
+      if (historyDirty) queueHistoryRefresh();
+      else loadOlderHistory();
+    });
+    el.appendChild(historyHint);
     host.appendChild(el);
 
     // FlowMeter 窗格左上角: 窗格名 + 模式/阈值下拉框 + 量能读数。窗格的 DOM 要等库画出第一帧才有,
@@ -1549,6 +1565,9 @@
       const next = data.contract || symbol;
       if (next === dataContract) return;
       dataContract = next;
+      resetOlderHistory();
+      bars = [];
+      barsLtf = null;
       obTracker.reset();
       htfLoad?.controller.abort();
       htfLoad = null;
@@ -1691,6 +1710,11 @@
       if (mode !== "rvol") fields.push(field("RVOL", fmt(d.rvol[i], 2)));
       fields.push(field("斜率", fmt(d.lw.crvSlope[i], 2)));
       fields.push(field("覆盖", COVERAGE_LABELS[quality] || "缺失", quality === "complete" ? "" : "warn"));
+      if (historyBackfill?.limited && bars.some((bar) => bar.cvd == null)) {
+        const limited = field("历史", "受限", "warn");
+        limited.title = historyBackfill.reason;
+        fields.push(limited);
+      }
       meterReadout.replaceChildren(...fields);
     }
 
@@ -1817,9 +1841,11 @@
       refreshReadout();
     });
     chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+      if (restoringRange) return;
       largeTooltip.hidden = true;
       largeHoverParam = null;
       onRangeChange();
+      queueOlderHistory();
     });
 
     // ---------- 固定范围成交量分布(交互与画法见文件上部) ----------
@@ -2460,7 +2486,7 @@
       const oldLast = fpBars[fpBars.length - 1]?.time;
       const canUpdate = !replace && data.bars.length === 1 && fpBars.length < 800 &&
                         (oldLast == null || data.bars[0].time >= oldLast);
-      fpBars = FlowData.mergeBars(replace ? [] : fpBars, data.bars);
+      fpBars = FlowData.mergeBars(replace ? [] : fpBars, data.bars, 800);
       const first = bars[0]?.time;
       if (first != null) fpBars = fpBars.filter((b) => b.time >= first);
       fpSeries.applyOptions({ tickSize: data.tickSize });
@@ -2490,6 +2516,137 @@
 
     // ---------- 数据加载与实时推送 ----------
 
+    function resetOlderHistory() {
+      olderRequest?.controller.abort();
+      olderRequest = null;
+      clearTimeout(olderTimer);
+      olderTimer = null;
+      olderHasMore = true;
+      olderError = "";
+      historyHint.hidden = true;
+      historyRefresh?.controller.abort();
+      historyRefresh = null;
+      clearTimeout(historyRefreshTimer);
+      historyRefreshTimer = null;
+      historyDirty = false;
+      historyRevision = 0;
+      historyBackfill = null;
+    }
+
+    function acceptHistoryRevision(data) {
+      if (Object.hasOwn(data, "historyBackfill")) historyBackfill = data.historyBackfill;
+      if (isCrypto || ltf === 0 || data.historyRevision == null) return;
+      if (historyRevision !== data.historyRevision && barsLtf === ltf && bars.length) historyDirty = true;
+      historyRevision = data.historyRevision;
+    }
+
+    function queueHistoryRefresh() {
+      if (!historyDirty || olderError || historyRefresh || historyRefreshTimer != null || olderRequest || loadController ||
+          !cfg || !bars.length || barsLtf !== ltf) return;
+      historyRefreshTimer = setTimeout(() => {
+        historyRefreshTimer = null;
+        refreshLoadedHistory();
+      }, 150);
+    }
+
+    async function refreshLoadedHistory() {
+      if (!historyDirty || historyRefresh || olderRequest || loadController || !bars.length) return;
+      const request = { controller: new AbortController(), generation: loadGeneration, contract: dataContract };
+      const first = bars[0].time, last = bars[bars.length - 1].time;
+      historyRefresh = request;
+      historyDirty = false;
+      try {
+        // 回补会改变整段累计基准。只重读已加载的范围, 不改变视口、不再次安排下载。
+        const resp = await fetch(`/api/history?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}&tf=${tf}` +
+                                 `&since=${first}&before=${last + tf}&limit=2000`,
+                                 { signal: request.controller.signal });
+        const data = await resp.json();
+        if (historyRefresh !== request || request.generation !== loadGeneration || request.contract !== dataContract) return;
+        if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+        if (data.contract !== dataContract || data.symbol !== symbol || data.tf !== tf || data.ltf !== ltf) return;
+        acceptHistoryRevision(data);
+        const refreshed = data.bars.filter((bar) => bar.time >= first && bar.time <= last);
+        // 末根继续采用实时消息, 防止等待历史期间到达的新成交被旧响应回滚。
+        renderWithHistory(FlowData.mergeCvdHistory(bars, refreshed, last));
+      } catch (error) {
+        if (historyRefresh === request && !request.controller.signal.aborted) {
+          historyDirty = true;
+          olderError = `CVD 历史同步失败: ${error.message}`;
+          showHistoryHint();
+        }
+      } finally {
+        if (historyRefresh === request) {
+          historyRefresh = null;
+          queueHistoryRefresh();
+        }
+      }
+    }
+
+    function nearHistoryStart() {
+      const range = chart.timeScale().getVisibleLogicalRange();
+      return bars.length > 0 && range != null && range.from < 80;
+    }
+
+    function showHistoryHint() {
+      historyHint.hidden = !nearHistoryStart() || (!olderRequest && olderHasMore && !olderError);
+      historyHint.disabled = !olderError;
+      historyHint.textContent = olderRequest ? "正在加载历史…" : olderError ? "历史加载失败，点击重试" : "已到可用历史起点";
+      historyHint.title = olderError;
+    }
+
+    function queueOlderHistory() {
+      showHistoryHint();
+      if (olderTimer != null || olderRequest || !olderHasMore || olderError || loadController ||
+          !cfg || barsLtf !== ltf || !nearHistoryStart()) return;
+      // 拖动事件合并成一次请求; 每张图独立翻页, 同时最多一页。
+      olderTimer = setTimeout(() => { olderTimer = null; loadOlderHistory(); }, 150);
+    }
+
+    function renderWithHistory(next) {
+      const range = chart.timeScale().getVisibleLogicalRange();
+      const first = bars[0]?.time;
+      const added = first == null ? 0 : Math.max(0, next.findIndex((b) => b.time === first));
+      bars = next;
+      restoringRange = true;
+      try {
+        renderAll();
+        if (range && added) chart.timeScale().setVisibleLogicalRange({ from: range.from + added, to: range.to + added });
+      } finally { restoringRange = false; }
+      onRangeChange();
+    }
+
+    async function loadOlderHistory() {
+      if (olderRequest || loadController || !olderHasMore || !cfg || barsLtf !== ltf || !bars.length) return;
+      const request = { controller: new AbortController(), generation: loadGeneration, contract: dataContract };
+      olderRequest = request;
+      olderError = "";
+      const before = bars[0].time;
+      showHistoryHint();
+      try {
+        const resp = await fetch(`/api/history?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}&tf=${tf}&before=${before}&limit=800`,
+                                 { signal: request.controller.signal });
+        const data = await resp.json();
+        if (olderRequest !== request || request.generation !== loadGeneration || request.contract !== dataContract) return;
+        if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+        if (data.contract !== dataContract) { loadHistory(); return; }
+        if (data.symbol !== symbol || data.tf !== tf || data.ltf !== ltf) throw new Error("历史数据与当前图表不匹配");
+        acceptHistoryRevision(data);
+        const older = data.bars.filter((bar) => bar.time < before);
+        olderHasMore = data.hasMore === true && older.length > 0;
+        // 等待期间实时行情照常合并; 它比历史页新, 重叠处以已有值为准。
+        if (older.length) renderWithHistory(FlowData.mergeBars(older, bars));
+      } catch (error) {
+        if (olderRequest === request && !request.controller.signal.aborted) olderError = error.message;
+      } finally {
+        if (olderRequest === request) {
+          olderRequest = null;
+          showHistoryHint();
+          queueOlderHistory();
+          queueHistoryRefresh();
+        }
+      }
+    }
+
     function clearLoadRetry() {
       clearTimeout(retryTimer);
       retryTimer = null;
@@ -2512,6 +2669,7 @@
     async function loadHistory(generation) {
       clearPaperEntry();
       if (generation == null) {
+        resetOlderHistory();
         generation = ++loadGeneration;  // 用户切换开始新一轮加载；自动重试沿用原 generation。
         retryAttempts = 0;
       }
@@ -2561,6 +2719,8 @@
         cfg = data.cfg;
         bars = data.bars;
         barsLtf = data.ltf;
+        historyRevision = data.historyRevision ?? 0;
+        historyBackfill = data.historyBackfill ?? null;
         barRevision = -1;
         fpRevision = -1;
         onConfig();
@@ -2575,6 +2735,8 @@
         }
       } finally {
         if (loadController === controller) loadController = null;
+        if (generation === loadGeneration) queueOlderHistory();
+        if (generation === loadGeneration) queueHistoryRefresh();
       }
     }
 
@@ -2583,9 +2745,9 @@
       if (nextCfg) { cfg = nextCfg; onConfig(); }
       const oldLast = bars[bars.length - 1]?.time;
       const onlyLast = updates.length === 1 && updates[0].time === oldLast;
-      bars = FlowData.mergeBars(bars, updates);
-      if (onlyLast && !nextCfg) updateLast();
-      else renderAll();  // 补齐/修订历史和窗口裁剪时，所有图表使用同一份数据。
+      const next = FlowData.mergeBars(bars, updates);
+      if (onlyLast && !nextCfg) { bars = next; updateLast(); }
+      else renderWithHistory(next);
       if (settings.view === "footprint" && fpBars.length) {
         const latest = fpBars[fpBars.length - 1];
         if (onlyLast && latest.time === oldLast) fpSeries.update(toFpItem(latest));
@@ -2638,24 +2800,30 @@
             } else if (synced) onStatus(true, "已连接");
           } else if (msg.symbol === symbol && msg.type === "snapshot" && msg.ltf === ltf && msg.tf === tf) {
             acceptDataContract(msg);
+            acceptHistoryRevision(msg);
             cfg = msg.cfg;
-            bars = FlowData.mergeBars([], msg.bars);
+            const next = FlowData.mergeBars(barsLtf === msg.ltf ? bars : [], msg.bars);
             barsLtf = msg.ltf;
             barRevision = msg.revision;
             fpRevision = -1;
             onConfig();
             // 足迹清空要在 renderAll 之前: 清掉的足迹点也会改动时间轴序号, 放在后面 K 线标记又会错位
             if (!msg.footprint) { fpBars = []; fpSeries.setData([]); }
-            renderAll();
+            renderWithHistory(next);
             if (msg.footprint) applyFootprint(msg.footprint, true);
             synced = true;
             onStatus(true, "已连接");
             loadHtfHistory(htfRefresh);   // 断开重连的话大周期历史也重要一次, 补上断开期间的桶
             htfRefresh = false;
+            queueOlderHistory();
+            queueHistoryRefresh();
           } else if (synced && msg.symbol === symbol && msg.tf === tf) {
             if (msg.type === "bars" && msg.ltf === ltf && msg.revision > barRevision) {
               onBars(msg.bars, msg.cfg);
               barRevision = msg.revision;
+            } else if (msg.type === "history" && msg.ltf === ltf) {
+              acceptHistoryRevision(msg);
+              queueHistoryRefresh();
             } else if ((msg.type === "footprints" || msg.type === "footprint_snapshot") && msg.revision > fpRevision) {
               applyFootprint(msg, msg.type === "footprint_snapshot");
             }

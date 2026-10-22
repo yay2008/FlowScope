@@ -143,9 +143,14 @@ class AggregateFeed(ingest.Feed):
         frames = [frame for frame, _ in parts]
         window = parts[0][1]
         starts = [int(part[0]) if part is not None and len(part) else None for _, part in parts]
+        return self.combine_frames(frames), window, starts
+
+    @staticmethod
+    def combine_frames(frames):
+        """按第一家的时间与价格合并; 历史分页与实时窗口共用缺失判定。"""
         primary = frames[0]
         if primary is None:
-            return pd.DataFrame(columns=BAR_COLUMNS), window, starts
+            return pd.DataFrame(columns=BAR_COLUMNS)
         times = primary.index
         parts = [frame.reindex(times) if frame is not None else pd.DataFrame(index=times) for frame in frames]
         df = primary[["open", "high", "low", "close"]].copy()
@@ -162,7 +167,7 @@ class AggregateFeed(ingest.Feed):
         df["unknown"] = np.where(df["buy"].notna(), 0.0, np.nan)
         df["buyLegacy"], df["sellLegacy"] = df["buy"], df["sell"]
         df = finalize_bars(df.reset_index())
-        return df[BAR_COLUMNS], window, starts
+        return df[BAR_COLUMNS]
 
     def _starts_moved(self, ltf, starts, window):
         """第一家以外各家的窗口起点与上一轮不同时, 汇总窗口里从哪根起受影响(None 不受影响)。

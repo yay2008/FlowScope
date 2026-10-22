@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import concurrent.futures
 import math
 import os
 import queue
@@ -485,6 +486,19 @@ class CandleStore:
         frame.insert(0, "time", np.array(times, dtype=np.int64))
         return frame
 
+    def starts_before(self, before: int, limit: int, tf: int | None = None) -> list[int]:
+        """游标之前最近的起点; tf 给定时按 UTC 桶跳读, 不把全部旧 K 线展开。"""
+        end = bisect.bisect_left(self._times, before)
+        starts = []
+        while end and len(starts) < limit:
+            start = self._times[end - 1]
+            if tf is not None:
+                start = utc_bucket(start, tf)
+            if start < before:
+                starts.append(start)
+            end = bisect.bisect_left(self._times, start, 0, end)
+        return starts[::-1]
+
     def last_time(self) -> int | None:
         return self._times[-1] if self._times else None
 
@@ -672,6 +686,13 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
         starts = self._grid(feeds[0])
         if starts is None:
             return pd.DataFrame(columns=CANDLE_COLUMNS)
+        return self.candles_at(starts, feeds, forming=True)
+
+    def candles_at(self, starts, feeds=None, forming=False) -> pd.DataFrame:
+        """指定起点的历史桶与实时桶沿用相同的多所汇总规则。"""
+        feeds = self.candle_feeds() if feeds is None else feeds
+        if not len(starts) or not feeds or feeds[0] is None:
+            return pd.DataFrame(columns=CANDLE_COLUMNS)
         self._candle_cache = {feed.symbol: self._candle_cache.get(feed.symbol) or ClosedCache()
                               for feed in feeds if feed is not None}
         out = self._source_buckets(feeds[0], starts)
@@ -684,7 +705,8 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
                 # 自己最新一根: 逐笔成交到了才建 bar, 某家最近几秒没成交时就是比别家少最新那几根, 不算缺
                 whole = np.logical_and.reduce([part["count"].to_numpy() == out["count"].to_numpy()
                                                for part in parts[1:]])
-                whole[-1] |= all(self._forming_whole(part, int(starts[-1])) for part in parts)
+                if forming:
+                    whole[-1] |= all(self._forming_whole(part, int(starts[-1])) for part in parts)
                 volume = sum(part["volume"] for part in parts).where(whole)
             out = out.assign(volume=volume.round(VOLUME_ROUND))
         return out[out["count"] > 0].reset_index()[CANDLE_COLUMNS]
@@ -894,6 +916,18 @@ class CryptoManager:
             backfiller.bind(self.adapters)
 
     # ------------------------------------------------------------------ HTTP 线程调用
+    async def query(self, fn, timeout: float = 15):
+        """历史读取也排到管理线程, 避免与实时落盘/回填同时修改索引。"""
+        if self.status != "running":
+            raise RuntimeError("加密行情线程未就绪")
+        future = concurrent.futures.Future()
+        self.events.put(("query", fn, future))
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout)
+        except asyncio.TimeoutError:
+            future.cancel()
+            raise RuntimeError("历史查询超时，请重试") from None
+
     def start(self, loop: asyncio.AbstractEventLoop):
         self.loop = loop
         if self._thread is None or not self._thread.is_alive():
@@ -1250,6 +1284,14 @@ class CryptoManager:
                 print(f"[crypto] 循环回调失败: {type(exc).__name__}: {exc}", flush=True)
 
     def _apply_event(self, event):
+        if event[0] == "query":
+            _, fn, future = event
+            if future.set_running_or_notify_cancel():
+                try:
+                    future.set_result(fn(self))
+                except Exception as exc:
+                    future.set_exception(exc)
+            return
         kind, symbol = event[0], event[1]
         if kind == "trade":
             applied = False

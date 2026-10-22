@@ -1,10 +1,24 @@
 /* 可在浏览器和 Node 回归测试中复用的数据合并规则。 */
 (function (root) {
   "use strict";
-  function mergeBars(existing, updates, limit = 800) {
+  function mergeBars(existing, updates, limit = Infinity) {
     const byTime = new Map(existing.map((bar) => [bar.time, bar]));
     for (const bar of updates) byTime.set(bar.time, bar);
-    return [...byTime.values()].sort((a, b) => a.time - b.time).slice(-limit);
+    const bars = [...byTime.values()].sort((a, b) => a.time - b.time);
+    return Number.isFinite(limit) ? bars.slice(-limit) : bars;
+  }
+  function mergeCvdHistory(existing, history, liveFrom) {
+    const anchor = history.find((bar) => bar.time === liveFrom);
+    let cumulative = anchor?.cvdOpen ?? (anchor?.cvd != null && anchor?.delta != null ? anchor.cvd - anchor.delta : null);
+    const live = existing.filter((bar) => bar.time >= liveFrom).map((bar) => {
+      if (cumulative == null) return bar;
+      if (bar.delta == null) return { ...bar, cvdOpen: null, cvd: null };
+      const open = cumulative;
+      cumulative += bar.delta;
+      return { ...bar, cvdOpen: open, cvd: cumulative };
+    });
+    // 历史重算覆盖已收盘的根; 末根和等候期间新到的根保留实时成交, 只调整累计基准。
+    return mergeBars(mergeBars(existing, history.filter((bar) => bar.time < liveFrom)), live);
   }
   function diagonalVolumes(levels, tickSize) {
     if (!(tickSize > 0)) return levels.map(() => null);
@@ -99,7 +113,7 @@
     if (!option || option.openInterest == null) return name;
     return `${name} · 昨仓 ${formatOpenInterest(option.openInterest)}`;
   }
-  const api = { mergeBars, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
+  const api = { mergeBars, mergeCvdHistory, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
                 parseSymbolParts, formatOpenInterest, formatAmount, liquidityLabel,
                 watchLabel, formatPrice, formatChangePct, changeClass, productLabel, monthLabel };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

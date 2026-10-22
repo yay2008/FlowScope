@@ -164,7 +164,7 @@ def bucket_stats(rows: pd.DataFrame, starts: np.ndarray, ends: np.ndarray) -> pd
     return out
 
 
-def finish_bars(candles: pd.DataFrame, stats: pd.DataFrame, tf: int, rule: str = "volume") -> pd.DataFrame:
+def finish_bars(candles: pd.DataFrame, stats: pd.DataFrame, tf: int, rule: str = "volume", *, closed=False) -> pd.DataFrame:
     """大周期开高低收量 + 各桶统计 -> 大周期 bars 表(BAR_COLUMNS, 不含 CVD)。
 
     rule="volume"(期货): 各根 30s 都 complete 且已知成交量之和等于这根的成交量才算完整;
@@ -183,7 +183,7 @@ def finish_bars(candles: pd.DataFrame, stats: pd.DataFrame, tf: int, rule: str =
     if rule == "slots":
         last = s["last"].astype(float)
         latest = int(last.max()) + BASE_SEC if last.notna().any() else int(starts[-1])
-        expected = (np.minimum(ends, latest) - starts) // BASE_SEC
+        expected = ((ends if closed else np.minimum(ends, latest)) - starts) // BASE_SEC
         whole = (complete == expected) & (expected > 0)
     else:
         whole = ((complete == count) & (count > 0)
@@ -307,8 +307,10 @@ class RollupMixin:
         raise NotImplementedError
 
     def volume_store(self, base, ltf):
-        """期货覆盖判定用的成交量来源(tick 口径历史文件); 加密数槽位, 不需要。"""
-        return base._store(0) if self.rule == "volume" else None
+        """期货按各口径对应的原生成交量核对; TV 历史不依赖 tick 覆盖。"""
+        if self.rule != "volume":
+            return None
+        return base.volume_history() if ltf > 0 else base._store(0)
 
     def base_stats(self, base, ltf, candles) -> pd.DataFrame | None:
         """底层 ltf 粒度 -> 各桶统计。已收尾的桶走缓存; 其余由历史文件里窗口之前那截加最近窗口现算。"""

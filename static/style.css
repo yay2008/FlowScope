@@ -211,6 +211,14 @@ body { display: flex; flex-direction: column; }
   min-height: 0;
 }
 .chart-view + .chart-view { border-left: 1px solid #2a2e39; }
+.history-hint {
+  position: absolute; top: 42px; left: 50%; transform: translateX(-50%); z-index: 6;
+  padding: 5px 10px; border: 1px solid #363c4b; border-radius: 4px;
+  background: #171b24e8; color: #b2b9c8; font-size: 12px; white-space: nowrap;
+}
+.history-hint:disabled { cursor: default; opacity: 1; }
+.history-hint:not(:disabled) { cursor: pointer; color: #f0b90b; }
+.history-hint[hidden] { display: none; }
 /* 划线止盈止损: 鼠标在能拖的线上(或正拖着)时换成上下箭头; 库在自己的元素上写了内联光标, 要 !important 才盖得住 */
 .chart-view.paper-drag, .chart-view.paper-drag * { cursor: ns-resize !important; }
 /* 十字线右端的挂单入口, 与价格轴标签相接。 */

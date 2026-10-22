@@ -1260,7 +1260,7 @@ test("OB Zones: 图元按实际价格坐标绘制、裁掉画外区域, 两条�
 });
 
 for (const maxAge of [500, 2000]) {
-  test(`OB Zones: 隐藏期间滚动裁剪、模拟断线重连和补齐快照保持一致（年龄${maxAge}）`, async () => {
+  test(`OB Zones: 历史超过800根、模拟断线重连和补齐快照保持一致（年龄${maxAge}）`, async () => {
     let price = 100;
     const all = Array.from({ length: 921 }, (_, i) => {
       const after = [100, 550].find((at) => i > at && i <= at + 40);
@@ -1302,7 +1302,7 @@ for (const maxAge of [500, 2000]) {
     for (let i = 800; i < 901; i++) send(socket, { type: "bars", revision: i - 799, bars: [all[i]] });
     assert.equal(vm.runInContext("charts[1].derived.ob", context), null, "隐藏期间只维护状态");
     clickEye(context, 1, "ob");
-    assert.equal(vm.runInContext("charts[1].bars.length", context), 800);
+    assert.equal(vm.runInContext("charts[1].bars.length", context), 901);
     assert.equal(result().historyCount, 901);
     assert.deepEqual(result().zones.map(z => z.status), [maxAge === 500 ? "expired" : "active"]);
     checkFull(all.slice(0, 901));
@@ -1327,6 +1327,115 @@ for (const maxAge of [500, 2000]) {
     checkFull(newContractBars); // 实际换月必须重置，不能继承旧月份区域。
   });
 }
+
+async function pagingBrowser() {
+  const symbol = "AGG.BTC", requests = [], sockets = [], timers = new Map();
+  const all = Array.from({ length: 1701 }, (_, i) => ({ time: 1700000000 + i * 30,
+    open: 100 + i % 10, close: 101 + i % 10, high: 102 + i % 10, low: 99 + i % 10,
+    volume: 100, buy: 60, sell: 40, delta: 20, cvd: (i + 1) * 20, coverage: "complete" }));
+  const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50,
+    colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
+  const context = runBrowser({ search: `?symbol=${symbol}`, localStorage: createLocalStorage({ chartTfs: "[30,300]" }),
+    fetch: (url, options) => {
+      const parsed = new URL(url, "http://localhost");
+      if (parsed.pathname !== "/api/history") return stubFetch(url, options);
+      const tf = Number(parsed.searchParams.get("tf")), ltf = Number(parsed.searchParams.get("ltf"));
+      if (parsed.searchParams.has("before")) return new Promise((resolve, reject) => {
+        requests.push({ parsed, options, resolve, reject, tf, ltf });
+      });
+      return Promise.resolve(jsonResponse({ symbol, contract: symbol, tf, ltf, cfg,
+        bars: tf === 30 ? all.slice(900, 1700) : [] }));
+    } });
+  context.WebSocket = class { constructor(url) { this.url = url; sockets.push(this); } close() {} };
+  let timerId = 0;
+  context.setTimeout = (fn, delay) => { timers.set(++timerId, { fn, delay }); return timerId; };
+  context.clearTimeout = (id) => timers.delete(id);
+  await new Promise(resolve => setImmediate(resolve));
+  vm.runInContext("activate(charts[0])", context);
+  const scale = stubCharts[0].timeScale;
+  const bars = () => JSON.parse(vm.runInContext("JSON.stringify(charts[0].bars)", context));
+  const hint = () => context.document.getElementById("chart").children[0].children.find(x => x.className === "history-hint");
+  const send = (message, socket = sockets.find(s => new URL(s.url).searchParams.get("tf") === "30")) =>
+    socket.onmessage({ data: JSON.stringify({ symbol, contract: symbol, tf: 30, ltf: 0, cfg, ...message }) });
+  send({ type: "snapshot", revision: 0, bars: all.slice(900, 1700) });
+  const fire = () => {
+    const entry = [...timers].find(([, timer]) => timer.delay === 150);
+    if (!entry) return false;
+    timers.delete(entry[0]); entry[1].fn(); return true;
+  };
+  const resolve = async (request, pageBars, hasMore = true) => {
+    request.resolve(jsonResponse({ symbol, contract: symbol, tf: request.tf, ltf: request.ltf, bars: pageBars, hasMore }));
+    await new Promise(resolve => setImmediate(resolve));
+  };
+  return { context, requests, sockets, timers, all, scale, bars, hint, send, fire, resolve };
+}
+
+test("向左翻页: 同时只请求一页, 按响应到达时的视口定位, 实时更新和重连保留历史", async () => {
+  const h = await pagingBrowser();
+  h.scale.setVisibleLogicalRange({ from: 10.5, to: 110.5 });
+  assert.equal(h.fire(), true);
+  assert.equal(h.requests.length, 1);
+  assert.equal(Number(h.requests[0].parsed.searchParams.get("before")), h.all[900].time);
+  h.scale.setVisibleLogicalRange({ from: -20, to: 80 });
+  assert.equal(h.fire(), false, "请求未完成时不重复加载");
+  h.send({ type: "bars", revision: 1, bars: [{ ...h.all[1699], close: 222 }, h.all[1700]] });
+  await h.resolve(h.requests[0], h.all.slice(100, 900));
+  assert.equal(h.bars().length, 1601);
+  assert.deepEqual(h.scale.getVisibleLogicalRange(), { from: 780, to: 880 });
+  assert.equal(h.bars().at(-2).close, 222, "在途历史不能覆盖实时价格");
+  h.send({ type: "snapshot", revision: 2, bars: h.all.slice(901) });
+  assert.equal(h.bars().length, 1601, "最近800根快照不能删掉历史");
+  assert.equal(h.bars()[0].time, h.all[100].time);
+  assert.equal(h.fire(), false, "补完一页后离开边缘就停止请求");
+  h.scale.setVisibleLogicalRange({ from: 5, to: 105 });
+  h.fire();
+  await h.resolve(h.requests[1], h.all.slice(0, 100), false);
+  assert.equal(h.bars().length, 1701);
+  h.scale.setVisibleLogicalRange({ from: -10, to: 90 });
+  assert.equal(h.fire(), false, "已到起点不空转请求");
+  assert.equal(h.hint().textContent, "已到可用历史起点");
+  assert.equal(h.hint().hidden, false);
+});
+
+test("向左翻页: 失败保留图表与实时连接, 点击提示可重试", async () => {
+  const h = await pagingBrowser();
+  h.scale.setVisibleLogicalRange({ from: 0, to: 100 }); h.fire();
+  h.requests[0].resolve({ ok: false, status: 503, json: async () => ({ detail: "历史查询超时" }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.bars().length, 800);
+  assert.equal(h.hint().disabled, false);
+  assert.match(h.hint().textContent, /点击重试/);
+  assert.equal(h.fire(), false, "错误不产生无限重试");
+  const sockets = h.sockets.length;
+  h.hint().handlers.click[0]();
+  await h.resolve(h.requests[1], h.all.slice(100, 900));
+  assert.equal(h.bars().length, 1600);
+  assert.equal(h.sockets.length, sockets, "历史请求不重连实时订阅");
+});
+
+test("向左翻页: 切周期和买卖量口径取消请求, 迟到数据不能污染新图", async () => {
+  for (const action of ['charts[0].setTf(60)', 'settings.cvdSource = "kline"; settings.klineLtf = 5; charts[0].load()']) {
+    const h = await pagingBrowser();
+    h.scale.setVisibleLogicalRange({ from: 0, to: 100 }); h.fire();
+    const request = h.requests[0];
+    vm.runInContext(action, h.context);
+    assert.equal(request.options.signal.aborted, true);
+    await new Promise(resolve => setImmediate(resolve));
+    const before = h.bars();
+    await h.resolve(request, h.all.slice(100, 900));
+    assert.deepEqual(h.bars(), before);
+  }
+});
+
+test("向左翻页: 旧合约请求在主力换月后失效", async () => {
+  const h = await pagingBrowser();
+  h.scale.setVisibleLogicalRange({ from: 0, to: 100 }); h.fire();
+  h.send({ type: "snapshot", contract: "changed-contract", revision: 2, bars: h.all.slice(1600, 1700) });
+  assert.equal(h.requests[0].options.signal.aborted, true);
+  await h.resolve(h.requests[0], h.all.slice(100, 900));
+  assert.equal(h.bars().length, 100);
+  assert.equal(h.bars()[0].time, h.all[1600].time);
+});
 
 test("大额成交: 买卖两侧各画一个点, 大小按该侧量, 对冲不抵消, 只有未知方向不画, 悬停保留买卖明细", () => {
   const storage = createLocalStorage();

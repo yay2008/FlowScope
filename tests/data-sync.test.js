@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeBars, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
+const { mergeBars, mergeCvdHistory, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
         parseSymbolParts, formatOpenInterest, formatAmount, liquidityLabel,
         watchLabel, formatPrice,
         formatChangePct, changeClass, productLabel, monthLabel } =
@@ -33,6 +33,38 @@ test("patches fill gaps, revise old bars, deduplicate and bound the window", () 
 
 test("empty footprints accept their first update", () => {
   assert.deepEqual(mergeBars([], [{time: 10, levels: [[101, 10, 0]]}]), [{time: 10, levels: [[101, 10, 0]]}]);
+});
+
+test("backfilled CVD rebases the live tail without reverting newer trades", () => {
+  const live = [{ time: 1, delta: 2, cvd: 2 },
+                { time: 2, close: 150, volume: 10, delta: 7, cvdOpen: 2, cvd: 9 },
+                { time: 3, delta: -3, cvdOpen: 9, cvd: 6 }];
+  const history = [{ time: 1, delta: 2, cvdOpen: 100, cvd: 102 },
+                   { time: 2, close: 120, volume: 5, delta: 3, cvdOpen: 102, cvd: 105 }];
+  const next = mergeCvdHistory(live, history, 2);
+  assert.equal(next[0].cvd, 102);
+  assert.equal(next[1].close, 150);
+  assert.equal(next[1].volume, 10);
+  assert.equal(next[1].delta, 7);
+  assert.equal(next[1].cvd, 109);
+  assert.equal(next[2].cvdOpen, 109);
+  assert.equal(next[2].cvd, 106);
+});
+
+test("backfill synchronization leaves unknown live delta missing", () => {
+  const next = mergeCvdHistory([{ time: 2, delta: null, cvd: null }, { time: 3, delta: 4, cvd: 4 }],
+                               [{ time: 2, delta: 1, cvdOpen: 100, cvd: 101 }], 2);
+  assert.equal(next[0].cvd, null);
+  assert.equal(next[1].cvd, 104);
+});
+
+test("loaded candle history survives live updates without an implicit 800-bar cap", () => {
+  const older = Array.from({ length: 1600 }, (_, time) => ({ time, close: 1 }));
+  const result = mergeBars(older, [{ time: 1599, close: 2 }, { time: 1600, close: 3 }]);
+  assert.equal(result.length, 1601);
+  assert.equal(result[0].time, 0);
+  assert.equal(result[1599].close, 2);
+  assert.equal(mergeBars(older, [], 800).length, 800, "足迹等显式限制仍生效");
 });
 
 test("diagonal comparison uses adjacent price ticks, never the next traded row", () => {
