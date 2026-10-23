@@ -182,6 +182,14 @@ class StoreRowsTests(unittest.TestCase):
         self.assertTrue(np.isnan(out["volume"].iloc[0]))
         self.assertEqual(out["volume"].iloc[1], 6.0)
 
+    def test_volume_falls_back_to_later_stores_in_order(self):
+        # TV 口径: 原生 K 线成交量档案优先, 档案里没有的 30s 用 tick 历史核对过的量
+        self.save([(T0, 1, 1), (T0 + 30, 2, 2)])
+        archive = HistoryStore(Path(self.temp.name) / "x_30s_volume_v1.csv")
+        archive.save_completed(rows((T0 + 30, 9, 0, "complete")), final=True)
+        out = store_rows(self.store, volume_store=(archive, self.store))
+        self.assertEqual(out["volume"].tolist(), [2.0, 9.0])
+
     def test_only_rows_before_the_live_window(self):
         self.save([(T0, 1, 1), (T0 + 30, 2, 2), (T0 + 60, 3, 3)])
         self.assertEqual(store_rows(self.store, before=T0 + 60)["time"].tolist(), [T0, T0 + 30])
@@ -263,7 +271,8 @@ class FuturesRollupFeedTests(unittest.TestCase):
         cfg = self.feed.cfg()
         self.assertEqual(cfg["tf"], 300)
         self.assertEqual(cfg["ltfOptions"], [0, 1, 5, 10, 15, 30])
-        self.assertEqual(self.feed.footprint_snapshot()["bars"], [])
+        self.assertIsNone(self.feed.footprint_snapshot())
+        self.assertGreater(self.base._fp_until, time.monotonic())
 
     def test_changes_when_klines_change_or_the_base_recomputes(self):
         api = Mock()
@@ -416,13 +425,13 @@ class CryptoRollupTests(CryptoRollupCase):
         self.assertIsNot(self.manager.ensure(BTC, 3600), feed)    # 回收后再要就是新建的
 
     def test_history_endpoint_routes_rollup_periods(self):
-        self.manager.ensure(BTC, 900)
+        self.manager.ensure(BTC, 900).request(footprint=True)
         self.feed_trades(BTC, make_trades(START_MS, 60, step_ms=4000))
         self.compute()
         with patch.object(server, "crypto", self.manager):
             snapshot = asyncio.run(server.history(BTC, 0, 900))
             self.assertEqual((snapshot["tf"], snapshot["cfg"]["tf"]), (900, 900))
-            self.assertEqual(asyncio.run(server.footprint(BTC, 900))["bars"], [])
+            self.assertTrue(asyncio.run(server.footprint(BTC, 900))["bars"])
             self.assertIn(f"{BTC}@900s", self.manager.status_snapshot()["rollups"])
 
 

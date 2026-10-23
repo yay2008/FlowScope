@@ -120,6 +120,78 @@ class FuturesBackfillTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertFalse(list(Path(self.temp.name).glob("DCE_p2705*")))
 
+    def test_bars_left_partial_after_download_are_not_downloaded_again(self):
+        # 没成交的秒没有小 K 线: 下载后这些 bar 仍是 partial, 不能每次加载都重下
+        self.lower = self.lower[self.lower.index % 40 != 7].copy()
+        asyncio.run(self.manager.backfill_history(SYMBOL, 300, 15))
+        self.assertTrue(any(b["coverage"] == "partial" for b in self.page()["bars"]))
+        asyncio.run(self.manager.backfill_history(SYMBOL, 300, 15))
+        self.assertEqual(len(self.downloads), 1)
+
+    def test_range_whose_save_failed_is_downloaded_again(self):
+        store = self.base._store(15)
+        with patch.object(type(store), "save_completed", side_effect=OSError("磁盘写入失败")):
+            with self.assertRaises(OSError):
+                asyncio.run(self.manager.backfill_history(SYMBOL, 300, 15))
+        self.assertNotIn(15, self.base.history_attempted, "没存上不能记为下载过")
+        asyncio.run(self.manager.backfill_history(SYMBOL, 300, 15))
+        self.assertEqual(len(self.downloads), 2)
+        self.assertTrue(all(b["cvd"] is not None for b in self.page()["bars"]))
+
+    def test_holiday_chunk_without_any_kline_is_not_an_error(self):
+        empty = self.main.iloc[:0].copy()
+        self.assertTrue(self.manager._apply_history(self.base, SYMBOL, 15, empty, self.lower.iloc[:0].copy(),
+                                                    T0, T0 + 86400))
+        self.assertEqual(self.base.history_attempted[15], [(T0, T0 + 86400)])
+        self.manager._apply_history(self.base, SYMBOL, 15, empty, self.lower.iloc[:0].copy(),
+                                    T0 + 86400, T0 + 2 * 86400)
+        self.assertEqual(self.base.history_attempted[15], [(T0, T0 + 2 * 86400)])
+
+    def test_background_backfill_failure_is_logged_and_does_not_raise(self):
+        def broken(*args):
+            raise RuntimeError("网络中断")
+
+        self.manager._history_backfiller.stop()
+        self.manager._history_backfiller = KlineBackfiller(broken)
+
+        async def run():
+            first = self.manager.schedule_backfill(SYMBOL, 300, 15)
+            self.assertIs(self.manager.schedule_backfill(SYMBOL, 300, 15), first, "同一范围只跑一个")
+            await first
+            return self.manager._backfills
+
+        with patch("builtins.print") as printed:
+            self.assertEqual(asyncio.run(run()), {})
+        self.assertIn("网络中断", printed.call_args.args[0])
+        self.assertIsNone(self.manager.schedule_backfill(SYMBOL, 300, 0))
+
+    def test_first_load_returns_snapshot_without_waiting_for_download(self):
+        import app as server
+
+        release = threading.Event()
+
+        def slow(*args):
+            release.wait(5)
+            return self.download(*args)
+
+        self.manager._history_backfiller.stop()
+        self.manager._history_backfiller = KlineBackfiller(slow)
+        self.feed.snapshot_for(15, demand=False)
+        self.feed.snapshots[15] = {"tf": 300, "ltf": 15, "bars": []}
+
+        async def run():
+            with patch.object(server, "manager", self.manager):
+                snapshot = await asyncio.wait_for(server.history(SYMBOL, 15, 300), timeout=3)
+                self.assertEqual(snapshot["symbol"], SYMBOL)
+                (task,) = self.manager._backfills.values()
+                self.assertFalse(task.done(), "下载还在后台进行")
+                release.set()
+                await task
+
+        asyncio.run(run())
+        self.assertEqual(len(self.downloads), 1)
+        self.assertTrue(any(m["type"] == "history" for m in self.messages))
+
     def test_tick_mode_does_not_download_small_kline_history(self):
         asyncio.run(self.manager.backfill_history(SYMBOL, 300, 0))
         self.assertEqual(self.downloads, [])

@@ -70,7 +70,8 @@ def download_klines(contract, tf, ltf, since, before, stopped):
             for seconds, frame in frames.items():
                 stamps = frame.datetime // 10**9 + TZ_SHIFT_S
                 frames[seconds] = frame[(stamps >= since) & (stamps + seconds <= before)].copy()
-            if frames[tf].empty or frames[ltf].empty:
+            # 两种都没有是整段休市(节假日), 照常返回空表; 只缺一种才是行情源出了问题
+            if frames[tf].empty != frames[ltf].empty:
                 raise RuntimeError("行情源未返回所需的小周期历史 K 线")
             return frames[tf], frames[ltf]
     finally:

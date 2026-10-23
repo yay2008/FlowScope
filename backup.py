@@ -18,7 +18,10 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sqlite3
+import tempfile
 import threading
+import time
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -33,6 +36,8 @@ WEEKLY_KEEP = 12
 _PREFIX = "flowscope-data-"
 _NAME = re.compile(re.escape(_PREFIX) + r"(\d{8}-\d{6})\.zip\Z")
 _STAMP = "%Y%m%d-%H%M%S"
+SQLITE_LOCK_WAIT_SEC = 10    # 一致性快照最多等锁这么久, 之后改为直接复制文件
+_SQLITE_WAITING = (5, 6)     # SQLITE_BUSY / SQLITE_LOCKED(sqlite3 模块 3.11 起才有这两个常量)
 
 
 def default_dest() -> str:
@@ -57,6 +62,38 @@ def snapshots(dest) -> list[tuple[datetime, Path]]:
     return sorted(found, reverse=True)
 
 
+def _write_sqlite(archive, path: Path, name: str):
+    """数据库可能正在提交: 用 SQLite 一致性快照, 不直接复制活跃数据库。
+
+    库坏了或一直被锁(快照做不成)时退回直接复制文件, 一个库出问题不能让自选、模拟账户、历史都备份不上。
+    """
+    with tempfile.TemporaryDirectory(prefix="flowscope-backup-") as staging:
+        copied = Path(staging) / path.name
+        deadline = time.monotonic() + SQLITE_LOCK_WAIT_SEC
+
+        def give_up(status, remaining, total):
+            # backup() 遇到锁只会隔 250ms 重试、从不报错(connect 的 timeout 管不到这个循环), 别的进程一直
+            # 占着写锁时整个备份就一直卡在这里。到期抛错, 落到下面改为直接复制。
+            if status in _SQLITE_WAITING and time.monotonic() >= deadline:
+                raise sqlite3.OperationalError(f"等锁超过 {SQLITE_LOCK_WAIT_SEC} 秒")
+
+        try:
+            source_db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
+                                        timeout=SQLITE_LOCK_WAIT_SEC)
+            try:
+                target_db = sqlite3.connect(copied)
+                try:
+                    source_db.backup(target_db, progress=give_up)
+                finally:
+                    target_db.close()
+            finally:
+                source_db.close()
+        except sqlite3.Error as exc:
+            print(f"[backup] {name} 无法做一致性快照({exc}), 改为直接复制文件", flush=True)
+            copied = path
+        archive.write(copied, name)
+
+
 def create_snapshot(source, dest, now: datetime | None = None) -> Path:
     """把 source 下的全部文件(不含 *.tmp 中间文件)打成一个 zip, 返回快照路径。
 
@@ -75,8 +112,13 @@ def create_snapshot(source, dest, now: datetime | None = None) -> Path:
                              strict_timestamps=False) as archive:
             for path in sorted(root.rglob("*")):
                 if (path.is_file() and path.suffix != ".tmp"
+                        and not path.name.endswith((".sqlite3-journal", ".sqlite3-wal", ".sqlite3-shm"))
                         and own not in path.resolve().parents):
-                    archive.write(path, path.relative_to(root).as_posix())
+                    name = path.relative_to(root).as_posix()
+                    if path.suffix == ".sqlite3":
+                        _write_sqlite(archive, path, name)
+                    else:
+                        archive.write(path, name)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)

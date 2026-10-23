@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from indicator import BAR_COLUMNS, ROLLUP_BASE_TF, TZ_SHIFT_S, VOLUME_ROUND, ltf_options
+from footprint import rollup as rollup_footprint
 
 BASE_SEC = ROLLUP_BASE_TF
 SUM_COLUMNS = ["buy", "sell", "unknown", "buyLegacy", "sellLegacy"]
@@ -101,8 +102,8 @@ def utc_bucket(t: int, tf: int) -> int:
 def store_rows(store, since=INT64_MIN, before=INT64_MAX, volume_store=None) -> pd.DataFrame:
     """底层历史文件里 [since, before) 的 30s -> 每根一行; 买卖量、对照列与覆盖同 HistoryStore.merge。
 
-    volume 列是这根 30s 已知的成交量, 只有期货的覆盖判定用得到: 来自 volume_store(tick 口径
-    的历史文件)里核对通过的行, buy + sell + unknown 就是 K 线成交量; 其余为 NaN。
+    volume 列是这根 30s 已知的成交量, 只有期货的覆盖判定用得到: 来自 volume_store 里核对通过的行,
+    buy + sell + unknown 就是 K 线成交量; 其余为 NaN。volume_store 可以是几个文件, 按先后取第一个有这根的。
     买卖量与来源直接切 HistoryStore 的索引数组; 对照列与成交量存在按时间的字典里, 只能逐根取。
     """
     times, buy, sell, codes = store.display_between(since, before)
@@ -117,12 +118,14 @@ def store_rows(store, since=INT64_MIN, before=INT64_MAX, volume_store=None) -> p
     legacy = codes == 2
     unknown[legacy], buy_legacy[legacy], sell_legacy[legacy] = 0.0, buy[legacy], sell[legacy]
     volume = np.full(len(keys), np.nan)
-    if volume_store is not None:
-        reference, reference_extra = volume_store.values, volume_store.extra
-        known = [reference.get(t) for t in keys]
-        volume = np.array([np.nan if k is None else
-                           k[0] + k[1] + ((reference_extra.get(t) or _NO_EXTRA).get("unknown") or 0.0)
-                           for t, k in zip(keys, known)], dtype=float)
+    for reference in (volume_store if isinstance(volume_store, tuple) else (volume_store,)):
+        if reference is None:
+            continue
+        values, extra = reference.values, reference.extra
+        for i, t in enumerate(keys):
+            known = values.get(t) if np.isnan(volume[i]) else None
+            if known is not None:
+                volume[i] = known[0] + known[1] + ((extra.get(t) or _NO_EXTRA).get("unknown") or 0.0)
     return pd.DataFrame({"time": times, "buy": buy, "sell": sell, "unknown": unknown, "buyLegacy": buy_legacy,
                          "sellLegacy": sell_legacy, "coverage": COVERAGES[codes], "hasBaseline": False,
                          "volume": volume}, columns=ROW_COLUMNS)
@@ -277,19 +280,30 @@ class RollupMixin:
         return self.base_lookup()
 
     def request(self, ltf=None, footprint=False, demand=False):
-        super().request(ltf=ltf, demand=demand)
+        super().request(ltf=ltf, footprint=footprint, demand=demand)
         base = self.base()
         if base is not None:
-            base.request(ltf=ltf, demand=demand)
+            base.request(ltf=ltf, footprint=footprint, demand=demand)
 
     def cfg(self) -> dict:
         base = self.base()
         cfg = base.cfg() if base is not None else super().cfg()
         return {**cfg, "tf": self.tf, "ltfOptions": ltf_options(self.tf)}
 
-    def footprint_snapshot(self, demand=True):
-        """大周期不做足迹图。"""
-        return self._empty_footprint(demand)
+    def _flowwave_context(self, ltf, bars, records):
+        """大周期只合成最近 max_bars 根(就是快照那些): FlowWave 第一次算时从历史读快照之前的各根预热,
+        否则快照最左边几根没有值、往左翻页后接缝处空一段。读不到(底层还没就绪)就不预热。"""
+        from history_paging import history_frame
+        from ingest import FLOWWAVE_COLUMNS
+        from wt2 import CONTEXT_BARS
+
+        if not records:
+            return []
+        try:
+            older, _ = history_frame(None, self, self.tf, ltf, int(records[0]["time"]), CONTEXT_BARS)
+        except RuntimeError:
+            return []
+        return older[[c for c in FLOWWAVE_COLUMNS if c in older]].to_dict("records")
 
     def _new_large_detector(self):
         """大额事件由底层 30s 的检测器提供, 大周期不自建。"""
@@ -307,21 +321,27 @@ class RollupMixin:
         raise NotImplementedError
 
     def volume_store(self, base, ltf):
-        """期货按各口径对应的原生成交量核对; TV 历史不依赖 tick 覆盖。"""
+        """期货核对成交量用的文件: tick 口径用 tick 历史; TV 口径先看原生 K 线成交量档案, 档案是新加的,
+        之前的各根(及没回补过的)退回 tick 历史里核对过的量, 已经完整的历史不会因此变回 partial。"""
         if self.rule != "volume":
             return None
-        return base.volume_history() if ltf > 0 else base._store(0)
+        return (base.volume_history(), base._store(0)) if ltf > 0 else base._store(0)
 
-    def base_stats(self, base, ltf, candles) -> pd.DataFrame | None:
-        """底层 ltf 粒度 -> 各桶统计。已收尾的桶走缓存; 其余由历史文件里窗口之前那截加最近窗口现算。"""
+    def base_stats(self, base, ltf, candles, cache=None) -> pd.DataFrame | None:
+        """底层 ltf 粒度 -> 各桶统计。已收尾的桶走缓存; 其余由历史文件里窗口之前那截加最近窗口现算。
+
+        cache 不给就用实时窗口的缓存; 翻页读历史要另给一个, 别把实时那份换成历史区间的桶。
+        """
         recent = base.latest_window(ltf)
         if recent is None:          # 底层这一轮没算这个粒度(刚要、或已停用): 等它算出来
             return None
         store = base._store(ltf)
         store.refresh()
         volume_store = self.volume_store(base, ltf)
-        if volume_store is not None and volume_store is not store:
-            volume_store.refresh()
+        extra_sources = [source for source in (volume_store if isinstance(volume_store, tuple) else (volume_store,))
+                         if source is not None and source is not store]
+        for source in extra_sources:
+            source.refresh()
         starts = candles["time"].to_numpy(dtype=np.int64)
         edge = int(recent["time"].iloc[0]) if not recent.empty else INT64_MAX
 
@@ -330,8 +350,9 @@ class RollupMixin:
                     if not frame.empty]
             return bucket_stats(pd.concat(rows, ignore_index=True) if rows else None, s, e)
 
-        sources = [store] if volume_store is None or volume_store is store else [store, volume_store]
-        return split_buckets(starts, bucket_ends(starts, self.tf), edge, self._closed.setdefault(ltf, ClosedCache()),
+        sources = [store, *extra_sources]
+        cache = self._closed.setdefault(ltf, ClosedCache()) if cache is None else cache
+        return split_buckets(starts, bucket_ends(starts, self.tf), edge, cache,
                              sources, lambda lo, hi, s, e: bucket_stats(store_rows(store, lo, hi, volume_store), s, e),
                              fresh)
 
@@ -339,12 +360,15 @@ class RollupMixin:
         """各粒度: 合成 -> 用底层历史文件的累计和算 CVD -> 出快照与增量消息。"""
         with self._state_lock:
             now = time.monotonic()
-            ltfs = [ltf for ltf, expires in self._requested.items() if expires >= now]
+            ltfs = sorted(ltf for ltf, expires in self._requested.items() if expires >= now)
+            want_fp = self._fp_until >= now
             demand_version = self._demand_version
             previous = dict(self.snapshots)
+            previous_fp = self.footprint
         self._start_round()      # 大额汇总只重算检测器改到的那几根(见 ingest.Feed._records)
         base = self.base()
         snapshots, messages = {}, []
+        raw_fp = None
         revision = self.revision + 1
         if base is not None:
             candles = self.candles(base)
@@ -359,8 +383,16 @@ class RollupMixin:
                 if message:
                     messages.append(message)
             self.base_revision = base.revision
+            source = base.footprint_source() if want_fp else None
+            if source is not None:
+                raw_fp = rollup_footprint(source, candles.to_dict("records"), self.tf, self._footprint_merge)
+        fp, message = self._prepare_footprint(raw_fp, previous_fp, revision)
+        if message:
+            messages.append(message)
         with self._state_lock:
             self.snapshots = snapshots
+            self.footprint = fp
+            self._footprint_raw = raw_fp
             self.revision = revision
             self._computed_version = demand_version
             self.error = None

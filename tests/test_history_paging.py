@@ -38,18 +38,24 @@ class HistoryPagingTests(unittest.TestCase):
         self.paths.stop()
         self.temp.cleanup()
 
-    def seed(self, symbol, count=3300, missing=()):
+    def seed(self, symbol, count=3300, missing=(), wave=False, partial=()):
+        """wave: 价格有起伏(平价时涨跌 RMA 都是 0, FlowWave 算不出值); partial: 这些根的覆盖不完整。"""
         feed = self.manager.ensure(symbol, 30)
         self.manager._ensure_loaded(feed)
         times = np.array([T0 + i * 30 for i in range(count) if i not in missing], dtype=np.int64)
         buy = 3.0 if symbol == BTC else 2.0
         candles = pd.DataFrame({"time": times, "open": 100.0, "high": 103.0, "low": 99.0,
                                 "close": 102.0, "volume": buy + 1})
+        if wave:
+            price = 100 + np.sin(np.arange(len(candles)) / 13)
+            candles["open"], candles["close"] = price, price
+            candles["high"], candles["low"] = price + 1, price - 1
         feed.candles.save(candles, final=True)
         for ltf in (0, 5):
             rows = candles.assign(buy=buy if ltf == 0 else 1.0, sell=1.0 if ltf == 0 else buy,
                                   unknown=0.0, buyLegacy=buy, sellLegacy=1.0,
                                   coverage="complete", hasBaseline=True)
+            rows.loc[rows.index.isin(partial), "coverage"] = "partial"
             feed._store(ltf).save_completed(rows, final=True)
         feed.trades.load(feed.candles.load())
         feed.request(ltf=5)
@@ -126,6 +132,82 @@ class HistoryPagingTests(unittest.TestCase):
         self.assertEqual(page["bars"][-1]["cvd"], -60)
         self.assertEqual(page["bars"][0]["large"]["coverage"], "missing")
 
+    def test_history_and_split_preserve_authoritative_live_flowwave_results(self):
+        for symbol in (BTC, OKX):
+            source = self.seed(symbol)
+            candles = source.trades.frame(0)[["time", "open", "high", "low", "close", "volume"]].copy()
+            price = 100 + np.sin(np.arange(len(candles)) / 13)
+            candles["open"], candles["close"] = price, price
+            candles["high"], candles["low"] = price + 1, price - 1
+            source.candles.save(candles, final=True)
+            source.trades.load(source.candles.load())
+            source.recompute(lambda _: None)
+        self.agg.sync_history(self.manager)
+        self.agg.recompute(self.manager, lambda _: None)
+        live = self.agg.snapshot_for(0)["bars"]
+        self.assertIsNotNone(live[-1]["flowWave"]["wt2"])
+        before = live[-1]["time"] + 30
+        for ltf in (0, 5):
+            page = self.page("AGG.BTC", before, limit=100, ltf=ltf)
+            self.assertEqual([b["flowWave"] for b in page["bars"]], [b["flowWave"] for b in live[-100:]])
+        older = self.page("AGG.BTC", live[0]["time"], limit=100)
+        self.assertTrue(all("flowWave" in b for b in older["bars"]))
+
+    def test_crypto_backfill_before_the_snapshot_bumps_history_revision(self):
+        feed = self.seed(BTC)
+        feed.snapshot_for(0)
+        feed.recompute(lambda _: None)
+        start, messages = feed.history_revision, []
+        feed.recompute(messages.append)
+        self.assertEqual(feed.history_revision, start, "没有改动不提升")
+        first = feed.snapshot_for(0)["bars"][0]["time"]
+        rows = pd.DataFrame({"time": [first - 300], "buy": [9.0], "sell": [1.0], "unknown": 0.0, "buyLegacy": 9.0,
+                             "sellLegacy": 1.0, "coverage": "complete", "hasBaseline": True})
+        feed._store(0).save_completed(rows, final=True)      # 回填改到了快照第一根之前
+        feed.recompute(messages.append)
+        self.assertEqual(feed.history_revision, start + 1)
+        update = [m for m in messages if m["type"] == "bars" and m["ltf"] == 0][-1]
+        self.assertEqual(update["historyRevision"], start + 1)
+        self.assertEqual(feed.snapshot_for(0)["historyRevision"], start + 1)
+
+    def test_backfill_before_the_snapshot_rewarms_live_flowwave(self):
+        # 快照第一根之前那 30 根先缺覆盖(加密的价和量都不可用): 第一次算时 FlowWave 从快照第一根才开始预热
+        feed = self.seed(BTC, wave=True, partial=range(2470, 2500))
+        feed.snapshot_for(0)
+        feed.recompute(lambda _: None)
+        bars = feed.snapshot_for(0)["bars"]
+        self.assertEqual(bars[0]["time"], T0 + 2500 * 30)
+        self.assertIsNone(bars[0]["flowWave"]["wt2"])
+        start = feed.history_revision
+        rows = pd.DataFrame({"time": T0 + np.arange(2470, 2500) * 30, "buy": 3.0, "sell": 1.0, "unknown": 0.0,
+                             "buyLegacy": 3.0, "sellLegacy": 1.0, "coverage": "complete", "hasBaseline": True})
+        feed._store(0).save_completed(rows, final=True)      # 回填补齐
+        feed.recompute(lambda _: None)
+        self.assertEqual(feed.history_revision, start + 1)
+        revised = feed.snapshot_for(0)["bars"]
+        self.assertIsNotNone(revised[0]["flowWave"]["wt2"], "历史修订后要重新预热")
+        feed._flowwave.clear()                               # 对照: 从头预热算出来的
+        feed.recompute(lambda _: None)
+        self.assertEqual([b["flowWave"] for b in revised], [b["flowWave"] for b in feed.snapshot_for(0)["bars"]])
+
+    def test_rollup_flowwave_is_warmed_from_history_on_first_compute(self):
+        source = self.seed(BTC)
+        candles = source.trades.frame(0)[["time", "open", "high", "low", "close", "volume"]].copy()
+        price = 100 + np.sin(np.arange(len(candles)) / 13)
+        candles["open"], candles["close"] = price, price
+        candles["high"], candles["low"] = price + 1, price - 1
+        source.candles.save(candles, final=True)
+        source.trades.load(source.candles.load())
+        source.recompute(lambda _: None)
+        rollup = self.manager.ensure(BTC, 60)
+        rollup.recompute(lambda _: None)
+        bars = rollup.snapshot_for(0)["bars"]
+        # 大周期只合成快照那 800 根: 第一次算从历史读之前的各根预热, 最左边一根也有值, 与翻页结果接得上
+        self.assertEqual(len(bars), 800)
+        self.assertIsNotNone(bars[0]["flowWave"]["wt2"])
+        page = self.page(BTC, bars[0]["time"], limit=50, tf=60)
+        self.assertTrue(all(b["flowWave"]["wt2"] is not None for b in page["bars"]))
+
     def test_rollup_pages_use_old_30_second_files_and_the_same_cvd(self):
         self.seed(BTC)
         self.seed(OKX)
@@ -134,7 +216,12 @@ class HistoryPagingTests(unittest.TestCase):
         rollup = self.manager.ensure("AGG.BTC", 60)
         rollup.recompute(lambda _: None)
         initial = rollup.snapshot_for(0)["bars"]
+        live = (rollup._closed[0].frame, {s: c.frame for s, c in rollup._candle_cache.items()})
         page = self.page("AGG.BTC", initial[0]["time"], tf=60)
+        # 翻页另用缓存: 实时窗口已收尾各桶的缓存原样留着, 下一轮实时重算不用重建
+        self.assertIs(rollup._closed[0].frame, live[0])
+        self.assertEqual({s: c.frame for s, c in rollup._candle_cache.items()}.keys(), live[1].keys())
+        self.assertTrue(all(rollup._candle_cache[s].frame is frame for s, frame in live[1].items()))
         self.assertEqual(len(page["bars"]), 800)
         self.assertTrue(page["hasMore"])
         last = page["bars"][-1]

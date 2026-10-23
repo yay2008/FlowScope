@@ -5,10 +5,10 @@
  * 渲染: 两个 pane: K线 / Volume Suite(FlowMeter); 第三个 pane LSMA×CRVOL(FlowWave 副图)暂时隐藏, 见 FLOWWAVE_PANE;
  * 阈值与配色按 Volume Suite (By Leviathan) 口径在前端实时计算(纯计算在 indicators.js)。
  *
- * 共用状态(视图/CVD口径与拆分粒度在工具栏, 模式/阈值在 FlowMeter 窗格左上角, 加上图例里切的带宽)由页面持有,
+ * 共用状态(CVD口径与拆分粒度在工具栏, 模式/阈值在 FlowMeter 窗格左上角, 加上图例里切的带宽)由页面持有,
  * 以 settings 对象按引用传进来、多张图共用; 组件只读不写, 页面改完再调对应的刷新入口(见 create 的返回值)。
  * 模式/阈值的下拉框每张图各有一份, 选了交给页面(onSuiteSetting), 页面写进 settings 再让各图一起刷新。
- * 主图指标的显示开关不在 settings 里: 每张图左上角各有一份图例, 眼睛按钮只管本图。
+ * 视图与主图指标的显示开关不在 settings 里: 每张图左上角各有一份选择框与图例, 只管本图。
  * 读数每张图各显示各的: 主图左上角周期框右边是 OHLC 与涨跌, FlowMeter 窗格名后面是量能读数与覆盖标记。
  * 周期框右边还有两个画图工具: 测量(尺子)与固定范围成交量分布, 画好的成交量分布在图例里一个一行, 由页面记下来。
  * 连接状态和多图联动(十字光标、可视时间范围)是页面的事, 组件通过回调报出事件、
@@ -20,6 +20,8 @@
 
   // 可选主周期(秒), 与后端 indicator.TF_OPTIONS 一致(tests/test_rollup.py 核对两边相同)
   const TF_CHOICES = [10, 30, 60, 300, 900, 3600, 14400];
+  const FOOTPRINT_MIN_TF = 30;
+  const VIEW_CHOICES = ["candle", "footprint"];
   // 拆分粒度候选(秒); 本周期合法的是能整除主周期的那些, 规则同后端 indicator.ltf_options, 拿到 cfg 后以 cfg 为准
   const LTF_CHOICES = [1, 5, 10, 15, 30];
 
@@ -39,137 +41,391 @@
   // 最后一根右边留几根的空白(图表的 rightOffset), 联动对齐右边缘时也按它留
   const RIGHT_OFFSET = 3;
   const RETRY_MAX_ATTEMPTS = 24;
+  // 一张图最多留这么多根(实时 + 翻页取到的历史): 页面开几天也不会越积越多, 裁掉的还能再往左翻回来
+  const LOADED_BARS_MAX = 5000;
+  // CVD 历史重读一次最多取这么多根(后端 /api/history 的 limit 上限), 更多的分几次往前取
+  const HISTORY_REFRESH_LIMIT = 2000;
   const noop = () => {};
 
   // ---------- 足迹图自定义 series (lightweight-charts v5 custom series) ----------
-  // 数据项: {time, levels: [[price, buy, sell], ...按价格升序]}
-  // 每档一格分左右两半(左卖右买), 暖色热力底色按档量强度渐变;
-  // K线轮廓(影线+柱体框)垫在格子下; POC(最大量档)白框, 对角不平衡(>=3:1)色框
-
+  // 数据项: {time, barTime, levels: [[price, buy, sell, unknown], ...按价格升序], coverage, open/high/low/close}
+  // (库交给渲染器的 originalData 不带 time, 渲染器按 barTime 认 bar)
+  // levels 按服务端底档(series 选项 tickSize, 是最小价位 priceTick 的整数倍)给出, 档位标在本档最低价,
+  // 一档的格子占 [最低价 - 半个最小价位, 最低价 + 档宽 - 半个最小价位], 与真实成交价对齐。
+  // 画的时候先按当前行高把相邻档并成显示档(放大变细、缩小变粗, 见 FlowData.footprintMultiple),
+  // 再按格子宽度分三级细节, 每级都有两种显示模式(series 选项 footprintMode, 每张图左上角选):
+  //   数字: 买卖 = 每档一格分左右两半(左卖右买, 红/绿底色按量深浅), 数字贴着中线;
+  //         差值 = 每档一个数(买 - 卖), 整格按正负染绿/红, 深浅按差值大小;
+  //   量柱: 买卖 = 每档一根横向量柱(红卖段 + 绿买段 + 紫色未知段, 长度按档量);
+  //         差值 = 从格子中线往左(卖多)或往右(买多)长的柱, 长度按差值;
+  //   蜡烛: 再窄只画开高低收和 POC 横线。
+  // 每根左边一根细蜡烛(涨金跌橙); POC(最大量档)白框; 对角不平衡(>=3:1)在买卖模式下把触发的那半格/那一段
+  // 涂成实色, 差值模式下在格子外侧画实色竖条(卖在左、买在右)。
+  // 不平衡的优势侧最小量按显示档上的典型半格量自适应(期货与加密相同), 期货另有 10 手下限。
+  // 堆叠不平衡: 同一根里连续 3 档以上同向不平衡, 按服务端底档判断(不随缩放变), 买方是支撑、卖方是阻力,
+  // 从这根往右画一条色带, 直到后面某根 K 线碰到这段价位为止; 一直没碰到的画到图的右边缘。
   const FP = {
     imbRatio: 3,                              // 对角不平衡阈值: 买[j] vs 卖[j-1] 或 卖[j] vs 买[j+1]
-    imbMinVol: 10,                            // 优势侧最小量, 防小数字噪声
+    imbMinLots: 10,                           // 期货优势侧至少这么多手(自适应门槛更低时取它), 对侧最少按 1 手比较
+    stackLevels: 3,                           // 堆叠不平衡: 连续这么多档同向不平衡
     imbBuyColor: "#00e676", imbSellColor: "#f23645",
-    upColor: "#f0b90d", downColor: "#ef6c00", // K线轮廓: 涨金 跌橙
+    buy: (alpha) => `rgba(0, 230, 118, ${alpha})`, sell: (alpha) => `rgba(242, 54, 69, ${alpha})`,
+    upColor: "#f0b90d", downColor: "#ef6c00", // 左侧细蜡烛: 涨金 跌橙
     pocColor: "rgba(232, 234, 237, 0.9)",
-    // 判不出方向的那部分成交量: 中性紫, 与橙系热力底和绿/红不平衡框都能区分
+    textColor: "rgba(232, 234, 237, 0.92)", imbTextColor: "#131722",
+    axisColor: "rgba(149, 152, 161, 0.3)",    // 差值量柱的中线
+    // 判不出方向的那部分成交量: 中性紫, 与红绿都能区分
     unknownColor: (ratio) => `rgba(167, 139, 250, ${0.35 + 0.55 * ratio})`,
+    textRowPx: 12,                            // 写数字的最小行高; 行高不够就把相邻档并起来
+    barRowPx: 3,                              // 量柱模式的最小行高
+    textChars: 3,                             // 买卖模式半格、差值模式整格至少放得下这么多字符(差值另加正负号)才写数字
+    candleCellPx: 8,                          // 格子比这窄就只画蜡烛
+    spacing: 72,                              // 进足迹视图时的 bar 间距: 半格放得下 4 个字符
   };
+  const FOOTPRINT_MODES = ["bidask", "delta"];
+  const FOOTPRINT_MODE_LABELS = { bidask: "买卖", delta: "差值" };
+
+  // 格子里的量: 0 不写; 按半格放得下的字符数取最多的小数位, 小于 1 一律省掉前导 0(.06、.077, 同一列写法一致),
+  // 大数用 k/M/B, 小到写不出非零数字就写 "<.01" 这类上限。
+  function footprintVolumeText(v, maxChars) {
+    if (!(v > 0) || maxChars < 1) return "";
+    for (const [unit, suffix] of [[1, ""], [1e3, "k"], [1e6, "M"], [1e9, "B"]]) {
+      const room = maxChars - suffix.length;
+      for (let digits = Math.min(4, room - 1); digits >= 0; digits--) {
+        let text = (v / unit).toFixed(digits).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+        if (text.startsWith("0.")) text = text.slice(1);
+        if (text.length <= room && Number(text) > 0) return text + suffix;
+      }
+    }
+    const digits = maxChars - 2;
+    return digits >= 1 ? "<" + (10 ** -digits).toFixed(digits).slice(1) : "";
+  }
+
+  // 一根各档的对角不平衡("buy" / "sell" / null): 买[j] >= 3*卖[j-1] 或 卖[j] >= 3*买[j+1](levels 按价格升序,
+  // 相邻指相差一个 step), 优势侧还要不小于 minimum。加密量以币计，允许小于 1；期货对侧最少按 1 手比较。
+  function footprintImbalances(levels, step, minimum, lots) {
+    const diagonals = FlowData.diagonalVolumes(levels, step);
+    const oppositeFloor = lots ? 1 : 0;
+    return levels.map(([, buy, sell], j) => {
+      const diagonal = diagonals[j];
+      if (!diagonal) return null;
+      if (buy >= FP.imbRatio * Math.max(diagonal.sellBelow, oppositeFloor) && buy >= minimum) return "buy";
+      if (sell >= FP.imbRatio * Math.max(diagonal.buyAbove, oppositeFloor) && sell >= minimum) return "sell";
+      return null;
+    });
+  }
 
   // 两个自定义 series(足迹图、FlowWave带)共用的坐标契约: 库只给 visibleRange 内的 bar 算 x
   // (区间已经包含两侧只露出一半的那根); 区间外的 x 是 NaN, 或者是上次可见时留下的旧值 ——
   // 滚动/缩放之后、下一次 setData 之前不会重算。遍历全部 bar 就会拿旧坐标在画面两侧画出残影,
-  // 所以 draw 只走 visibleRange。
+  // 所以 draw 只走 visibleRange(门槛和堆叠不平衡要用全部历史, 只读 originalData, 不碰坐标;
+  // 起点或终点在区间外的色带直接画到窗格边缘)。
   class FootprintRenderer {
-    constructor() {
+    // onGrid({step, thresholds, minimum}): 显示档或门槛变了(画完之后异步通知), 页面据此刷新左上角说明
+    constructor(onGrid = noop) {
       this._data = null;
       this._options = null;
+      this._onGrid = onGrid;
+      this._rows = new WeakMap();   // levels 数组 -> Map("底档/倍数" -> 合并后的档); levels 发布后不再就地修改
+      this._mins = new Map();       // 合并倍数 -> 门槛缓存; 数据没变就不重算(显示档和堆叠用的底档各一份)
+      this._zones = null;           // 堆叠不平衡缓存
+      this._grid = null;
     }
     update(data, options) {
       this._data = data;
       this._options = options;
     }
-    _heat(ratio) {   // 暖色热力: 同一色系, 亮度 = 档量 / bar 最大档量
-      return `rgba(245, 166, 35, ${0.08 + 0.87 * ratio})`;
+    grid() { return this._grid; }
+    _rowsOf(levels, base, factor) {
+      if (factor === 1 || !levels.length) return levels;
+      let cached = this._rows.get(levels);
+      if (!cached) this._rows.set(levels, cached = new Map());
+      const key = `${base}/${factor}`;
+      if (!cached.has(key)) cached.set(key, FlowData.footprintRows(levels, base, factor));
+      return cached.get(key);
+    }
+    // 只有末根更新(新对象)或整份 setData(全是新对象)才会改数据, 认首尾两根的对象就够了
+    _sameData(cached, bars, base) {
+      return cached && cached.first === bars[0]?.originalData && cached.last === bars[bars.length - 1]?.originalData &&
+             cached.length === bars.length && cached.base === base;
+    }
+    _stamp(bars, base) {
+      return { first: bars[0]?.originalData, last: bars[bars.length - 1]?.originalData, length: bars.length, base };
+    }
+    // 不平衡的自适应最小量按显示档的半格量算(FlowData.footprintThresholds), 合档后跟着变。
+    _imbalanceMins(bars, base, factor) {
+      const cached = this._mins.get(factor);
+      if (this._sameData(cached, bars, base)) return cached.map;
+      const map = FlowData.footprintThresholds(bars.map(({ originalData: d }) =>
+        ({ time: d.barTime, coverage: d.coverage, levels: this._rowsOf(d.levels || [], base, factor) })));
+      this._mins.set(factor, { ...this._stamp(bars, base), map });
+      return map;
+    }
+    // 本根不平衡的优势侧最小量: 显示档上的自适应门槛, 期货(lots)不低于 10 手; 没有门槛(本根无量)就不标
+    static minimum(thresholds, time, lots) {
+      const value = thresholds?.get(time);
+      if (!(value > 0)) return Infinity;
+      return lots ? Math.max(value, FP.imbMinLots) : value;
+    }
+    // 堆叠不平衡(按底档判断): items 是全部数据项(按时间升序), 返回 [{from, to, side, low, high}],
+    // from 是出现的那根, to 是第一根碰到这段价位的 K 线(支撑看最低价、阻力看最高价), 一直没碰到为 null;
+    // low/high 是这段最低、最高那一档的价格(档位标在最低价, 实际成交到 high + 档宽 - 最小价位)。
+    static stackedZones(items, base, tick, lots, thresholds) {
+      const zones = [];
+      items.forEach((d, i) => {
+        const levels = d.levels || [];
+        if (d.coverage !== "complete" || levels.length < FP.stackLevels) return;
+        const flags = footprintImbalances(levels, base, FootprintRenderer.minimum(thresholds, d.barTime, lots), lots);
+        let start = 0;
+        for (let j = 1; j <= levels.length; j++) {
+          const next = j < levels.length && flags[j] && flags[j] === flags[start] &&
+                       Math.round((levels[j][0] - levels[j - 1][0]) / base) === 1;
+          if (next) continue;
+          if (flags[start] && j - start >= FP.stackLevels) {
+            zones.push({ from: i, to: null, side: flags[start], low: levels[start][0], high: levels[j - 1][0] });
+          }
+          start = j;
+        }
+      });
+      for (const zone of zones) {
+        const top = zone.high + base - tick;
+        for (let k = zone.from + 1; k < items.length; k++) {
+          const { low, high } = items[k];
+          if (zone.side === "buy" ? low != null && low <= top : high != null && high >= zone.low) {
+            zone.to = k;
+            break;
+          }
+        }
+      }
+      return zones;
+    }
+    _stacks(bars, base, tick, lots) {
+      if (this._sameData(this._zones, bars, base) && this._zones.tick === tick && this._zones.lots === lots) {
+        return this._zones.zones;
+      }
+      const zones = FootprintRenderer.stackedZones(bars.map((bar) => bar.originalData), base, tick, lots,
+                                                   this._imbalanceMins(bars, base, 1));
+      this._zones = { ...this._stamp(bars, base), tick, lots, zones };
+      return zones;
+    }
+    _report(step, thresholds, lots) {
+      if (this._grid && this._grid.step === step && this._grid.thresholds === thresholds) return;
+      this._grid = { step, thresholds, minimum: (time) => FootprintRenderer.minimum(thresholds, time, lots) };
+      const grid = this._grid;
+      Promise.resolve().then(() => { if (this._grid === grid) this._onGrid(grid); });
     }
     draw(target, priceConverter) {
       const range = this._data?.visibleRange;
       if (!range) return;
       const { bars, barSpacing } = this._data;
-      const tickSize = this._options?.tickSize;
-      target.useMediaCoordinateSpace(({ context: ctx }) => {
-        const cellW = Math.max(barSpacing * 0.85, 6);
-        const halfW = cellW / 2;
-        const showText = cellW >= 42;
-        ctx.font = "9px Consolas, monospace";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        for (let i = range.from; i < range.to; i++) {   // 只画可见区间, 见上方说明
+      const base = this._options?.tickSize > 0 ? this._options.tickSize : null;
+      const tick = this._options?.priceTick > 0 ? this._options.priceTick : base;
+      const lots = this._options?.lots === true;   // 期货: 量是整数手
+      const delta = this._options?.footprintMode === "delta";
+      target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
+        const colW = Math.max(barSpacing * 0.88, 1);
+        const stripeW = colW >= 20 ? Math.min(Math.max(Math.round(colW * 0.08), 3), 6) : colW >= 12 ? 2 : 0;
+        const cellW = colW - (stripeW ? stripeW + 2 : 0);
+        const charWidth = (px) => {
+          ctx.font = `${px}px Consolas, monospace`;
+          const width = ctx.measureText?.("0")?.width;
+          return width > 0 ? width : px * 0.6;
+        };
+        // 一个数能用的字符数: 买卖模式是半格(贴中线留 3px), 差值模式是整格去掉正负号
+        const charsAt = (px) => Math.floor((delta ? cellW - 6 : cellW / 2 - 4) / charWidth(px)) - (delta ? 1 : 0);
+        const mode = cellW < FP.candleCellPx ? "candle" : charsAt(9) >= FP.textChars ? "text" : "bars";
+
+        // 显示档: 当前每个最小价位占多少像素 -> 行高够用的最小倍数(不影响价格轴自动缩放, 所以不会来回跳)
+        let factor = 1;
+        if (base && tick) {
+          let ref = null;
+          for (let i = range.from; i < range.to && ref == null; i++) ref = bars[i].originalData.levels?.[0]?.[0] ?? null;
+          const y1 = ref == null ? null : priceConverter(ref), y2 = ref == null ? null : priceConverter(ref + tick * 100);
+          const perTick = y1 != null && y2 != null ? Math.abs(y2 - y1) / 100 : 0;
+          if (perTick > 0) {
+            const baseTicks = Math.max(1, Math.round(base / tick));
+            const needed = (mode === "text" ? FP.textRowPx : FP.barRowPx) / perTick;
+            factor = Math.max(1, Math.round(FlowData.footprintMultiple(baseTicks, needed) / baseTicks));
+          }
+        }
+        const step = base ? Number((base * factor).toPrecision(12)) : null;
+        const mins = base ? this._imbalanceMins(bars, base, factor) : null;
+
+        // 堆叠不平衡的色带垫在格子下面; 起点或终点不在可见区间的直接画到窗格边缘(见上方坐标契约)
+        if (base && tick) {
+          const right = mediaSize?.width ?? 1e5;
+          for (const zone of this._stacks(bars, base, tick, lots)) {
+            const end = zone.to ?? Infinity;
+            if (end < range.from || zone.from >= range.to) continue;
+            const x1 = zone.from >= range.from ? bars[zone.from].x + colW / 2 : -1;
+            const x2 = end < range.to ? bars[end].x : right;
+            const a = priceConverter(zone.low - tick / 2), b = priceConverter(zone.high + base - tick / 2);
+            if (a == null || b == null || !(x2 > x1)) continue;
+            const top = Math.min(a, b), h = Math.max(Math.abs(a - b), 1);
+            const color = zone.side === "buy" ? FP.buy : FP.sell;
+            ctx.fillStyle = color(0.13);
+            ctx.fillRect(x1, top, x2 - x1, h);
+            ctx.fillStyle = color(0.7);
+            ctx.fillRect(x1, top, x2 - x1, 1);
+            ctx.fillRect(x1, top + h - 1, x2 - x1, 1);
+          }
+        }
+
+        // 先算可见各根的显示档与亮度参考: 可见各根最大半格量的中位数, 量小的根整体淡一些
+        const visible = [];
+        for (let i = range.from; i < range.to; i++) {
           const d = bars[i].originalData;
-          const levels = d.levels;
-          if (!levels || !levels.length) continue;
-          const x = bars[i].x - cellW / 2;
-          const ys = levels.map((lv) => priceConverter(lv[0]));
-          const diagonals = FlowData.diagonalVolumes(levels, tickSize);
-          // 稀疏成交档位之间可能隔了多个 tick，行高只按真实最小变动价位计算。
-          let rowH = 6;
-          if (tickSize > 0 && ys[0] != null) {
-            const y2 = priceConverter(levels[0][0] + tickSize);
-            if (y2 != null && y2 !== ys[0]) rowH = Math.abs(y2 - ys[0]);
+          const levels = base ? this._rowsOf(d.levels || [], base, factor) : d.levels || [];
+          let maxHalf = 0, maxVol = 0, maxDelta = 0, poc = -1;
+          for (let j = 0; j < levels.length; j++) {
+            const [, buy, sell, unknown = 0] = levels[j];
+            maxHalf = Math.max(maxHalf, buy, sell);
+            maxDelta = Math.max(maxDelta, Math.abs(buy - sell));
+            if (buy + sell + unknown > maxVol) { maxVol = buy + sell + unknown; poc = j; }
           }
-          // K线轮廓: 影线(最高-最低) + 柱体框(开-收), 垫在格子下
-          if (d.high != null && d.low != null) {
-            const yH = priceConverter(d.high), yL = priceConverter(d.low);
-            if (yH != null && yL != null) {
-              const frameColor = d.close >= d.open ? FP.upColor : FP.downColor;
-              ctx.strokeStyle = frameColor;
+          if (maxVol > 0) visible.push({ i, d, levels, maxHalf, maxVol, maxDelta, poc });
+        }
+        const halves = visible.map((v) => v.maxHalf).sort((a, b) => a - b);
+        const reference = halves.length ? halves[halves.length >> 1] : 0;
+
+        const rowOf = (price) => {   // 一档的上下边(像素), 没有档宽时退回以价格为中心 6px
+          if (!step) {
+            const y = priceConverter(price);
+            return y == null ? null : { top: y - 3, h: 6 };
+          }
+          const a = priceConverter(price - tick / 2), b = priceConverter(price + step - tick / 2);
+          return a == null || b == null ? null : { top: Math.min(a, b), h: Math.abs(a - b) };
+        };
+        const sampleRow = visible.length ? rowOf(visible[0].levels[0][0]) : null;
+        const rowH = sampleRow ? sampleRow.h : 0;
+        const gap = rowH >= 5 ? 1 : 0;
+        const fontPx = rowH >= 15 ? 10 : 9;
+        const maxChars = charsAt(fontPx);
+        const showText = mode === "text" && rowH >= FP.textRowPx - 1 && maxChars >= FP.textChars;
+        ctx.textBaseline = "middle";
+
+        for (const { i, d, levels, maxHalf, maxVol, maxDelta, poc } of visible) {
+          const x0 = bars[i].x - colW / 2;
+          const cellX = x0 + (stripeW ? stripeW + 2 : 0);
+          this._candle(ctx, d, priceConverter, x0, mode === "candle" ? colW : stripeW);
+          if (mode === "candle") {
+            const row = rowOf(levels[poc][0]);
+            if (row) {
+              ctx.fillStyle = FP.pocColor;
+              ctx.fillRect(x0, row.top + row.h / 2 - 1, colW, 2);
+            }
+            continue;
+          }
+          const weight = reference > 0 ? 0.45 + 0.55 * Math.min(1, maxHalf / reference) : 1;
+          const imbalances = d.coverage === "complete"
+            ? footprintImbalances(levels, step, FootprintRenderer.minimum(mins, d.barTime, lots), lots)
+            : levels.map(() => null);
+          const half = cellW / 2;
+          const tint = (v, max) => weight * (0.08 + 0.42 * (max > 0 ? v / max : 0));   // 底色深浅
+          if (delta && mode === "bars") {      // 差值量柱的中线, 从最高档画到最低档
+            const highest = rowOf(levels[levels.length - 1][0]), lowest = rowOf(levels[0][0]);
+            if (highest && lowest) {
+              ctx.fillStyle = FP.axisColor;
+              ctx.fillRect(cellX + half, highest.top, 1, lowest.top + lowest.h - highest.top);
+            }
+          }
+          // 判不出方向的量压在格子底部整条: 不参与左卖右买和差值, 但必须可见(数字模式, 先画后写字)
+          const unknownBand = (top, h, unknown) => {
+            if (!(unknown > 0)) return;
+            const band = Math.max(h * 0.25, 2);
+            ctx.fillStyle = FP.unknownColor(unknown / maxVol);
+            ctx.fillRect(cellX, top + h - band, cellW, band);
+          };
+          for (let j = 0; j < levels.length; j++) {
+            const row = rowOf(levels[j][0]);
+            if (!row) continue;
+            const [, buy, sell, unknown = 0] = levels[j];
+            const top = row.top, h = Math.max(row.h - gap, 1);
+            const imbalance = imbalances[j];
+            if (delta) {
+              const net = buy - sell;
+              const color = net >= 0 ? FP.buy : FP.sell;
+              if (mode === "text") {
+                ctx.fillStyle = color(tint(Math.abs(net), maxDelta));
+                ctx.fillRect(cellX, top, cellW, h);
+              } else {
+                const length = maxDelta > 0 ? Math.abs(net) / maxDelta * half : 0;
+                ctx.fillStyle = color(0.55 * weight);
+                ctx.fillRect(net >= 0 ? cellX + half : cellX + half - length, top, length, h);
+              }
+              if (imbalance) {                 // 不平衡: 格子外侧实色竖条, 卖在左、买在右
+                const edge = Math.min(3, Math.max(cellW / 8, 1));
+                ctx.fillStyle = imbalance === "buy" ? FP.imbBuyColor : FP.imbSellColor;
+                ctx.fillRect(imbalance === "buy" ? cellX + cellW - edge : cellX, top, edge, h);
+              }
+              if (mode === "text") unknownBand(top, h, unknown);
+              if (mode === "text" && showText && (buy > 0 || sell > 0)) {
+                const text = net === 0 ? "0" : (net > 0 ? "+" : "-") + footprintVolumeText(Math.abs(net), maxChars);
+                ctx.font = `${fontPx}px Consolas, monospace`;
+                ctx.textAlign = "center";
+                ctx.fillStyle = FP.textColor;
+                ctx.fillText(text, cellX + half, top + h / 2);
+              }
+            } else if (mode === "text") {
+              ctx.fillStyle = imbalance === "sell" ? FP.imbSellColor : FP.sell(tint(sell, maxHalf));
+              ctx.fillRect(cellX, top, half, h);
+              ctx.fillStyle = imbalance === "buy" ? FP.imbBuyColor : FP.buy(tint(buy, maxHalf));
+              ctx.fillRect(cellX + half, top, cellW - half, h);
+              unknownBand(top, h, unknown);
+              if (showText) {
+                ctx.font = `${imbalance ? "bold " : ""}${fontPx}px Consolas, monospace`;
+                ctx.textAlign = "right";
+                ctx.fillStyle = imbalance === "sell" ? FP.imbTextColor : FP.textColor;
+                ctx.fillText(footprintVolumeText(sell, maxChars), cellX + half - 3, top + h / 2);
+                ctx.textAlign = "left";
+                ctx.fillStyle = imbalance === "buy" ? FP.imbTextColor : FP.textColor;
+                ctx.fillText(footprintVolumeText(buy, maxChars), cellX + half + 3, top + h / 2);
+              }
+            } else {
+              // 量柱: 从格子左边起, 卖段 + 买段 + 未知段, 总长按本根最大档量
+              const scale = cellW / maxVol;
+              ctx.fillStyle = imbalance === "sell" ? FP.imbSellColor : FP.sell(0.55 * weight);
+              ctx.fillRect(cellX, top, sell * scale, h);
+              ctx.fillStyle = imbalance === "buy" ? FP.imbBuyColor : FP.buy(0.55 * weight);
+              ctx.fillRect(cellX + sell * scale, top, buy * scale, h);
+              if (unknown > 0) {
+                ctx.fillStyle = FP.unknownColor(0.5);
+                ctx.fillRect(cellX + (sell + buy) * scale, top, unknown * scale, h);
+              }
+            }
+            if (j === poc) {                   // POC 那一档整格描白框(买卖量柱模式下它就是最长的那根)
+              ctx.strokeStyle = FP.pocColor;
               ctx.lineWidth = 1;
-              ctx.beginPath();
-              ctx.moveTo(bars[i].x, yH);
-              ctx.lineTo(bars[i].x, yL);
-              ctx.stroke();
-              const yO = priceConverter(d.open), yC = priceConverter(d.close);
-              if (yO != null && yC != null) {
-                ctx.lineWidth = 1.5;
-                ctx.strokeRect(x, Math.min(yO, yC), cellW, Math.max(Math.abs(yC - yO), 1));
-              }
-            }
-          }
-          let maxVol = 0, pocIdx = -1;
-          for (let j = 0; j < levels.length; j++) {
-            const v = levels[j][1] + levels[j][2] + (levels[j][3] || 0);   // 未知量也占档位总量
-            if (v > maxVol) { maxVol = v; pocIdx = j; }
-          }
-          if (maxVol <= 0) continue;
-          for (let j = 0; j < levels.length; j++) {
-            const y = ys[j];
-            if (y == null) continue;
-            const buy = levels[j][1], sell = levels[j][2], unknown = levels[j][3] || 0;
-            const top = y - rowH / 2;
-            const h = Math.max(rowH - 1, 1);
-            ctx.fillStyle = this._heat(sell / maxVol);
-            ctx.fillRect(x, top, halfW, h);
-            ctx.fillStyle = this._heat(buy / maxVol);
-            ctx.fillRect(x + halfW, top, cellW - halfW, h);
-            if (unknown > 0) {
-              // 判不出方向的量压在格子底部整条: 不参与左卖右买, 但必须可见
-              const band = Math.max(h * 0.3, 2);
-              ctx.fillStyle = FP.unknownColor(unknown / maxVol);
-              ctx.fillRect(x, top + h - band, cellW, band);
-            }
-            if (showText && rowH >= 9) {
-              ctx.fillStyle = "rgba(19, 23, 34, 0.6)";      // 左右半格分隔线
-              ctx.fillRect(x + halfW, top, 1, h);
-              ctx.fillStyle = "rgba(232, 234, 237, 0.92)";
-              ctx.fillText(String(sell), x + halfW / 2, y);
-              ctx.fillText(String(buy), x + halfW * 1.5, y);
-              // 对角不平衡: 买[j] >= 3*卖[j-1] 或 卖[j] >= 3*买[j+1] (levels 按价格升序)
-              const diagonal = diagonals[j];
-              let imbColor = null;
-              if (diagonal && d.coverage === "complete") {
-                if (buy >= FP.imbRatio * Math.max(diagonal.sellBelow, 1) && buy >= FP.imbMinVol) imbColor = FP.imbBuyColor;
-                else if (sell >= FP.imbRatio * Math.max(diagonal.buyAbove, 1) && sell >= FP.imbMinVol) imbColor = FP.imbSellColor;
-              }
-              if (imbColor) {
-                ctx.strokeStyle = imbColor;
-                ctx.lineWidth = 1.5;
-                ctx.strokeRect(x + 0.5, top + 0.5, cellW - 1, h - 1);
-              }
-              if (j === pocIdx) {                            // POC 白框画内侧, 与不平衡框共存时两层都可见
-                ctx.strokeStyle = FP.pocColor;
-                ctx.lineWidth = 1.5;
-                ctx.strokeRect(x + 2.5, top + 2.5, Math.max(cellW - 5, 1), Math.max(h - 5, 1));
-              }
+              if (h >= 3) ctx.strokeRect(cellX + 0.5, top + 0.5, Math.max(cellW - 1, 1), h - 1);
+              else { ctx.fillStyle = FP.pocColor; ctx.fillRect(cellX, top, cellW, h); }
             }
           }
         }
+        if (base) this._report(step, mins, lots);
       });
+    }
+    // 细蜡烛: 影线(最高-最低) + 实体(开-收)填色; 没有对应 K 线(还没加载到)就不画
+    _candle(ctx, d, priceConverter, x, width) {
+      if (!(width > 0) || d.high == null || d.low == null) return;
+      const yH = priceConverter(d.high), yL = priceConverter(d.low);
+      const yO = priceConverter(d.open), yC = priceConverter(d.close);
+      if (yH == null || yL == null || yO == null || yC == null) return;
+      const color = d.close >= d.open ? FP.upColor : FP.downColor;
+      const center = Math.round(x + width / 2) + 0.5;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(center, yH);
+      ctx.lineTo(center, yL);
+      ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.fillRect(x, Math.min(yO, yC), width, Math.max(Math.abs(yC - yO), 1));
     }
   }
 
   class FootprintSeries {
-    constructor() {
-      this._renderer = new FootprintRenderer();
+    constructor(onGrid) {
+      this._renderer = new FootprintRenderer(onGrid);
     }
     defaultOptions() { return { priceLineVisible: false, lastValueVisible: false }; }
     renderer() { return this._renderer; }
@@ -688,6 +944,8 @@
    *             largeMinRadius 是大额圆圈最小显示半径, 0 = 全部, 由那一行的下拉框选择)
    *   profiles  本图已画的成交量分布 [{from, to, rows, extend, visible}](页面记下来的, 不合法的条目丢掉)
    *   obOptions 本图 OB Zones 参数, 由 onObOptionsChange 通知页面保存
+   *   view      本图视图: candle=K线(默认), footprint=足迹图
+   *   footprintMode 本图足迹的显示模式: bidask=买卖(默认), delta=差值; 只在足迹视图下显示选择框
    * 回调(都可省略):
    *   onStatus(ok, text)        连接状态变了
    *   onSuiteSetting(key, value) 用户在本图 FlowMeter 窗格选了模式(key = "mode")或阈值(key = "threshtype");
@@ -700,6 +958,8 @@
    *                             time 为 null, 光标不在主图窗格时 price 为 null
    *   onRangeChange()           本图的可视范围变了(用户缩放拖动, 也包括新 bar 自动右移、加载后滚到最新)
    *   onTfChange()              用户在左上角切换了本图周期(新周期用 tf 取, 本图已开始按新周期加载)
+   *   onViewChange(view)        本图视图切换完成, 由页面按左右图保存
+   *   onFootprintModeChange(mode) 用户切了本图足迹的显示模式, 由页面按左右图保存
    *   onProfilesChange()        用户画了、删了或改了本图的成交量分布(新列表用 profiles() 取)
    *   onPaperStops(change)      图上拖/双击了止盈止损线({tp: 价格} / {sl: null} 是取消)
    *   onPaperAmend(id, price)   图上拖了挂单线改价
@@ -710,9 +970,16 @@
   function create({ host, tf, symbol, settings, shown: initialShown, onStatus = noop, onSuiteSetting = noop,
                     onConfig = noop, onShownChange = noop, onBandK = noop, onCrosshair = noop,
                     onRangeChange = noop, onTfChange = noop, onPaperStops = noop, onPaperAmend = noop,
-                    onPaperCancel = noop, paperMenu = () => [],
+                    onPaperCancel = noop, paperMenu = () => [], view: initialView = "candle", onViewChange = noop,
+                    footprintMode: initialFootprintMode = "bidask", onFootprintModeChange = noop,
                     profiles: initialProfiles = [], onProfilesChange = noop,
                     obOptions: initialObOptions = {}, onObOptionsChange = noop }) {
+    let view = VIEW_CHOICES.includes(initialView) ? initialView : "candle";
+    let footprintMode = FOOTPRINT_MODES.includes(initialFootprintMode) ? initialFootprintMode : "bidask";
+    if (view === "footprint" && tf < FOOTPRINT_MIN_TF) tf = FOOTPRINT_MIN_TF;
+    const isCrypto = CRYPTO_SYMBOL.test(symbol);
+    const cryptoUnit = isCrypto
+      ? symbol.replace(/^(BINANCE|OKX|AGG)\./, "").replace(/USDT\.P$|-USDT-SWAP$/, "") : "";
     let bars = [];        // 原始 bar: {time, open, high, low, close, volume, buy, sell, delta, cvd}
     let dataContract = symbol; // 自选主力的稳定代码与实际采集月份可以不同。
     let cfg = null;       // 后端配置: mult/rellen/smalen/zlen/colors
@@ -722,6 +989,7 @@
     // bars 实际是按哪个粒度拆的(服务端快照里的 ltf); 没有数据为 null。切了口径、新历史还没到时与 ltf 不同
     let barsLtf = null;
     let fpBars = [];      // 足迹 bar: {time, levels: [[price, buy, sell], ...按价格升序]}
+    let fpTickSize = null;    // 服务端底档; 实际显示档由渲染器按行高合并(fpView.renderer().grid())
     let fpBarSpacing = null;   // 进足迹模式前的 barSpacing, 退出时恢复
     let barRevision = -1, fpRevision = -1;
     let watchdog = null;
@@ -736,6 +1004,7 @@
     let olderHasMore = true, olderError = "", restoringRange = false;
     let historyRevision = 0, historyDirty = false;
     let historyRefresh = null, historyRefreshTimer = null;
+    let historyRefreshFailures = 0, historyRefreshRetryAt = 0;   // 重读失败后退避自动重试, 不挡翻页
     let historyBackfill = null;
     const shown = { ema: true, emaAll: false, emaLong: true, htfEma: true, htfEmaAll: false, htf: 0, band: false,
                     bandMid: false, ob: false, large: true, largeMinRadius: 8,
@@ -759,10 +1028,36 @@
       badge.appendChild(option);
     }
     badge.value = String(tf);
-    badge.title = "主图周期：K 线、成交量、CVD 都按该周期计算，1 分钟及以上由 30s 合成（足迹图只有 10s、30s）。" +
+    badge.title = "主图周期：K 线、成交量、CVD、足迹都按该周期计算；足迹最小 30s，大周期由 30s 汇总。" +
                   "指标长度按根数固定（与 TradingView 切周期行为一致），周期越大，同样根数覆盖的时长越长。";
     badge.addEventListener("change", () => setTf(Number(badge.value)));
-    // 周期下拉框右边是测量按钮(说明见文件上部「测量工具」)
+    const viewSelect = document.createElement("select");
+    viewSelect.className = "view-select";
+    viewSelect.title = "本图视图：独立切换 K 线或足迹图；足迹最小 30s。";
+    viewSelect.setAttribute("aria-label", "本图视图");
+    for (const value of VIEW_CHOICES) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value === "footprint" ? "足迹图" : "K线";
+      viewSelect.appendChild(option);
+    }
+    viewSelect.value = view;
+    viewSelect.addEventListener("change", () => setView(viewSelect.value));
+    // 足迹视图下, 视图框右边多一个显示模式框(买卖 / 差值)
+    const fpModeSelect = document.createElement("select");
+    fpModeSelect.className = "fp-mode-select";
+    fpModeSelect.title = "足迹显示模式：买卖 = 每档左卖右买两个数；差值 = 每档一个数（买 − 卖），绿色买多、红色卖多。";
+    fpModeSelect.setAttribute("aria-label", "足迹显示模式");
+    for (const value of FOOTPRINT_MODES) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = FOOTPRINT_MODE_LABELS[value];
+      fpModeSelect.appendChild(option);
+    }
+    fpModeSelect.value = footprintMode;
+    fpModeSelect.hidden = view !== "footprint";
+    fpModeSelect.addEventListener("change", () => setFootprintMode(fpModeSelect.value));
+    // 视图下拉框右边是测量按钮(说明见文件上部「测量工具」)
     const measureBtn = document.createElement("button");
     measureBtn.type = "button";
     measureBtn.className = "measure-btn";
@@ -779,7 +1074,7 @@
                        "（POC、70% 价值区），可以画多个，在图例里调行数、隐藏或删除。" +
                        `终点点在最新一根上会自动延伸；每张图最多 ${VP_MAX} 个，再画替换最早的。`;
     profileBtn.addEventListener("click", () => toggleProfileTool());
-    profileBtn.disabled = settings.view === "footprint";   // 足迹图下不画, 见 setView
+    profileBtn.disabled = view === "footprint";   // 足迹图下不画, 见 setView
     // 测量、画成交量分布的过程中, 旁边提示下一步(两个工具共用)
     const measureHint = document.createElement("span");
     measureHint.className = "measure-hint";
@@ -789,9 +1084,23 @@
     priceReadout.className = "readout";
     const cornerRow = document.createElement("div");
     cornerRow.className = "chart-corner-row";
-    cornerRow.append(badge, measureBtn, profileBtn, measureHint, priceReadout);
+    cornerRow.append(badge, viewSelect, fpModeSelect, measureBtn, profileBtn, measureHint, priceReadout);
     corner.appendChild(cornerRow);
+    const footprintInfo = document.createElement("div");
+    footprintInfo.className = "footprint-info";
+    footprintInfo.hidden = true;
+    footprintInfo.title = "足迹按真实成交价格汇总，仅显示已采集的逐笔成交（历史 K 线和总买卖量不能还原分价成交）。\n" +
+      "价格档是最小价位的整数倍，随缩放自动合并：放大变细、缩小变粗。\n" +
+      "格子够宽时写数字：买卖模式左卖右买、底色越深量越大；差值模式每档一个数（买 − 卖），绿色买多、红色卖多。\n" +
+      "写不下数字时画横向量柱：买卖模式是红卖绿买紫未知；差值模式从中线往右（买多）或往左（卖多）长。再窄只画蜡烛。\n" +
+      "左侧细蜡烛是本根开高低收；白框是 POC（本根成交最多的价位）；对角不平衡（≥ 3 倍）在买卖模式下把触发的那半格涂成实色，" +
+      "差值模式下在格子外侧画实色竖条（卖在左、买在右）。\n" +
+      "绿 / 红色带是堆叠不平衡（同一根连续 3 档以上同向不平衡，按服务端底档判断，不随缩放变）：买方是支撑、卖方是阻力，" +
+      "往右延伸到后面有 K 线碰到这段价位为止，一直没碰到的画到右边缘。" +
+      "\n不平衡的优势侧最小量随近期完整足迹自适应（按当前价格档的典型半格量算）" + (isCrypto ? "" : "，期货不低于 10 手") +
+      "；默认显示最新一根的门槛，十字光标悬停时显示对应 K 线的门槛。";
     el.appendChild(corner);
+    el.appendChild(footprintInfo);
     const historyHint = document.createElement("button");
     historyHint.type = "button";
     historyHint.className = "history-hint";
@@ -799,8 +1108,7 @@
     historyHint.setAttribute("aria-live", "polite");
     historyHint.addEventListener("click", () => {
       olderError = "";
-      if (historyDirty) queueHistoryRefresh();
-      else loadOlderHistory();
+      loadOlderHistory();
     });
     el.appendChild(historyHint);
     host.appendChild(el);
@@ -1065,7 +1373,11 @@
     const largePrimitive = new FlowLargeTrades.Primitive(largeGeometry, largeMargins);   // 挂在成交标记插件之后, 见下
 
     // 足迹图 series (pane 0, 默认隐藏; 视图切到足迹图时显示, tickSize 由 /api/footprint 下发)
-    const fpSeries = chart.addCustomSeries(new FootprintSeries(), { visible: false, tickSize: 1 }, 0);
+    // 渲染器换了显示档或加密门槛(画完后异步通知)就刷新左上角说明
+    const fpView = new FootprintSeries(() => refreshReadout());
+    const fpSeries = chart.addCustomSeries(fpView, {
+      visible: false, tickSize: 1, priceTick: 1, lots: !isCrypto, footprintMode,
+    }, 0);
 
     // suite pane: 直方图(主值) + 直方图(卖量, 负值) + 蜡烛(CRVOL/CVD 模式)
     const histA = chart.addSeries(LightweightCharts.HistogramSeries, { priceFormat: { type: "volume" } }, 1);
@@ -1339,7 +1651,7 @@
     // 只读量、半径和窗格高度, 不读坐标, 避免自动缩放递归。与成交标记插件要的边距逐侧取大(见 paperMarkerPrimitive);
     // 没有圆点时返回 null, 库沿用插件的。
     function largeMargins(from, to) {
-      if (!shown.large || settings.view === "footprint" || !FlowLargeTrades.cryptoConfigs(cfg?.largeTrades)) return null;
+      if (!shown.large || view === "footprint" || !FlowLargeTrades.cryptoConfigs(cfg?.largeTrades)) return null;
       const lo = Math.max(0, Math.floor(from)), hi = Math.min(bars.length - 1, Math.ceil(to));
       if (lo > hi) return null;
       const [bottom, top] = mainPaneRange(lo, hi);
@@ -1357,7 +1669,7 @@
 
     // 原大单与空心层每根、每侧各一个点; 实心位置不变, 同侧空心放在外侧。
     function largeGeometry() {
-      if (!shown.large || settings.view === "footprint") return [];
+      if (!shown.large || view === "footprint") return [];
       const ts = chart.timeScale();
       const range = ts.getVisibleLogicalRange();
       if (!range) return [];
@@ -1399,7 +1711,7 @@
     }
     let largeTooltipSize = null;   // 文字没变就沿用上次量的尺寸, 不必每次强制排版
     function showLargeTooltip(param) {
-      const mark = param && shown.large && settings.view !== "footprint" && param.paneIndex === 0
+      const mark = param && shown.large && view !== "footprint" && param.paneIndex === 0
         ? largePrimitive.hit(param.point) : null;
       largeTooltip.hidden = !mark;
       if (!mark) return;
@@ -1425,7 +1737,7 @@
 
     // 隐藏时也维护计算状态，避免再次开启时丢失已裁剪历史的防重叠影响。
     function obVisible() {
-      return shown.ob && settings.view !== "footprint";
+      return shown.ob && view !== "footprint";
     }
     function refreshOb() {
       if (derived) derived.ob = obVisible() ? obTracker.update(bars, obOptions, barsLtf) : null;
@@ -1487,7 +1799,7 @@
 
     // 叠加只在 K 线视图生效: 足迹图本身已经很密, 再叠带会糊成一片; 切回 K 线按开关恢复。
     function bandShown() {
-      return shown.band && settings.view !== "footprint";
+      return shown.band && view !== "footprint";
     }
 
     function applyBandVisibility() {   // 中线开关随带一起交给 series(带隐藏时中线自然也不画)
@@ -1517,7 +1829,7 @@
     }
 
     function emaShown() {
-      return shown.ema && settings.view !== "footprint";
+      return shown.ema && view !== "footprint";
     }
 
     function emaLineShown(j) {   // 长周期的两条还要看 emaLong
@@ -1608,7 +1920,7 @@
     }
 
     function htfEmaShown() {
-      return shown.htfEma && settings.view !== "footprint" && htfOf() > 0;
+      return shown.htfEma && view !== "footprint" && htfOf() > 0;
     }
 
     function applyHtfEmaVisibility() {
@@ -1638,10 +1950,28 @@
     // 显示十字光标所在那根(另一张图联动摆过来的光标也算), 光标不在图上时跟着最新一根。
 
     let hoverTime = null;   // 十字光标所在的时间; 不在本图上为 null
-    const isCrypto = CRYPTO_SYMBOL.test(symbol);
-
     function refreshReadout() {
-      updateReadout(hoverTime == null ? bars.length - 1 : Math.max(indexAtOrBefore(bars, hoverTime), 0));
+      const readIndex = hoverTime == null ? bars.length - 1 : Math.max(indexAtOrBefore(bars, hoverTime), 0);
+      footprintInfo.hidden = view !== "footprint";
+      // 一行小标签: 显示档(渲染器还没画过就先用服务端底档)与不平衡条件; 详细说明在 title 里
+      const grid = fpView.renderer().grid();
+      const step = grid?.step ?? fpTickSize;
+      let info = "等待逐笔成交，足迹将从采集到的数据开始显示";
+      if (fpBars.some((bar) => bar.levels?.length)) {
+        info = `${footprintMode === "delta" ? "差值 = 买 − 卖" : "左卖 右买"}` +
+               `${step > 0 ? ` · 价格档 ${Number(step.toPrecision(10))}` : ""} · 不平衡 ≥ ${FP.imbRatio}×`;
+        const time = hoverTime == null ? fpBars.at(-1)?.time : bars[readIndex]?.time;
+        const minimum = grid?.minimum(time);
+        if (Number.isFinite(minimum)) {
+          // 期货手数是整数, 门槛向上取整就是实际要求的手数
+          const amount = isCrypto
+            ? minimum.toLocaleString("en-US", { useGrouping: false, maximumSignificantDigits: 4 })
+            : String(Math.ceil(minimum));
+          info += ` 且 ≥ ${amount} ${isCrypto ? cryptoUnit : "手"}${hoverTime == null ? "" : "（光标处）"}`;
+        }
+      }
+      footprintInfo.textContent = info;
+      updateReadout(readIndex);
     }
 
     // 一项读数: 名称(暗色) + 数值, className 给整项上色
@@ -1668,7 +1998,7 @@
         return;
       }
       const mode = settings.mode;
-      const isFp = settings.view === "footprint";
+      const isFp = view === "footprint";
       const b = bars[i];
       const d = derived;
       // 价格与成交量的显示位数由服务端按合约下发: 期货都是整数手, 币安 BTC 的量是小数(0.001 步长)
@@ -1963,7 +2293,7 @@
 
     // 画哪些: 显示着的、算出了结果的, 加上正在画的那个; 坐标现算, 跟着滚动缩放走。足迹图下不画
     function shownProfiles() {
-      if (settings.view === "footprint") return [];
+      if (view === "footprint") return [];
       const items = profiles.filter((p) => p.visible && p.result);
       if (profileDraft && profileDraft.result) items.push(profileDraft);
       return items;
@@ -2073,7 +2403,7 @@
     // ---------- 主图指标图例 ----------
 
     function renderLegend() {
-      legendEl.hidden = settings.view === "footprint";   // 足迹图下主图指标都强制隐藏, 图例也收起
+      legendEl.hidden = view === "footprint";   // 足迹图下主图指标都强制隐藏, 图例也收起
       legendRows.large.select.value = String(shown.largeMinRadius);
       legendRows.large.select.disabled = !shown.large;
       legendRows.ob.params.textContent = `${obOptions.zLen} / ${obOptions.maxAge}`;
@@ -2194,7 +2524,7 @@
     }
 
     function canPaperOrder() {
-      return paperState?.contract && paperState.quote && settings.view !== "footprint"
+      return paperState?.contract && paperState.quote && view !== "footprint"
         && !measuring() && profilePhase === "off" && !paperDrag && !paperSaving;
     }
 
@@ -2232,7 +2562,7 @@
 
     // 鼠标所在的主图窗格(不含价格轴), 回 {rect, y}; 测量中、画成交量分布中、足迹图、左上角控件和挂单菜单上都不算
     function paperPane(event) {
-      if (!paperState || settings.view === "footprint" || measuring() || profilePhase !== "off") return null;
+      if (!paperState || view === "footprint" || measuring() || profilePhase !== "off") return null;
       if (event.target && event.target.closest && event.target.closest(".chart-corner, .paper-menu, .paper-add")) return null;
       let paneEl = null;
       try { paneEl = chart.panes()[0].getHTMLElement(); } catch (e) { return null; }
@@ -2446,16 +2776,42 @@
     }
 
     const toFpItem = (b) => {
-      const item = { time: b.time, levels: b.levels, coverage: b.coverage };
+      const item = { time: b.time, barTime: b.time, levels: b.levels, coverage: b.coverage };
       const k = ohlcOf(b.time);
       if (k) { item.open = k.open; item.high = k.high; item.low = k.low; item.close = k.close; }
       return item;
     };
 
-    // 按 settings.view 切换 K线 / 足迹图
-    function setView() {
+    // 视图属于本图; 只刷新本图的显示、周期约束与推送订阅。
+    function setView(next) {
+      if (!VIEW_CHOICES.includes(next) || next === view) {
+        viewSelect.value = view;
+        return;
+      }
+      view = next;
+      applyView();
+      onViewChange(view);
+    }
+
+    // 足迹显示模式也属于本图: 只换画法, 数据和订阅不变
+    function setFootprintMode(next) {
+      if (!FOOTPRINT_MODES.includes(next) || next === footprintMode) {
+        fpModeSelect.value = footprintMode;
+        return;
+      }
+      footprintMode = next;
+      fpSeries.applyOptions({ footprintMode });
+      refreshReadout();
+      onFootprintModeChange(footprintMode);
+    }
+
+    function applyView() {
+      viewSelect.value = view;
       clearPaperEntry();
-      const isFp = settings.view === "footprint";
+      const isFp = view === "footprint";
+      for (const option of badge.children) {
+        option.disabled = isFp && Number(option.value) < FOOTPRINT_MIN_TF;
+      }
       candleSeries.applyOptions({ visible: !isFp });
       applyEmaVisibility();
       applyHtfEmaVisibility();
@@ -2468,29 +2824,32 @@
       renderLegend();          // 足迹图下主图指标全部隐藏, 图例跟着收起
       if (isFp) setProfilePhase("off");
       profileBtn.disabled = isFp;   // 成交量分布同样只在 K 线视图画, 足迹图下按钮置灰
+      fpModeSelect.hidden = !isFp;
       profilePrimitive.refresh();
       refreshReadout();        // 覆盖标记换成足迹的口径
       if (isFp) {
-        fpBarSpacing = chart.timeScale().options().barSpacing;
-        chart.timeScale().applyOptions({ barSpacing: 60 });
+        if (fpBarSpacing == null) fpBarSpacing = chart.timeScale().options().barSpacing;
+        chart.timeScale().applyOptions({ barSpacing: FP.spacing });
       } else if (fpBarSpacing != null) {
         chart.timeScale().applyOptions({ barSpacing: fpBarSpacing });
         fpBarSpacing = null;
       }
+      if (isFp && tf < FOOTPRINT_MIN_TF) { setTf(FOOTPRINT_MIN_TF); return; }
       if (cfg) connectWs();  // 订阅视图需求并获得完整快照，补齐未观看期间的足迹。
     }
 
     function applyFootprint(data, replace = false) {
       if (!data || data.revision < fpRevision) return;
       fpRevision = data.revision;
+      fpTickSize = data.tickSize;
       const oldLast = fpBars[fpBars.length - 1]?.time;
       const canUpdate = !replace && data.bars.length === 1 && fpBars.length < 800 &&
                         (oldLast == null || data.bars[0].time >= oldLast);
       fpBars = FlowData.mergeBars(replace ? [] : fpBars, data.bars, 800);
       const first = bars[0]?.time;
       if (first != null) fpBars = fpBars.filter((b) => b.time >= first);
-      fpSeries.applyOptions({ tickSize: data.tickSize });
-      if (settings.view === "footprint") {
+      fpSeries.applyOptions({ tickSize: data.tickSize, priceTick: data.priceTick ?? data.tickSize });
+      if (view === "footprint") {
         if (canUpdate) fpSeries.update(toFpItem(data.bars[0]));
         else fpSeries.setData(fpBars.map(toFpItem));
       }
@@ -2528,25 +2887,28 @@
       historyRefresh = null;
       clearTimeout(historyRefreshTimer);
       historyRefreshTimer = null;
+      historyRefreshFailures = 0;
+      historyRefreshRetryAt = 0;
       historyDirty = false;
       historyRevision = 0;
       historyBackfill = null;
     }
 
+    // 期货 tick 口径不回补(同一 Feed 的 historyRevision 只随小周期回补变); 加密回填补进旧数据时也会变
     function acceptHistoryRevision(data) {
       if (Object.hasOwn(data, "historyBackfill")) historyBackfill = data.historyBackfill;
-      if (isCrypto || ltf === 0 || data.historyRevision == null) return;
+      if ((!isCrypto && ltf === 0) || data.historyRevision == null) return;
       if (historyRevision !== data.historyRevision && barsLtf === ltf && bars.length) historyDirty = true;
       historyRevision = data.historyRevision;
     }
 
     function queueHistoryRefresh() {
-      if (!historyDirty || olderError || historyRefresh || historyRefreshTimer != null || olderRequest || loadController ||
+      if (!historyDirty || historyRefresh || historyRefreshTimer != null || olderRequest || loadController ||
           !cfg || !bars.length || barsLtf !== ltf) return;
       historyRefreshTimer = setTimeout(() => {
         historyRefreshTimer = null;
         refreshLoadedHistory();
-      }, 150);
+      }, Math.max(150, historyRefreshRetryAt - Date.now()));
     }
 
     async function refreshLoadedHistory() {
@@ -2557,22 +2919,33 @@
       historyDirty = false;
       try {
         // 回补会改变整段累计基准。只重读已加载的范围, 不改变视口、不再次安排下载。
-        const resp = await fetch(`/api/history?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}&tf=${tf}` +
-                                 `&since=${first}&before=${last + tf}&limit=2000`,
-                                 { signal: request.controller.signal });
-        const data = await resp.json();
-        if (historyRefresh !== request || request.generation !== loadGeneration || request.contract !== dataContract) return;
-        if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
-        if (data.contract !== dataContract || data.symbol !== symbol || data.tf !== tf || data.ltf !== ltf) return;
-        acceptHistoryRevision(data);
-        const refreshed = data.bars.filter((bar) => bar.time >= first && bar.time <= last);
+        // 一次最多取 HISTORY_REFRESH_LIMIT 根, 从最新往前分几次取到最早一根。
+        let refreshed = [], before = last + tf;
+        for (;;) {
+          const resp = await fetch(`/api/history?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}&tf=${tf}` +
+                                   `&since=${first}&before=${before}&limit=${HISTORY_REFRESH_LIMIT}`,
+                                   { signal: request.controller.signal });
+          const data = await resp.json();
+          if (historyRefresh !== request || request.generation !== loadGeneration || request.contract !== dataContract) return;
+          if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+          if (data.contract !== dataContract || data.symbol !== symbol || data.tf !== tf || data.ltf !== ltf) return;
+          acceptHistoryRevision(data);
+          refreshed = data.bars.concat(refreshed);
+          if (!data.hasMore || !data.bars.length || data.bars[0].time <= first) break;
+          before = data.bars[0].time;
+        }
+        refreshed = refreshed.filter((bar) => bar.time >= first && bar.time <= last);
+        historyRefreshFailures = 0;
+        historyRefreshRetryAt = 0;
         // 末根继续采用实时消息, 防止等待历史期间到达的新成交被旧响应回滚。
         renderWithHistory(FlowData.mergeCvdHistory(bars, refreshed, last));
       } catch (error) {
         if (historyRefresh === request && !request.controller.signal.aborted) {
+          // 不占用 olderError(那会挡住翻页, 提示也只在最左边才看得到): 退避后自动重试, 最长隔一分钟
           historyDirty = true;
-          olderError = `CVD 历史同步失败: ${error.message}`;
-          showHistoryHint();
+          historyRefreshFailures += 1;
+          historyRefreshRetryAt = Date.now() + Math.min(60000, 2000 * 2 ** (historyRefreshFailures - 1));
+          console.warn(`CVD 历史同步失败, 稍后重试: ${error.message}`);
         }
       } finally {
         if (historyRefresh === request) {
@@ -2602,10 +2975,23 @@
       olderTimer = setTimeout(() => { olderTimer = null; loadOlderHistory(); }, 150);
     }
 
+    // 已加载超过 LOADED_BARS_MAX 根时裁掉最左边的; 正看着要裁的那截就先不裁(之后再说), 裁了可以再往左翻
+    function trimLoaded(next) {
+      const excess = next.length - LOADED_BARS_MAX;
+      if (excess <= 0) return next;
+      const range = chart.timeScale().getVisibleLogicalRange();
+      if (range == null || range.from < excess + 80) return next;
+      olderHasMore = true;
+      return next.slice(excess);
+    }
+
     function renderWithHistory(next) {
       const range = chart.timeScale().getVisibleLogicalRange();
       const first = bars[0]?.time;
-      const added = first == null ? 0 : Math.max(0, next.findIndex((b) => b.time === first));
+      let added = first == null ? 0 : Math.max(0, next.findIndex((b) => b.time === first));
+      if (first != null && next.length && next[0].time > first) {
+        added = -Math.max(0, bars.findIndex((b) => b.time === next[0].time));   // 左边裁掉了几根
+      }
       bars = next;
       restoringRange = true;
       try {
@@ -2747,8 +3133,8 @@
       const onlyLast = updates.length === 1 && updates[0].time === oldLast;
       const next = FlowData.mergeBars(bars, updates);
       if (onlyLast && !nextCfg) { bars = next; updateLast(); }
-      else renderWithHistory(next);
-      if (settings.view === "footprint" && fpBars.length) {
+      else renderWithHistory(trimLoaded(next));
+      if (view === "footprint" && fpBars.length) {
         const latest = fpBars[fpBars.length - 1];
         if (onlyLast && latest.time === oldLast) fpSeries.update(toFpItem(latest));
         else fpSeries.setData(fpBars.map(toFpItem));
@@ -2766,7 +3152,7 @@
       }
       onStatus(false, "同步中…");
       const wsScheme = location.protocol === "https:" ? "wss" : "ws";
-      const socket = new WebSocket(`${wsScheme}://${location.host}/ws?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}&tf=${tf}&footprint=${settings.view === "footprint"}`);
+      const socket = new WebSocket(`${wsScheme}://${location.host}/ws?symbol=${encodeURIComponent(symbol)}&ltf=${ltf}&tf=${tf}&footprint=${view === "footprint"}`);
       ws = socket;
       let synced = false;
       const armWatchdog = () => {
@@ -2800,16 +3186,26 @@
             } else if (synced) onStatus(true, "已连接");
           } else if (msg.symbol === symbol && msg.type === "snapshot" && msg.ltf === ltf && msg.tf === tf) {
             acceptDataContract(msg);
+            const kept = barsLtf === msg.ltf ? bars : [];
+            const gap = FlowData.snapshotGap(kept, msg.bars);
+            if (gap) {
+              // 断开太久, 中间缺了一段: 整份换成快照, 翻页从快照的第一根重新往左取
+              resetOlderHistory();
+              obTracker.reset();
+              largeStrengthMemo.clear();
+              bars = [];
+            }
             acceptHistoryRevision(msg);
             cfg = msg.cfg;
-            const next = FlowData.mergeBars(barsLtf === msg.ltf ? bars : [], msg.bars);
+            const next = gap ? msg.bars : trimLoaded(FlowData.mergeBars(kept, msg.bars));
             barsLtf = msg.ltf;
             barRevision = msg.revision;
             fpRevision = -1;
             onConfig();
             // 足迹清空要在 renderAll 之前: 清掉的足迹点也会改动时间轴序号, 放在后面 K 线标记又会错位
-            if (!msg.footprint) { fpBars = []; fpSeries.setData([]); }
+            if (!msg.footprint) { fpBars = []; fpTickSize = null; fpSeries.setData([]); }
             renderWithHistory(next);
+            if (gap) chart.timeScale().scrollToRealTime();
             if (msg.footprint) applyFootprint(msg.footprint, true);
             synced = true;
             onStatus(true, "已连接");
@@ -2821,6 +3217,8 @@
             if (msg.type === "bars" && msg.ltf === ltf && msg.revision > barRevision) {
               onBars(msg.bars, msg.cfg);
               barRevision = msg.revision;
+              acceptHistoryRevision(msg);     // 回填改到了快照之前的历史: 重读翻页取到的那些根
+              queueHistoryRefresh();
             } else if (msg.type === "history" && msg.ltf === ltf) {
               acceptHistoryRevision(msg);
               queueHistoryRefresh();
@@ -2839,7 +3237,8 @@
     // 切换本图周期: 先清掉旧周期的画面(新数据到之前不能还显示旧周期的 K 线), 再按新周期重新加载;
     // 加载流程会作废进行中的请求、重试与旧周期的推送连接。
     function setTf(next) {
-      if (next === tf || !TF_CHOICES.includes(next)) {
+      if (next === tf || !TF_CHOICES.includes(next) ||
+          (view === "footprint" && next < FOOTPRINT_MIN_TF)) {
         badge.value = String(tf);
         return;
       }
@@ -2853,10 +3252,12 @@
       largeStrengthMemo.clear();
       largePoints = [];
       fpBars = [];
+      fpTickSize = null;
       barRevision = -1;
       fpRevision = -1;
       chart.timeScale().applyOptions({ secondsVisible: tf < 60 });
       fpSeries.setData([]);
+      refreshReadout();
       if (cfg) renderAll();
       applyHtfEmaVisibility();   // 大周期的选项跟着本图周期变(4h 图没有大周期)
       renderLegend();
@@ -2900,20 +3301,25 @@
     // htf 是大周期 EMA 实际画的大周期(秒), 本图没有更大的周期时为 0
     function analysisInput() {
       const range = chart.timeScale().getVisibleLogicalRange();
-      return { tf, view: settings.view, shown: { ...shown }, htf: htfOf(), bars, derived, cfg, ltf: barsLtf,
+      return { tf, view, shown: { ...shown }, htf: htfOf(), bars, derived, cfg, ltf: barsLtf,
                stale: barsLtf !== ltf, range: range ? { from: range.from, to: range.to } : null };
     }
 
     // ---------- 对页面的接口 ----------
+    // 恢复足迹视图的显隐、格子宽度与周期限制; 此时没有 cfg, 不会提前建立连接。
+    if (view === "footprint") applyView();
+
     // 工具栏改了 settings 之后, 页面按改动调对应的入口
     return {
       get tf() { return tf; },
+      get view() { return view; },
+      get footprintMode() { return footprintMode; },
       setTf,
       el,
       shown: () => ({ ...shown }),
       obOptions: () => ({ ...obOptions }),
       load: () => loadHistory(),       // 重新加载(CVD口径/拆分粒度变了), 作废进行中的请求与重试
-      setView,                         // 视图(K线/足迹图)变了
+      setView,                         // 切换本图视图("candle" / "footprint")
       renderSuite,                     // 模式/阈值变了
       rebuildBand() {                  // 带宽变了: 中线/状态都不受影响, 不必整体 derive(), 重算带即可
         if (derived && derived.lw) {
@@ -2994,7 +3400,8 @@
   }
 
   // 渲染类与时间换算一并导出, 测试直接检查
-  root.ChartView = { create, FootprintRenderer, BandRenderer, BandSeries, TF_CHOICES, tfLabel, localLtfOptions, htfOptions, defaultHtf,
+  root.ChartView = { create, FootprintRenderer, footprintVolumeText, FOOTPRINT_MODES, BandRenderer, BandSeries, TF_CHOICES,
+                     VIEW_CHOICES, tfLabel, localLtfOptions, htfOptions, defaultHtf,
                      EMA_COLORS, EMA_LONG_PERIODS, EMA_DRAW_BARS, HTF_EMA_COLORS, HTF_EMA_WIDTH,
                      indexAtOrBefore, timeAtLogical, logicalAtTime, formatDuration, measureStats, measureLines };
 })(typeof globalThis !== "undefined" ? globalThis : this);

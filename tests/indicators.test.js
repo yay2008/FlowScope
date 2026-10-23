@@ -154,3 +154,27 @@ test("volumeProfile: 不给价格步长时按连续价格均匀切; 最高 = 最
   assert.deepEqual([flat.rows.length, flat.rows[0].unknown, flat.count, flat.pocPrice], [1, 5, 1, 7]);
   assert.equal(volumeProfile(bars, 5, 9), null, "区间里没有 bar");
 });
+
+test("WT2: 缺量不会变成零，影响退出窗口后恢复，真实零量仍有效", () => {
+  const { deriveLw } = require("../static/indicators.js");
+  const bars = Array.from({ length: 80 }, (_, i) => {
+    const price = 100 + Math.sin(i / 4) * 3;
+    return { time: 300 * i, open: price, high: price + 1, low: price - 1, close: price, volume: 100 + i };
+  });
+  const calc = (rows) => deriveLw(rows, rows.map(() => 0)).wt2;
+  const expected = calc(bars);
+  const broken = bars.map((b, i) => i === 40 ? { ...b, volume: null } : b);
+  const result = calc(broken);
+  assert.deepEqual(result.slice(40, 48), Array(8).fill(null));
+  for (let i = 48; i < bars.length; i++) assert.ok(Math.abs(result[i] - expected[i]) < 1e-10);
+  broken[40].volume = 0;
+  assert.notEqual(calc(broken)[40], null);
+});
+
+test("WT2: 图表严格采用后端值，null 不回退成本地信号", () => {
+  const { deriveLw } = require("../static/indicators.js");
+  const bars = Array.from({ length: 50 }, (_, i) => ({ time: i * 300,
+    open: 100 + i, high: 102 + i, low: 99 + i, close: 101 + i, volume: 100,
+    flowWave: { version: 1, wt2: i === 49 ? null : 17, wave: null, reason: "volume" } }));
+  assert.deepEqual(deriveLw(bars, bars.map(() => 0)).wt2, [...Array(49).fill(17), null]);
+});

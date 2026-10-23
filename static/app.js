@@ -1,8 +1,8 @@
 /* FlowScope 前端: 页面级逻辑
  * 工具栏、合约选择器、自选面板、模拟交易面板在这里; 图表本身(K线/指标/足迹图与数据推送)是 chart-view.js 里
  * 可实例化的组件, 每张图一个主周期, 左上角的下拉框切换。页面放两张图左右并排(默认 30s、5m):
- * 共用状态 settings(工具栏的视图/买卖口径, FlowMeter 窗格的模式/阈值)两张图共用, 十字光标与可视时间范围联动,
- * 主图指标的显示开关和读数每张图各管各的。
+ * 共用状态 settings(工具栏的买卖口径, FlowMeter 窗格的模式/阈值)两张图共用, 十字光标与可视时间范围联动,
+ * 视图、主图指标的显示开关和读数每张图各管各的。
  */
 "use strict";
 
@@ -18,7 +18,6 @@ const settings = {
   threshtype: "Z-SCORE",
   cvdSource: "tick",   // tick 口径 / kline = TV K线口径(按 klineLtf 秒的小周期拆分), 工具栏「买卖口径」一个下拉框选
   klineLtf: 10,        // 默认同 Pine 的 10S
-  view: "candle",      // 主图视图: candle=K线, footprint=足迹图
   bandK: BAND.kDefault,   // 叠加带的带宽倍数 k(回归残差标准差的倍数), 不在工具栏: 点主图图例里的「2σ」切换
 };
 let symbol = new URLSearchParams(location.search).get("symbol") || "KQ.m@SHFE.fu";
@@ -52,7 +51,9 @@ function loadChartTfs() {
   try {
     const saved = JSON.parse(localStorage.getItem(CHART_TFS_KEY) || "null");
     if (Array.isArray(saved) && saved.length === DEFAULT_CHART_TFS.length &&
-        saved.every((tf) => ChartView.TF_CHOICES.includes(tf))) return saved;
+        saved.every((tf) => ChartView.TF_CHOICES.includes(tf))) {
+      return new URLSearchParams(location.search).get("alert_tf") === "300" ? [saved[0], 300] : saved;
+    }
   } catch (error) { /* 记不住不影响使用 */ }
   return [...DEFAULT_CHART_TFS];
 }
@@ -64,6 +65,44 @@ function saveChartTfs() {
 }
 
 const chartTfs = loadChartTfs();
+
+// 视图按左右图分别保存, 刷新或切合约后保留; 没有记录的区域默认 K 线。
+const CHART_VIEWS_KEY = "flowscope.chartViews";
+const chartViews = loadChartViews();
+
+function loadChartViews() {
+  let saved;
+  try {
+    saved = JSON.parse(localStorage.getItem(CHART_VIEWS_KEY) || "null");
+  } catch (error) { /* 记不住不影响使用 */ }
+  return DEFAULT_CHART_TFS.map((_, index) =>
+    Array.isArray(saved) && ChartView.VIEW_CHOICES.includes(saved[index]) ? saved[index] : "candle");
+}
+
+function saveChartViews() {
+  try {
+    localStorage.setItem(CHART_VIEWS_KEY, JSON.stringify(chartViews));
+  } catch (error) { /* 记不住不影响使用 */ }
+}
+
+// 足迹显示模式(买卖 / 差值)同样按左右图分别保存; 没有记录或不认识的回到买卖。
+const FOOTPRINT_MODES_KEY = "flowscope.footprintModes";
+const footprintModes = loadFootprintModes();
+
+function loadFootprintModes() {
+  let saved;
+  try {
+    saved = JSON.parse(localStorage.getItem(FOOTPRINT_MODES_KEY) || "null");
+  } catch (error) { /* 记不住不影响使用 */ }
+  return DEFAULT_CHART_TFS.map((_, index) =>
+    Array.isArray(saved) && ChartView.FOOTPRINT_MODES.includes(saved[index]) ? saved[index] : "bidask");
+}
+
+function saveFootprintModes() {
+  try {
+    localStorage.setItem(FOOTPRINT_MODES_KEY, JSON.stringify(footprintModes));
+  } catch (error) { /* 记不住不影响使用 */ }
+}
 
 // 各图主图指标的显示开关记在 localStorage, 按左右图各记一份
 // [{ema, emaAll, emaLong, htfEma, htfEmaAll, htf, band, bandMid, ob, large, largeMinRadius}, {...}]:
@@ -158,6 +197,8 @@ function makeChart(tf, index) {
     tf,
     symbol,
     settings,
+    view: chartViews[index],
+    footprintMode: footprintModes[index],
     shown: loadShown(index, tf),
     obOptions: loadObOptions(index),
     profiles: loadProfiles(index),
@@ -175,6 +216,14 @@ function makeChart(tf, index) {
     onPaperAmend: (id, price) => paperPanel.amendOrder(id, price),
     onPaperCancel: (id) => paperPanel.cancelOrder(id),
     paperMenu: (price) => paperPanel.menuItems(price),
+    onViewChange: (view) => {
+      chartViews[index] = view;
+      saveChartViews();
+    },
+    onFootprintModeChange: (mode) => {
+      footprintModes[index] = mode;
+      saveFootprintModes();
+    },
     onTfChange: () => {
       chartTfs[index] = chartView.tf;
       saveChartTfs();
@@ -182,6 +231,11 @@ function makeChart(tf, index) {
       showStatus();
     },
   });
+  // 恢复足迹图时, 组件会把不支持的 10s 升到 30s; 状态栏与保存的周期一起更新。
+  if (chartTfs[index] !== chartView.tf) {
+    chartTfs[index] = chartView.tf;
+    saveChartTfs();
+  }
   chartView.el.addEventListener("pointerenter", () => activate(chartView));
   return chartView;
 }
@@ -240,6 +294,7 @@ function syncCrosshair(source, time, price) {
 // 所以不会来回触发。另一张缩不到那么小(bar 间距有下限)时只能显示它放得下的那部分, 不反过来改鼠标所在那张。
 // 两张图周期相差超过 FULL_SYNC_RATIO 倍(如 1m 与 4h)时, 显示同一段时间会把大周期压成一两根,
 // 所以只对齐右边缘时刻, 各图保留自己的缩放。
+// K 线与足迹混合显示时也只对齐右边缘, 让足迹保留足够宽的格子。
 const FULL_SYNC_RATIO = 3;
 
 function syncRanges() {
@@ -249,7 +304,7 @@ function syncRanges() {
   for (const c of charts) {
     if (c === activeChart) continue;
     const ratio = Math.max(c.tf, activeChart.tf) / Math.min(c.tf, activeChart.tf);
-    if (ratio <= FULL_SYNC_RATIO) c.setVisibleTimeRange(range);
+    if (c.view === activeChart.view && ratio <= FULL_SYNC_RATIO) c.setVisibleTimeRange(range);
     else c.alignRightEdge(range.to);
   }
 }
@@ -277,13 +332,6 @@ function setSuiteSetting(key, value) {
     c.refreshReadout();
   });
 }
-
-// ---------- 工具栏 ----------
-
-$("view").addEventListener("change", (e) => {
-  settings.view = e.target.value;
-  charts.forEach((c) => c.setView());
-});
 
 // ---------- 买卖口径(CVD 口径与拆分粒度合在一个下拉框) ----------
 // 选项值 "tick" = tick 口径, "kline-N" = TV K线口径、按 N 秒的小周期拆分; 写进 settings 时仍分成 cvdSource 与 klineLtf。
@@ -469,7 +517,9 @@ function renderWatchItem(code) {
     event.stopPropagation();
     changeFavorite(code, false);
   });
-  top.append(name, remove);
+  top.append(name);
+  if (window.alertPanel) top.appendChild(window.alertPanel.buttonFor(code));
+  top.appendChild(remove);
 
   const bottom = document.createElement("div");
   bottom.className = "watch-bottom";

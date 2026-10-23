@@ -7,6 +7,11 @@
     const bars = [...byTime.values()].sort((a, b) => a.time - b.time);
     return Number.isFinite(limit) ? bars.slice(-limit) : bars;
   }
+  // 重连快照与已有的 K 线接不上(已有的最后一根早于快照第一根): 断开期间缺了一段, 只能整份换掉,
+  // 合并的话指标会把缺口两边当成连续的数据来算, 翻页(只往最早一根之前取)也补不上这个洞。
+  function snapshotGap(existing, snapshot) {
+    return existing.length > 0 && snapshot.length > 0 && existing[existing.length - 1].time < snapshot[0].time;
+  }
   function mergeCvdHistory(existing, history, liveFrom) {
     const anchor = history.find((bar) => bar.time === liveFrom);
     let cumulative = anchor?.cvdOpen ?? (anchor?.cvd != null && anchor?.delta != null ? anchor.cvd - anchor.delta : null);
@@ -27,6 +32,60 @@
       const key = Math.round(lv[0] / tickSize);
       return { sellBelow: byPrice.get(key - 1)?.[2] || 0, buyAbove: byPrice.get(key + 1)?.[1] || 0 };
     });
+  }
+  // 足迹再合档: levels 的价格都是 step 的整数倍、标在本档最低价; 相邻 factor 档并成一档, 仍标在最低价。
+  function footprintRows(levels, step, factor) {
+    if (!(factor > 1) || !(step > 0)) return levels;
+    const rows = new Map();
+    for (const [price, buy, sell, unknown = 0] of levels) {
+      const key = Math.floor(Math.round(price / step) / factor);
+      const row = rows.get(key);
+      if (row) { row[1] += buy; row[2] += sell; row[3] += unknown; }
+      else rows.set(key, [key, buy, sell, unknown]);
+    }
+    const size = step * factor;
+    return [...rows.values()].sort((a, b) => a[0] - b[0])
+      .map(([key, buy, sell, unknown]) => [Number((key * size).toPrecision(12)), buy, sell, unknown]);
+  }
+  // 显示档(最小价位的倍数, base 是底档): 候选是 1-2-2.5-5 序列里能被底档整除的整数价位,
+  // 再补上底档的 1-2-5 倍 —— 底档是 2 个价位时只靠前者会从 2 直接跳到 10, 补上 4 以后相邻候选最多差 2.5 倍;
+  // 底档不在序列上(多所公约数之类)时也有候选。取不小于 needed 的最小一个。
+  function footprintMultiple(base, needed) {
+    const options = [];
+    for (let magnitude = 1; magnitude <= 1e9; magnitude *= 10) {
+      for (const n of [1, 2, 2.5, 5]) {
+        const ticks = n * magnitude;
+        if (Number.isInteger(ticks) && ticks % base === 0) options.push(ticks);
+        if (n !== 2.5) options.push(n * magnitude * base);
+      }
+    }
+    return options.sort((a, b) => a - b).find((ticks) => ticks >= needed) ?? Math.ceil(needed / base) * base;
+  }
+  function footprintThresholds(bars) {
+    // 足迹不平衡的优势侧最小量(期货与加密共用，期货另有手数下限，见 chart-view.js FP.imbMinLots)。
+    // 每根的非零买/卖半格均量代表其典型档量；此前最多 20 根完整足迹取中位数，
+    // 隔离品种、周期及显示分档的量级，也避免单根放量抬高整段门槛。
+    // bars 按时间升序，当前根先取门槛再入基线，不使用未来量；首根用自身均量启动。
+    const thresholds = new Map(), samples = [];
+    for (const bar of bars) {
+      let mean = 0, count = 0;
+      for (const level of bar.levels || []) {
+        for (const volume of [level[1], level[2]]) {
+          if (Number.isFinite(volume) && volume > 0) mean += (volume - mean) / ++count;
+        }
+      }
+      const sorted = [...samples].sort((a, b) => a - b);
+      const mid = sorted.length >> 1;
+      const minimum = sorted.length
+        ? (sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2)
+        : count ? mean : null;
+      thresholds.set(bar.time, minimum);
+      if (bar.coverage === "complete" && count) {
+        samples.push(mean);
+        if (samples.length > 20) samples.shift();
+      }
+    }
+    return thresholds;
   }
   function cvdCandle(bar) {
     if (bar.cvd == null || bar.delta == null) return null;
@@ -113,7 +172,8 @@
     if (!option || option.openInterest == null) return name;
     return `${name} · 昨仓 ${formatOpenInterest(option.openInterest)}`;
   }
-  const api = { mergeBars, mergeCvdHistory, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
+  const api = { mergeBars, snapshotGap, mergeCvdHistory, diagonalVolumes, footprintRows, footprintMultiple, footprintThresholds,
+                cvdCandle, splitLtf, relativeLevel,
                 parseSymbolParts, formatOpenInterest, formatAmount, liquidityLabel,
                 watchLabel, formatPrice, formatChangePct, changeClass, productLabel, monthLabel };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

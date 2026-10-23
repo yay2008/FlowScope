@@ -7,6 +7,7 @@
 <link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
 <link rel="icon" href="favicon.svg" type="image/svg+xml" sizes="any">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="alerts.css">
 </head>
 <body>
 <div id="toolbar">
@@ -26,12 +27,6 @@
       <div id="picker-foot" class="picker-foot">主力自动换月 · 固定月份不换月 · ☆ 加自选<br>↑↓ 移动 · →/← 换列 · Tab 换分类 · Enter 确认 · 双击品种选主力</div>
     </div>
   </div>
-  <label>视图
-    <select id="view">
-      <option value="candle" selected>K线</option>
-      <option value="footprint">足迹图</option>
-    </select>
-  </label>
   <!-- 模式/阈值在每张图 FlowMeter 窗格的左上角(chart-view.js 建), 只影响那个窗格 -->
   <label>买卖口径
     <select id="cvd-source" title="决定成交量怎么分成主动买和主动卖，影响 CVD、Delta 和买卖量。TqSdk tick：按快照盘口估算方向；TV K线：按小周期 K 线涨跌归类成交量，后面的秒数是拆分用的小周期，当前周期用不了的置灰。两者行情均来自 TqSdk。">
@@ -50,12 +45,25 @@
     <label title="勾上后两张图一起发给 AI（大周期在前：先定方向再找位置）；两张图周期相同时只发鼠标所在的那张"><input id="ai-both" type="checkbox">双图</label>
   </span>
   <div class="toolbar-end">
+    <button id="alerts-open" type="button" aria-controls="alerts-panel" aria-expanded="false">WT2 警报</button>
     <a href="training.html" style="color:#d1d4dc;text-decoration:none;padding:3px 8px;border:1px solid #3a4152;border-radius:4px">K 线训练</a>
     <!-- 状态点: 两张图的连接状态 + 合约目录/自选的提示, 细节在悬停提示里(app.js 的 showStatus) -->
     <span id="status" class="off">连接中…</span>
   </div>
 </div>
 <div id="workspace">
+  <section id="alerts-panel" class="alerts-panel" aria-label="五分钟 WT2 警报" hidden>
+    <div class="alerts-head"><strong>自选 · 5分钟 WT2 警报</strong><button id="alerts-close" type="button" aria-label="关闭警报面板">×</button></div>
+    <div class="alerts-controls">
+      <label><input id="alerts-enabled" type="checkbox">开启后台警报</label>
+      <button id="alerts-test" type="button">测试 Windows 通知</button>
+    </div>
+    <p id="alerts-status" role="status">正在读取后台状态…</p>
+    <p id="alerts-test-result" role="status"></p>
+    <p class="alerts-note">收盘确认 · 同一段只提醒一次 · 再次进入重新提醒。电脑需保持唤醒，后端需持续运行。</p>
+    <ul id="alerts-monitors"></ul>
+    <strong>最近警报</strong><ul id="alerts-history"></ul>
+  </section>
   <aside id="watchlist">
     <div id="watch-head">
       <span>自选</span>
@@ -258,5 +266,7 @@
 <script src="large-trades.js"></script>
 <script src="chart-view.js"></script>
 <script src="app.js"></script>
+<script src="alert-panel.js"></script>
+<script>window.alertPanel = FlowAlerts.mount({onChange: () => renderWatch()});</script>
 </body>
 </html>

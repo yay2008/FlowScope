@@ -47,6 +47,7 @@ from indicator import (BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, ROLLUP_BASE_TF, 
 from history_store import ChangeLog, ChangeMarks
 from ingest import COMPUTE_RETRY_SEC, MAX_KLINES, SNAPSHOT_BARS, feed_key, feed_label, validate_symbol
 from rollup import INT64_MAX, CANDLE_COLUMNS, ClosedCache, RollupMixin, candle_buckets, split_buckets, utc_bucket
+from footprint import CACHE_BARS as FOOTPRINT_BARS, MIN_TF as FOOTPRINT_MIN_TF
 
 VENUE_NAMES = {"BINANCE": "币安", "OKX": "OKX", "AGG": "多所汇总"}
 # 默认常驻采集: 币安与 OKX 的 BTC 永续(多所汇总 AGG.BTC 由这两路合成)。自选里的加密合约追加在后。
@@ -148,6 +149,11 @@ class TradeBars:
         self.live_start: int | None = None  # 最新一笔实时成交所在 bar 的起点
         self.gaps = 0                        # 本次运行编号接不上的次数(断线重连)
         self.large_trades = None
+        # 原始价位只在 30s 底层保留，供所有足迹周期共用；不依赖是否正在看足迹。
+        # 正在走的那根是 {价: [买, 卖, 0]}; 走完的改存成 [价, 买, 卖] 数组(按价升序, 见 _compact_levels)
+        self.price_levels: dict[int, dict[float, list[float]] | np.ndarray] = {}
+        self._price_floor = -1
+        self._price_rows = {}
         # 各 Feed 上次取过之后最早改到哪根(起点毫秒): 重算只取那以后的几根(见 frame_since);
         # 洞、裁窗口、读回落盘这类会动到多根的改动记 -inf, 整窗口重算
         self.changes = ChangeMarks()
@@ -181,6 +187,8 @@ class TradeBars:
                 self.gaps += 1
         elif self.live_start is not None and start > self.live_start + self.tf_ms:
             self._fill_quiet(self.live_start, start)
+        if self.live_start is not None and start > self.live_start:
+            self._compact_levels(self.live_start)     # 上一根走完了(编号只增, 晚到的也归到最新一根)
         self._apply(trade_id, price, qty, t_ms, sell)
         if self.large_trades is not None:
             self.large_trades.trade(trade_id, price, qty, t_ms, sell)
@@ -204,6 +212,9 @@ class TradeBars:
             self._apply(int(trade_id), float(price), float(qty), int(t_ms), bool(sell))
         self.holes.remove(hole)
         self.changes.mark(float("-inf"))
+        for start in list(self.price_levels):
+            if start != self.live_start:
+                self._compact_levels(start)
         begin = self.bar_of(after_ms if after_ms is not None else before_ms)
         self._fill_quiet(begin, self.bar_of(before_ms))
         return True
@@ -224,6 +235,16 @@ class TradeBars:
             bar[2] = min(bar[2], price)
         bar[4] += qty
         bar[6 if sell else 5] += qty
+        if self.tf_ms >= FOOTPRINT_MIN_TF * 1000 and start >= self._price_floor:
+            levels = self.price_levels.get(start)
+            if not isinstance(levels, dict):           # 新 bar, 或补洞改到已经走完的
+                levels = self.price_levels[start] = {} if levels is None else {
+                    price: [buy, sell, 0.0] for price, buy, sell in levels.tolist()}
+            volumes = levels.setdefault(price, [0.0, 0.0, 0.0])
+            volumes[1 if sell else 0] += qty
+            self._price_rows.pop(start, None)
+            if len(self.price_levels) > FOOTPRINT_BARS + TRIM_SLACK:
+                self._trim_prices()
         second = t_ms // 1000 * 1000
         tick = self.seconds.get(second)
         if tick is None:
@@ -269,6 +290,51 @@ class TradeBars:
         if first_live is not None:
             self.seconds = {key: value for key, value in self.seconds.items() if key >= first_live}
             self.holes = [hole for hole in self.holes if self.bar_of(hole[3]) >= first_live]
+        self._trim_prices()
+
+    def _compact_levels(self, start):
+        """走完的 bar 的分价位量改存成 [价, 买, 卖] 数组: 每档 24 字节, dict 套 list 每档要两三百字节,
+        常驻 800 根、每根几百档时差出几十 MB。第三列(未知量)加密恒为零, 不存。"""
+        levels = self.price_levels.get(start)
+        if isinstance(levels, dict):
+            self.price_levels[start] = np.array([(price, volumes[0], volumes[1])
+                                                 for price, volumes in sorted(levels.items())],
+                                                dtype=float).reshape(-1, 3)
+
+    def drop_footprint_rows(self):
+        """没人看足迹时丢掉给足迹快照缓存的逐档列表(只是缓存, 要时再从 price_levels 生成)。"""
+        self._price_rows.clear()
+
+    def _trim_prices(self):
+        keys = sorted(self.price_levels)[-min(self.max_bars, FOOTPRINT_BARS):]
+        if keys:
+            self._price_floor = max(self._price_floor, keys[0])
+        self.price_levels = {key: self.price_levels[key] for key in keys}
+        self._price_rows = {key: row for key, row in self._price_rows.items() if key in self.price_levels}
+
+    def footprint(self, tick_size):
+        """只使用收到的逐笔（含补洞成交）；普通买卖量历史不能升级分价覆盖。"""
+        spans = self.hole_spans()
+        floor = max(self._price_floor, min(self.bars, default=0))
+        bars = []
+        for start in sorted(self.bars)[-FOOTPRINT_BARS:]:
+            if start < floor:
+                continue
+            levels = self.price_levels.get(start)
+            if levels is None and self.bars[start][4] > 0:
+                continue
+            if start not in self._price_rows:
+                if isinstance(levels, np.ndarray):
+                    rows = [[price, round(buy, VOLUME_ROUND), round(sell, VOLUME_ROUND), 0.0]
+                            for price, buy, sell in levels.tolist()]
+                else:
+                    rows = [[price, *(round(v, VOLUME_ROUND) for v in quantities)]
+                            for price, quantities in sorted((levels or {}).items())]
+                self._price_rows[start] = rows
+            partial = any(begin <= start <= end for begin, end in spans)
+            bars.append({"time": start // 1000 + TZ_SHIFT_S, "levels": self._price_rows[start],
+                         "coverage": "partial" if partial else "complete"})
+        return {"tickSize": tick_size, "bars": bars}
 
     def hole_spans(self) -> list[tuple[int, int]]:
         """各个洞两端 bar 的起点(含): 落在其间的实时 bar 都可能缺量。"""
@@ -558,6 +624,8 @@ class CryptoFeed(ingest.Feed):
     """加密合约的一个主周期。需求登记、快照读取、历史文件命名沿用 ingest.Feed, 数据换成逐笔成交;
     只有管理线程写数据与历史文件。"""
 
+    revise_history = True     # 回填补进旧数据时通知页面重读翻页历史(见 ingest.Feed._publish)
+
     def __init__(self, instrument: Instrument, tf: int = DEFAULT_TF_SEC):
         super().__init__(instrument.symbol, tf)
         self.instrument = instrument
@@ -589,8 +657,9 @@ class CryptoFeed(ingest.Feed):
         return {(int(t) - TZ_SHIFT_S) * 1000 for t in store.values}
 
     def footprint_snapshot(self, demand=True):
-        """足迹图暂不做(BTC 最小价位太细, 要先做价格分档)。"""
-        return self._empty_footprint(demand)
+        if self.tf < FOOTPRINT_MIN_TF:
+            return self._empty_footprint(demand)
+        return super().footprint_snapshot(demand)
 
     def apply_backfill(self, bars: pd.DataFrame):
         """回填结果(aggregate_trades 的输出, 只含完整的 bar)写进各粒度历史与开高低收量文件。"""
@@ -615,9 +684,11 @@ class CryptoFeed(ingest.Feed):
     def recompute(self, broadcast):
         with self._state_lock:
             now = time.monotonic()
-            ltfs = [ltf for ltf, expires in self._requested.items() if expires >= now]
+            ltfs = sorted(ltf for ltf, expires in self._requested.items() if expires >= now)
+            want_fp = self._fp_until >= now
             demand_version = self._demand_version
             previous = dict(self.snapshots)
+            previous_fp = self.footprint
         self._start_round()
         # 逐笔成交窗口从上一轮到现在最早改到哪根: 一般只有正在走的那根, 只算尾部(见 Feed._tail_since)
         changed = self.trades.changes.take(self)
@@ -640,10 +711,18 @@ class CryptoFeed(ingest.Feed):
             snapshots[ltf], message = self._publish(ltf, bars, previous, revision, tail)
             if message:
                 messages.append(message)
+        raw_fp = self.trades.footprint(self.instrument.tick_size) if want_fp else None
+        if not want_fp:
+            self.trades.drop_footprint_rows()
+        fp, message = self._prepare_footprint(raw_fp, previous_fp, revision)
+        if message:
+            messages.append(message)
         self.last_compute = time.monotonic()
         self.computed_start = self.trades.live_start
         with self._state_lock:
             self.snapshots = snapshots
+            self.footprint = fp
+            self._footprint_raw = raw_fp
             self.revision = revision
             self._computed_version = demand_version
             self.error = None
@@ -688,16 +767,21 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
             return pd.DataFrame(columns=CANDLE_COLUMNS)
         return self.candles_at(starts, feeds, forming=True)
 
-    def candles_at(self, starts, feeds=None, forming=False) -> pd.DataFrame:
-        """指定起点的历史桶与实时桶沿用相同的多所汇总规则。"""
+    def candles_at(self, starts, feeds=None, forming=False, caches=None) -> pd.DataFrame:
+        """指定起点的历史桶与实时桶沿用相同的多所汇总规则。
+
+        caches(来源合约 -> ClosedCache)不给就用实时窗口的缓存; 翻页读历史要另给, 别冲掉实时那份。
+        """
         feeds = self.candle_feeds() if feeds is None else feeds
         if not len(starts) or not feeds or feeds[0] is None:
             return pd.DataFrame(columns=CANDLE_COLUMNS)
-        self._candle_cache = {feed.symbol: self._candle_cache.get(feed.symbol) or ClosedCache()
-                              for feed in feeds if feed is not None}
-        out = self._source_buckets(feeds[0], starts)
+        if caches is None:
+            self._candle_cache = caches = {feed.symbol: self._candle_cache.get(feed.symbol) or ClosedCache()
+                                           for feed in feeds if feed is not None}
+        out = self._source_buckets(feeds[0], starts, caches)
         if len(feeds) > 1:
-            parts = [out, *(self._source_buckets(feed, starts) if feed is not None else None for feed in feeds[1:])]
+            parts = [out, *(self._source_buckets(feed, starts, caches) if feed is not None else None
+                            for feed in feeds[1:])]
             if any(part is None for part in parts):
                 volume = out["volume"] * np.nan
             else:
@@ -732,7 +816,7 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
         last = utc_bucket(latest, self.tf)
         return np.arange(last - (self.max_bars - 1) * self.tf, last + self.tf, self.tf, dtype=np.int64)
 
-    def _source_buckets(self, feed: CryptoFeed, starts: np.ndarray) -> pd.DataFrame:
+    def _source_buckets(self, feed: CryptoFeed, starts: np.ndarray, caches) -> pd.DataFrame:
         """一个 30s 来源 -> 各桶的开高低收量与 30s 根数(按桶起点索引)。
 
         整根都早于来源最近窗口的桶只看文件, 按文件的改动记录增量维护; 其余由文件里窗口之前那截加窗口现算
@@ -752,7 +836,7 @@ class CryptoRollupFeed(RollupMixin, ingest.Feed):
             rows = [frame for frame in (stored(lo, edge), window) if frame is not None and not frame.empty]
             return candle_buckets(pd.concat(rows, ignore_index=True) if rows else None, s, e)
 
-        return split_buckets(starts, starts + self.tf, edge, self._candle_cache[feed.symbol],
+        return split_buckets(starts, starts + self.tf, edge, caches.setdefault(feed.symbol, ClosedCache()),
                              [store] if store is not None else [],
                              lambda lo, hi, s, e: candle_buckets(stored(lo, hi), s, e), fresh)
 
@@ -890,7 +974,7 @@ class CryptoManager:
         self.rollups: dict[tuple[str, int], CryptoRollupFeed] = {}
         self.quotes: dict[str, dict] = {}          # 合约 -> {"ticker": {...}, "book": {...}, "mark": {...}}
         self.events: queue.Queue = queue.Queue()
-        self.clients: dict[asyncio.Queue, tuple[str, int, int]] = {}   # 值: (合约, 主周期, 拆分粒度)
+        self.clients: dict[asyncio.Queue, tuple[str, int, int, bool]] = {}  # 合约、周期、粒度、足迹
         self.loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -898,6 +982,7 @@ class CryptoManager:
         self.pinned: list[str] = list(self.defaults)
         self.pin_skipped: list[str] = []
         self._pin_request: list[str] = []          # 自选里的加密合约(按面板顺序), 见 set_pinned
+        self.background: set[tuple[str, int]] = set()
         self._demand: dict[str, float] = {}         # 页面临时打开的合约 -> 最近一次需求
         self._interest: dict[tuple[str, str], float] = {}   # (合约, 报价种类) -> 截止时刻
         self._topics: dict[str, frozenset] = {}
@@ -1029,10 +1114,10 @@ class CryptoManager:
                    tf: int = DEFAULT_TF_SEC):
         key = feed_key(symbol, tf)
         with self._lock:
-            self.clients[queue_] = (key[0], key[1], ltf)
+            self.clients[queue_] = (key[0], key[1], ltf, footprint)
         feed = self._feed_of(key)
         if feed is not None:
-            feed.request(ltf=ltf, demand=True)
+            feed.request(ltf=ltf, footprint=footprint, demand=True)
 
     def remove_client(self, queue_: asyncio.Queue):
         with self._lock:
@@ -1046,6 +1131,23 @@ class CryptoManager:
             feed = self._feed_of(subscription[:2])
             if feed is not None:
                 feed.request(demand=True)
+
+    def set_background(self, keys) -> dict[str, str]:
+        wanted = set(feed_key(symbol, tf) for symbol, tf in keys)
+        errors = {}
+        with self._lock:
+            for key in self.background - wanted:
+                feed = self._feed_of(key)
+                if feed is not None:
+                    feed.request(demand=True)
+            self.background = wanted
+            for key in sorted(wanted):
+                try:
+                    if self._feed_of(key) is None:
+                        self.ensure(*key)
+                except ValueError as exc:
+                    errors[key[0]] = str(exc)
+        return errors
 
     def set_pinned(self, symbols) -> list[str]:
         """常驻采集集合: 默认合约 + 自选里的加密合约; 不认识的代码与超出名额的不常驻。
@@ -1166,7 +1268,12 @@ class CryptoManager:
         with self._lock:
             clients = list(self.clients.items())
         for q, subscription in clients:
-            if (msg.get("symbol"), msg.get("tf"), msg.get("ltf")) != subscription:
+            if (msg.get("symbol"), msg.get("tf")) != subscription[:2]:
+                continue
+            if msg.get("type") in {"footprints", "footprint_snapshot"}:
+                if not subscription[3]:
+                    continue
+            elif msg.get("ltf") != subscription[2]:
                 continue
             try:
                 q.put_nowait(msg)
@@ -1190,8 +1297,9 @@ class CryptoManager:
         now = time.monotonic() if now is None else now
         with self._lock:
             symbols = list(self.pinned)
+            symbols += [symbol for symbol, _ in self.background]
             symbols += [symbol for symbol, seen in self._demand.items() if now - seen < IDLE_EVICT_SEC]
-            symbols += [symbol for symbol, _, _ in self.clients.values()]
+            symbols += [subscription[0] for subscription in self.clients.values()]
             symbols += [symbol for symbol, _ in self.rollups]
         if self.aggregates is not None:
             symbols = [part for symbol in symbols for part in
@@ -1209,12 +1317,12 @@ class CryptoManager:
             kinds |= set(self._interest)
             self._demand = {symbol: seen for symbol, seen in self._demand.items()
                             if now - seen < IDLE_EVICT_SEC}
-            watched = {symbol for symbol, _, _ in self.clients.values()}
+            watched = {subscription[0] for subscription in self.clients.values()}
             for key in [key for key in self.feeds if key[0] not in trade_symbols and key[0] not in watched]:
                 del self.feeds[key]
-            viewed = {(symbol, tf) for symbol, tf, _ in self.clients.values()}
+            viewed = {subscription[:2] for subscription in self.clients.values()}
             for key in [key for key, feed in self.rollups.items()
-                        if key not in viewed and feed.idle_for(now) >= IDLE_EVICT_SEC]:
+                        if key not in viewed and key not in self.background and feed.idle_for(now) >= IDLE_EVICT_SEC]:
                 del self.rollups[key]
             for symbol in trade_symbols:
                 for tf in NATIVE_TFS:
@@ -1401,11 +1509,11 @@ class CryptoManager:
             clients = list(self.clients.values())
             feeds = list(self.feeds.items())
         watched = set()
-        for symbol, tf, ltf in clients:
+        for symbol, tf, ltf, footprint in clients:
             watched.add((symbol, tf))
             feed = self._feed_of((symbol, tf))
             if feed is not None:
-                feed.request(ltf=ltf, demand=False)   # 保持在看的拆分粒度不过期(大周期会转给 30s)
+                feed.request(ltf=ltf, footprint=footprint, demand=False)  # 大周期将需求转给 30s
         watched |= self._rollup_sources(watched)   # 看着大周期, 也就是看着合成它要用的 30s
         dirty, self._dirty = self._dirty, set()
         for key, feed in feeds:

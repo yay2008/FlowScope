@@ -1060,6 +1060,7 @@ class AppRoutingTests(unittest.TestCase):
         feed = self.crypto.ensure(BTC.symbol, 30)
         self.crypto._sync(time.monotonic())
         feed.trades.add(1, 100.0, 1.0, BASE + 1000, False)
+        feed.request(footprint=True)
         feed.recompute(lambda _: None)
         self.patches = [patch.object(server, "crypto", self.crypto), patch.object(server, "manager", NoTqSdk())]
         for item in self.patches:
@@ -1074,7 +1075,8 @@ class AppRoutingTests(unittest.TestCase):
     def test_history_and_footprint_come_from_the_crypto_manager(self):
         snapshot = asyncio.run(server.history(BTC.symbol, 0, 30))
         self.assertEqual((snapshot["symbol"], snapshot["bars"][-1]["buy"]), (BTC.symbol, 1.0))
-        self.assertEqual(asyncio.run(server.footprint(BTC.symbol, 30))["bars"], [])
+        fp = asyncio.run(server.footprint(BTC.symbol, 30))
+        self.assertEqual(fp["bars"][0]["levels"], [[100.0, 1.0, 0.0, 0.0]])
         with self.assertRaises(HTTPException) as caught:
             asyncio.run(server.history("BINANCE.NOPEUSDT.P", 0, 30))
         self.assertEqual(caught.exception.status_code, 400)

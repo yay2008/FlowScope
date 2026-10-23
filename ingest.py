@@ -22,6 +22,7 @@ import queue
 import re
 import threading
 import time
+from wt2 import FlowWaveSeries, calculate_flowwave, finite as finite_wt2
 from collections.abc import Mapping, MutableMapping
 from contextlib import contextmanager
 
@@ -37,6 +38,7 @@ from futures_backfill import CHUNK_SECONDS, KlineBackfiller
 from rollup import RollupMixin, candles_from_klines
 from tick_analytics import TickAnalytics
 from large_trades import LargeTradeDetector, decorate_bars
+from footprint import for_display, message as footprint_message
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -46,6 +48,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 MAX_TICKS = 10000     # 条数窗口；按 500ms 一条估算约 83 分钟
 MAX_KLINES = 2000     # K线根数窗口(与周期无关): 30s ≈ 2.5 个交易日, 10s ≈ 5.5 小时
 SNAPSHOT_BARS = 800   # 推送给前端的最近 bar 数(与周期无关)
+FLOWWAVE_COLUMNS = ("time", "open", "high", "low", "close", "volume", "coverage")   # FlowWave 的输入列
 MAX_FEEDS = 32
 # 常驻采集(默认合约 + 自选)最多占用的 Feed 数, 其余名额留给页面临时打开的合约。
 MAX_PINNED_FEEDS = MAX_FEEDS // 2
@@ -275,6 +278,10 @@ class Feed:
     周期是 Feed 级维度: 不同周期各自订阅 K 线、各自聚合与落盘, 但共享同一路 tick。
     """
 
+    # 历史文件在快照第一根之前被别处(回填)改到时, 自己提升 history_revision(见 _publish)。
+    # 期货的小周期回补由 FeedManager._apply_history 统一编号并通知, 不用这个。
+    revise_history = False
+
     def __init__(self, symbol: str, tf: int = DEFAULT_TF_SEC):
         self.symbol = validate_symbol(symbol)
         # symbol 保留自选/URL 的稳定标识; contract 决定 SDK 订阅与历史文件。
@@ -287,6 +294,9 @@ class Feed:
         self.ready = threading.Event()
         self.snapshots = {}
         self.footprint = None
+        self._footprint_raw = None
+        self._footprint_display = {}
+        self._footprint_merge = {}
         self.error = None
         # 订阅失败的冷却截止时刻(None = 未失败); 冷却期过后由 FeedManager 自动重订。
         self.retry_at = None
@@ -304,8 +314,11 @@ class Feed:
         self.revision = 0
         self.stores = {}
         self._volumes = None
+        self._volumes_through = None        # 原生 K 线成交量档案已存到的最后一根收盘 K 线(见 recompute)
         self.history_revision = 0
         self.history_backfill = {}
+        # ltf -> 本进程已下载过的区间[(起, 止)], 没成交的秒没有小 K 线, 下载后仍不完整的不再重下
+        self.history_attempted = {}
         # 各粒度最近一次合并历史、算好 CVD 的完整窗口(连同那一轮的 revision); 大周期由它合成,
         # 只认最近一轮算出来的(见 latest_window)。
         self.latest = {}
@@ -321,7 +334,10 @@ class Feed:
         self._large_seen = None             # 上一轮汇总用的检测器(换了就全部重算)
         self._record_state = {}             # ltf -> (轮次, 快照, 生成它的那段 bars), 见 _records
         self._tail_marks = {}               # ltf -> (轮次, 历史文件, 它算完时的版本), 见 _tail_since
+        self._history_marks = {}            # ltf -> (历史文件, 上一轮算完时的版本), 见 _publish
         self._klines_seen = None            # 上一轮的 K 线 (展示秒, 开高低收量), 见 _kline_changes
+        self._flowwave = {}                 # ltf -> (history_revision, FlowWaveSeries)(实时快照的增量计算, 见 _flowwave_snapshot)
+        self._flowwave_source = None        # (轮次, 本轮 tick 口径的快照各根): 其它口径直接沿用
         # 采集循环的节流(见 FeedManager._run_api): 数据变了还没算 / 上次算完的时刻
         self.pending = False
         self.last_compute = 0.0
@@ -342,18 +358,24 @@ class Feed:
             self.release_serials()
             self.snapshots.clear()
             self.footprint = None
+            self._footprint_raw = None
             self.ready.clear()
             self.stores.clear()
             self._volumes = None
+            self._volumes_through = None
             self.history_revision = 0
             self.history_backfill.clear()
+            self.history_attempted.clear()
             self.latest.clear()
             self.large_trades = self._new_large_detector()
             self._large_synced = self._large_cache = self._large_seen = None
             self._large_since = float("-inf")
             self._record_state.clear()
             self._tail_marks.clear()
+            self._history_marks.clear()
             self._klines_seen = None
+            self._flowwave.clear()
+            self._flowwave_source = None
             self._computed_version = -1
             if getattr(self, "is_rollup", False):
                 self._closed.clear()
@@ -370,6 +392,7 @@ class Feed:
         with self._state_lock:
             self.snapshots.clear()
             self.footprint = None
+            self._footprint_raw = None
             self.ready.clear()
             self.error = None
             self.retry_at = None
@@ -429,6 +452,7 @@ class Feed:
                 if self._fp_until < now:
                     self._demand_version += 1
                     self.footprint = None
+                    self._footprint_raw = None
                 self._fp_until = now + 60
 
     def has_demand(self, now=None):
@@ -458,8 +482,22 @@ class Feed:
         with self._state_lock:
             return self.footprint
 
+    def footprint_source(self):
+        """管理线程内合所/合周期用的原始价位；不使用为显示而合并过的价格档。"""
+        with self._state_lock:
+            return self._footprint_raw
+
+    def _prepare_footprint(self, raw, previous, revision):
+        if raw is None:
+            self._footprint_display.clear()
+            self._footprint_merge.clear()
+            return None, None
+        fp = {"symbol": self.symbol, "tf": self.tf, "revision": revision,
+              **for_display(raw, self._footprint_display)}
+        return fp, footprint_message(fp, previous)
+
     def _empty_footprint(self, demand=True):
-        """不做足迹图的 Feed(加密、大周期)给一份空足迹, 页面切到足迹图时不会一直等快照。"""
+        """内部 10s 加密 Feed 的兼容空快照；公开足迹请求最小为 30s。"""
         self.request(demand=demand)
         with self._state_lock:
             return {"symbol": self.symbol, "tf": self.tf, "revision": self.revision,
@@ -516,7 +554,7 @@ class Feed:
     def recompute(self, broadcast):
         with self._state_lock:
             now = time.monotonic()
-            ltfs = [ltf for ltf, expires in self._requested.items() if expires >= now]
+            ltfs = sorted(ltf for ltf, expires in self._requested.items() if expires >= now)
             want_fp = self._fp_until >= now
             demand_version = self._demand_version
             previous = dict(self.snapshots)
@@ -539,16 +577,20 @@ class Feed:
         valid_klines = self.klines.dropna(subset=["datetime", "close"])
         if valid_klines.empty:
             return
-        if any(ltf > 0 for ltf in ltfs):
-            self.save_kline_volumes(valid_klines)
         first_bar_ns = int(valid_klines.datetime.iloc[0])
         # 检测器本轮已喂完 tick, 这时才取它的改动; 大额汇总只重做改到的那几根(见 _records)
         self._start_round()
         # K 线与 tick 汇总从上一轮到现在最早改到哪根(展示秒): 平时只有最后一两根, 只算尾部(见 _tail_since)
         times = (valid_klines["datetime"] // 10**9 + TZ_SHIFT_S).astype("int64").to_numpy()
         dirty = self.analytics.dirty_from(0)
-        changed = min(self._kline_changes(valid_klines, times),
-                      dirty if not math.isfinite(dirty) else int(dirty) // 10**9 + TZ_SHIFT_S)
+        kline_changed = self._kline_changes(valid_klines, times)
+        changed = min(kline_changed, dirty if not math.isfinite(dirty) else int(dirty) // 10**9 + TZ_SHIFT_S)
+        if any(ltf > 0 for ltf in ltfs):
+            # 只在有 K 线收盘、或已收盘的被改了时才落盘: 每个 tick 都整窗口比对一遍太费
+            closed_through = int(times[-2]) if len(times) > 1 else None
+            if closed_through != self._volumes_through or kline_changed < times[-1]:
+                self.save_kline_volumes(valid_klines)
+                self._volumes_through = closed_through
         snapshots = {}
         messages = []
         revision = self.revision + 1
@@ -580,25 +622,17 @@ class Feed:
             snapshots[ltf], message = self._publish(ltf, bars, previous, revision, tail)
             if message:
                 messages.append(message)
-        fp = None
+        raw_fp = fp = None
         if want_fp and tick_bars is not None:
             coverage = dict(zip(tick_bars.time, tick_bars.coverage))
-            fp = self.analytics.footprint(self.klines, getattr(self.quote, "price_tick", None), coverage)
-            fp = {"symbol": self.symbol, "tf": self.tf, "revision": revision, **fp}
-            # 足迹更新必须带步长；步长可能在首次加载后才就绪。
-            removed = (set(bar["time"] for bar in previous_fp["bars"]) -
-                       set(bar["time"] for bar in fp["bars"])) if previous_fp else set()
-            if previous_fp is None or fp["tickSize"] != previous_fp["tickSize"] or removed:
-                messages.append({"type": "footprint_snapshot", **fp})
-            else:
-                old = {b["time"]: b for b in previous_fp["bars"]}
-                changed = [bar for bar in fp["bars"] if old.get(bar["time"]) != bar]
-                if changed:
-                    messages.append({"type": "footprints", "symbol": self.symbol, "tf": self.tf,
-                                     "revision": revision, "tickSize": fp["tickSize"], "bars": changed})
+            raw_fp = self.analytics.footprint(self.klines, getattr(self.quote, "price_tick", None), coverage)
+            fp, message = self._prepare_footprint(raw_fp, previous_fp, revision)
+            if message:
+                messages.append(message)
         with self._state_lock:
             self.snapshots = snapshots
             self.footprint = fp
+            self._footprint_raw = raw_fp
             self.revision = revision
             self._computed_version = demand_version
             self.error = None
@@ -615,6 +649,7 @@ class Feed:
         前端按「位数未知」处理, 不拿 0 位去取整(国债期货 107.85 会被取成 108)。
         """
         cfg = period_cfg(self.tf)
+        cfg["flowWaveContinuous"] = self.symbol.startswith(("BINANCE.", "OKX.", "AGG."))
         tick = getattr(self.quote, "price_tick", None)
         decs = getattr(self.quote, "price_decs", None)
         if (isinstance(tick, (int, float)) and math.isfinite(tick) and tick > 0
@@ -715,6 +750,11 @@ class Feed:
         # 增量读: 文件被其它进程(离线脚本/另一次运行)追加过时补齐内存视图,
         # 无变化时只是一次 stat, 不会重解析整个文件。
         store.refresh()
+        # 上一轮算完到现在别处(回填)改到的最早时间; 本轮自己落盘的都在窗口末尾, 在这之后才写
+        mark = self._history_marks.get(ltf)
+        moved = None
+        if self.revise_history and mark is not None and mark[0] is store:
+            moved = store.changed_since(mark[1])
         bars = self._merge_history(store, bars)
         if tail is not None:
             since, window, rebuild = tail
@@ -727,6 +767,10 @@ class Feed:
                 bars = self._merge_history(store, rebuild())
         self.latest[ltf] = (revision, bars)
         self._tail_marks[ltf] = (self._round, store, store.revision)
+        self._history_marks[ltf] = (store, store.revision)
+        # 改到了快照第一根之前: 页面上翻页取到的、滑出快照的各根累计基准变了, 要它们重读(增量消息带着 historyRevision)
+        if moved is not None and len(bars) and moved < int(bars["time"].iloc[max(len(bars) - SNAPSHOT_BARS, 0)]):
+            self.history_revision += 1
         return self._snapshot_message(ltf, bars, previous, revision, store.base)
 
     @staticmethod
@@ -761,14 +805,87 @@ class Feed:
         self._decorate_large(fresh)
         return kept, fresh
 
+    def flowwave_records(self, records, *, reference=None, series=None, context=None):
+        """只在行情线程调用。图表与警报使用同一份权威结果；各买卖口径共用 OHLCV。
+
+        series 是实时快照的增量计算器(context 给窗口之前的若干根, 见 FlowWaveSeries.update);
+        不给就整段现算(翻页)。
+        """
+        crypto = self.symbol.startswith(("BINANCE.", "OKX.", "AGG."))
+        canonical = {b["time"]: b for b in reference or []}
+        primary = None
+        if self.symbol.startswith("AGG."):
+            lookup = getattr(self, "candle_feeds", None) or getattr(self, "component_feeds", None)
+            parts = lookup() if lookup else []
+            primary = parts[0] if parts else None
+        recent, confirmed, cutoff = {}, {}, None
+        if primary is not None:
+            window = primary.latest_window(0)
+            if window is not None and not window.empty:
+                recent = dict(zip(window.time.astype(int), window.coverage.eq("complete")))
+                cutoff = int(window.time.iloc[-1]) + primary.tf
+            confirmed = primary._store(0).values
+
+        def inputs(rows):
+            out = []
+            for record in rows:
+                row = canonical.get(record["time"], record)
+                volume_ok = finite_wt2(row.get("volume")) and row["volume"] >= 0
+                price_ok = True
+                if crypto:
+                    volume_ok &= row.get("coverage") == "complete"
+                    price_ok = volume_ok
+                    if primary is not None and not price_ok:
+                        end = min(row["time"] + self.tf, cutoff) if cutoff is not None else row["time"] + self.tf
+                        slots = range(int(row["time"]), int(end), primary.tf)
+                        price_ok = bool(slots) and all(recent.get(t, t in confirmed) for t in slots)
+                out.append({**{k: row.get(k) for k in ("time", "open", "high", "low", "close", "volume")},
+                            "priceValid": price_ok, "volumeValid": bool(volume_ok)})
+            return out
+
+        if series is not None:
+            values = series.update(inputs(records), context and (lambda: inputs(context())))
+        else:
+            values = calculate_flowwave(inputs(records), tf=self.tf, continuous=crypto)
+        # _records 会复用旧快照里的 dict，必须复制后更新，才能正确生成修订消息。
+        return [record if record.get("flowWave") is value or record.get("flowWave") == value
+                else {**record, "flowWave": value} for record, value in zip(records, values)]
+
+    def _flowwave_snapshot(self, ltf, records, bars, history_revision):
+        """实时快照各根的 FlowWave。各口径开高低收量相同: 本轮已算过 tick 口径就按时间沿用它的(recompute
+        先算 tick 口径), 否则用本口径的增量计算器; 第一次算时拿窗口(bars)里快照之前的各根预热。
+
+        计算器只在第一次算时预热, 之后一直沿用窗口开头之前的状态; history_revision 变了(回填改到快照之前,
+        加密的覆盖决定价和量能不能用)就作废重建, 重新预热, 否则快照左边那截一直是按旧历史算的。"""
+        source = self._flowwave_source if ltf else None
+        if source is not None and source[0] == self._round:
+            values = {bar["time"]: bar["flowWave"] for bar in source[1]}
+            if all(record["time"] in values for record in records):
+                return [record if record.get("flowWave") is (value := values[record["time"]])
+                        or record.get("flowWave") == value else {**record, "flowWave": value} for record in records]
+        revision, series = self._flowwave.get(ltf, (None, None))
+        if series is None or revision != history_revision:
+            series = FlowWaveSeries(self.tf, self.symbol.startswith(("BINANCE.", "OKX.", "AGG.")))
+            self._flowwave[ltf] = (history_revision, series)
+        records = self.flowwave_records(records, series=series,
+                                        context=lambda: self._flowwave_context(ltf, bars, records))
+        if ltf == 0:
+            self._flowwave_source = (self._round, records)
+        return records
+
+    def _flowwave_context(self, ltf, bars, records):
+        """快照之前的若干根(time/开高低收量/覆盖), FlowWave 第一次算时预热用: 原生周期就是窗口里快照之前那截。"""
+        older = bars.iloc[:max(len(bars) - len(records), 0)]
+        return older[[c for c in FLOWWAVE_COLUMNS if c in older]].to_dict("records")
+
     def _snapshot_message(self, ltf, bars, previous, revision, cvd_base):
         """算好的 bars -> (该粒度的快照, 与上一份快照相比有变化时的增量消息或 None)。"""
         tail = bars.tail(SNAPSHOT_BARS)
         prior = previous.get(ltf)
         kept, fresh = self._records(ltf, tail, prior)
-        recs = kept + fresh
         history_source = self.base() if getattr(self, "is_rollup", False) else self
         history_source = history_source or self
+        recs = self._flowwave_snapshot(ltf, kept + fresh, bars, history_source.history_revision)
         snapshot ={"symbol": self.symbol, "contract": self.contract, "cfg": self.cfg(), "ltf": ltf,
                     "tf": self.tf,
                     "source": "tick" if ltf == 0 else "kline",
@@ -777,8 +894,8 @@ class Feed:
                     "bars": recs}
         self._record_state[ltf] = (self._round, snapshot, tail)
         old = {b["time"]: b for b in (prior or {}).get("bars", [])}
-        # 沿用的就是上一份里的同一个 dict, 不会有变化
-        changed = [bar for bar in fresh if old.get(bar["time"]) != bar]
+        # 历史修订会改变后续 WT2，OHLCV 没变化的根也必须推送更新; 沿用的是同一个 dict, 先比身份
+        changed = [bar for bar in recs if (before := old.get(bar["time"])) is not bar and before != bar]
         cfg_changed = (prior or {}).get("cfg") != snapshot["cfg"]
         message = None
         if prior is None and self.rolled:
@@ -787,7 +904,8 @@ class Feed:
             message = {"type": "snapshot", **snapshot}
         elif changed or cfg_changed:
             message = {"type": "bars", "symbol": self.symbol, "ltf": ltf,
-                       "tf": self.tf, "revision": revision, "bars": changed}
+                       "tf": self.tf, "revision": revision, "bars": changed,
+                       "historyRevision": snapshot["historyRevision"]}
             if cfg_changed:
                 message["cfg"] = snapshot["cfg"]
         return snapshot, message
@@ -896,6 +1014,7 @@ class FeedManager:
         # 常驻采集集合(见 set_pinned): 不依赖页面, 不参与闲置回收。
         self.pinned: list[tuple[str, int]] = []
         self.pin_skipped: list[tuple[str, int]] = []
+        self.background: set[tuple[str, int]] = set()  # 警报等后台消费者，不伪装成网页客户端
         # 正在执行的 SDK 调用(查询或自检)的开始时刻; 跨线程读, 用于判定连接卡死。
         self._busy_since: float | None = None
         # 最近一次收到行情数据的时刻与最近一次连接自检的时刻。
@@ -910,6 +1029,7 @@ class FeedManager:
         self.loop_hooks: list = []
         self._history_backfiller = None
         self._history_revision = 0
+        self._backfills: dict[tuple, asyncio.Task] = {}   # 后台回补(见 schedule_backfill), 同一范围只跑一个
 
     def feed_retry_error(self, feed: Feed) -> str | None:
         """失败 Feed 未过冷却期时给出可重试的错误文案; 否则返回 None(可以重订)。"""
@@ -994,8 +1114,12 @@ class FeedManager:
             raise RuntimeError(f"合约查询超时({timeout:.0f} 秒)") from None
 
     def _history_plan(self, symbol, tf, ltf, before, limit):
-        """仅检查本次主图请求的已收盘部分; 大周期取同合约 30s 的档案。"""
-        from history_paging import read_history_page
+        """仅检查本次主图请求的已收盘部分; 大周期取同合约 30s 的档案。
+
+        只看覆盖(不算 CVD 和 FlowWave)。本进程下载过的区间不再下载: 没成交的秒没有小 K 线,
+        这类 bar 下载后仍是 partial, 每次加载、翻页都重新登录下载只是白费(见 _apply_history)。
+        """
+        from history_paging import history_coverage
 
         feed = self.ensure(symbol, tf)
         if feed.klines is None:
@@ -1004,20 +1128,42 @@ class FeedManager:
         if candles.empty:
             raise RuntimeError("历史 K 线尚未就绪")
         end = before if before is not None else int(candles.time.iloc[-1]) + tf
-        page = read_history_page(self, symbol, tf, ltf, end, limit)
+        feed.request(ltf=ltf)
+        coverage = history_coverage(self, feed, tf, ltf, end, limit)
         now = time.time() + TZ_SHIFT_S
         base = feed.base() if getattr(feed, "is_rollup", False) else feed
         available = base.history_backfill.get(ltf, {}).get("availableSince", float("-inf"))
-        missing = [bar for bar in page["bars"]
-                   if bar["time"] + tf <= now and bar["coverage"] != "complete"]
-        if not missing or all(bar["time"] < available for bar in missing):
+        attempted = base.history_attempted.get(ltf, [])
+        missing = [t for t, quality in coverage if t + tf <= now and quality != "complete"
+                   and not any(lo <= t and t + tf <= hi for lo, hi in attempted)]
+        if not missing or all(t < available for t in missing):
             return None
-        return base, base.contract, int(missing[0]["time"]), int(missing[-1]["time"]) + tf
+        return base, base.contract, int(missing[0]), int(missing[-1]) + tf
 
-    def _apply_history(self, base, contract, ltf, main, lower):
-        """在采集线程保存回补结果并更新全部同合约周期, 主力换月后的迟到结果不并入新月份。"""
+    @staticmethod
+    def _mark_attempted(base, ltf, since, until):
+        """记下下载过的区间, 相邻、重叠的并成一段。"""
+        spans = sorted([*base.history_attempted.get(ltf, []), (since, until)])
+        merged = [spans[0]]
+        for lo, hi in spans[1:]:
+            if lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        base.history_attempted[ltf] = merged
+
+    def _apply_history(self, base, contract, ltf, main, lower, since=None, until=None):
+        """在采集线程保存回补结果并更新全部同合约周期, 主力换月后的迟到结果不并入新月份。
+
+        since/until 是这次下载的区间, 给了就在存好后记为已下载过(无论核对是否通过, 再下一次结果相同);
+        保存出错的不记, 下次加载、翻页到这里还会重下。
+        """
         if base.contract != contract:
             return False
+        if main.empty:
+            if since is not None:
+                self._mark_attempted(base, ltf, since, until)
+            return True          # 整段休市(节假日): 没有可保存的 K 线
         limitation = main.attrs.get("historyLimit")
         feeds = sorted([f for f in self._feed_list() if f.contract == contract and
                         (f is base or (getattr(f, "is_rollup", False) and f.base() is base))],
@@ -1035,8 +1181,8 @@ class FeedManager:
         store.refresh()
         before = store.revision
         store.save_completed(store.merge(bars), final=True)
-        if not bars.coverage.eq("complete").any() and limitation is None:
-            raise RuntimeError("小周期历史不足或成交量核对不通过，请重试")
+        if since is not None:
+            self._mark_attempted(base, ltf, since, until)
         if store.revision == before and base.volume_history().revision == volume_revision and not status_changed:
             return True
         self._history_revision += 1
@@ -1066,12 +1212,38 @@ class FeedManager:
         while since < end:
             until = min(end, since + CHUNK_SECONDS)
             main, lower = await self._history_backfiller.fetch(contract, base.tf, ltf, since, until)
-            applied = await self.query(lambda _: self._apply_history(base, contract, ltf, main, lower))
+            applied = await self.query(lambda _: self._apply_history(base, contract, ltf, main, lower,
+                                                                     since, until))
             if not applied:
                 raise RuntimeError("主力合约已换月，请重新加载历史")
             if main.attrs.get("historyLimit"):
                 break  # 免费序列已取到最大窗口, 继续请求更早区间不会产生新数据。
             since = until
+
+    def schedule_backfill(self, symbol, tf, ltf, before=None, limit=SNAPSHOT_BARS):
+        """在后台回补(只能在事件循环里调用): 下载可能要几分钟甚至失败, 不能挡住出图和翻页。
+
+        补好后 _apply_history 重算并推送 history 通知, 页面据此重读已加载的范围。同一范围同时只跑一个;
+        失败只记日志, 下次加载或翻页到这里再试(下载成功过的区间不会再下, 见 _history_plan)。
+        """
+        if ltf <= 0:
+            return None
+        key = (symbol, tf, ltf, before, limit)
+        task = self._backfills.get(key)
+        if task is not None and not task.done():
+            return task
+
+        async def run():
+            try:
+                await self.backfill_history(symbol, tf, ltf, before, limit)
+            except Exception as exc:
+                print(f"[ingest] {symbol} {tf}s 的 {ltf} 秒历史回补失败: {exc}", flush=True)
+            finally:
+                if self._backfills.get(key) is asyncio.current_task():
+                    del self._backfills[key]
+
+        task = self._backfills[key] = asyncio.get_running_loop().create_task(run())
+        return task
 
     def _run_jobs(self, api):
         """执行排队中的查询; 单个查询失败只结算它自己, 不影响采集循环。"""
@@ -1304,6 +1476,23 @@ class FeedManager:
         for q, subscription in clients:
             self._send_resync(q, subscription)
 
+    def set_background(self, keys) -> dict[str, str]:
+        """保留后台所需的周期，仍遵守总订阅上限；释放后进入普通闲置回收。"""
+        wanted = set(feed_key(validate_symbol(symbol), tf) for symbol, tf in keys)
+        errors = {}
+        with self._lock:
+            for key in self.background - wanted:
+                if key in self.feeds:
+                    self.feeds[key].request(demand=True)
+            self.background = wanted
+            for key in sorted(wanted):
+                try:
+                    if key not in self.feeds:
+                        self.ensure(*key)
+                except ValueError as exc:
+                    errors[key[0]] = str(exc)
+        return errors
+
     def set_pinned(self, keys) -> list[tuple[str, int]]:
         """设置常驻采集集合: 关掉所有页面也照常订阅、计算并落盘。
 
@@ -1380,6 +1569,7 @@ class FeedManager:
                     # 常驻采集集合; collectSkipped 是超出名额、只在页面打开时才采集的部分
                     "collecting": [feed_label(key) for key in self.pinned],
                     "collectSkipped": [feed_label(key) for key in self.pin_skipped],
+                    "background": [feed_label(key) for key in sorted(self.background)],
                     # 诊断"连接卡死"用: 排队查询数、当前调用已耗时、安静多久、上次自检结果
                     "jobQueue": self.jobs.qsize(),
                     "busySec": busy,
@@ -1399,7 +1589,7 @@ class FeedManager:
         """
         now = time.monotonic() if now is None else now
         with self._lock:
-            busy = {key[:2] for key in self.clients.values()} | set(self.pinned)
+            busy = {key[:2] for key in self.clients.values()} | set(self.pinned) | self.background
             # 按 Feed 判定: 主力和借用它的固定月份有一个还在用, 就整个留着
             owned = {}
             for key, feed in self.feeds.items():

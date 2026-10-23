@@ -22,6 +22,7 @@ from crypto_feed import IDLE_RECOMPUTE_SEC, VENUE_NAMES, large_trade_source, rol
 from indicator import (BAR_COLUMNS, DEFAULT_TF_SEC, NATIVE_TFS, TZ_SHIFT_S, VOLUME_ROUND, finalize_bars,
                        ltf_options)
 from ingest import feed_key
+from footprint import MIN_TF as FOOTPRINT_MIN_TF, combine as combine_footprints
 
 PREFIX = "AGG."
 SYNC_SEC = 30.0              # 每隔多久用各交易所的历史文件补一次汇总的历史文件
@@ -36,6 +37,8 @@ def components_of(base: str) -> list[str]:
 
 class AggregateFeed(ingest.Feed):
     """多所汇总的一个主周期; 只在管理线程里重算。"""
+
+    revise_history = True     # 补齐历史时通知页面重读翻页历史(见 ingest.Feed._publish)
 
     def __init__(self, symbol: str, tf: int, components: list[str], price_digits: int, qty_digits: int):
         super().__init__(symbol, tf)
@@ -54,6 +57,7 @@ class AggregateFeed(ingest.Feed):
         self._synced = {}
         # ltf -> (轮次, 各家 Feed, 各家这一粒度的历史文件, 算完时各自的版本, 各家窗口的起点), 见 _parts_since
         self._part_marks = {}
+        self.component_feeds = lambda: []
 
     def _new_large_detector(self):
         """大额事件来自各成分合约自己的检测器(见 recompute), 汇总不自建。"""
@@ -66,7 +70,15 @@ class AggregateFeed(ingest.Feed):
         return {**super().cfg(), "priceDigits": self.price_digits, "volumeDigits": self.qty_digits}
 
     def footprint_snapshot(self, demand=True):
-        return self._empty_footprint(demand)
+        if self.tf < FOOTPRINT_MIN_TF:
+            return self._empty_footprint(demand)
+        return super().footprint_snapshot(demand)
+
+    def request(self, ltf=None, footprint=False, demand=False):
+        super().request(ltf=ltf, footprint=footprint, demand=demand)
+        for feed in self.component_feeds():
+            if feed is not None:
+                feed.request(ltf=ltf, footprint=footprint, demand=demand)
 
     def sync_history(self, manager):
         """各交易所历史文件里都完整的 bar, 相加后写进汇总自己的历史文件(只补没有或不一样的)。
@@ -211,9 +223,11 @@ class AggregateFeed(ingest.Feed):
                                    if feed_key(symbol, self.tf) in manager.feeds else [self._large_missing[symbol]])]
         with self._state_lock:
             now = time.monotonic()
-            ltfs = [ltf for ltf, expires in self._requested.items() if expires >= now]
+            ltfs = sorted(ltf for ltf, expires in self._requested.items() if expires >= now)
+            want_fp = self._fp_until >= now
             demand_version = self._demand_version
             previous = dict(self.snapshots)
+            previous_fp = self.footprint
         self._start_round()
         parts = [manager.feeds.get(feed_key(symbol, self.tf)) for symbol in self.components]
         # 各家逐笔成交窗口从上一轮到现在最早改到哪根(展示秒), 见 _parts_since
@@ -244,8 +258,19 @@ class AggregateFeed(ingest.Feed):
                                          starts)
             if message:
                 messages.append(message)
+        raw_fp = None
+        if want_fp:
+            sources = [feed.footprint_source() if feed is not None else None for feed in parts]
+            # 等待已经建好的成分 Feed 处理新需求；真正缺所时仍可显示已收到的部分。
+            if all(feed is None or source is not None for feed, source in zip(parts, sources)):
+                raw_fp = combine_footprints(sources, self._footprint_merge)
+        fp, message = self._prepare_footprint(raw_fp, previous_fp, revision)
+        if message:
+            messages.append(message)
         with self._state_lock:
             self.snapshots = snapshots
+            self.footprint = fp
+            self._footprint_raw = raw_fp
             self.revision = revision
             self._computed_version = demand_version
             self.error = None
@@ -280,14 +305,12 @@ class AggregateBook:
         parts = self.components(symbol)
         if not parts:
             raise ValueError(f"不支持的多所汇总 {symbol}(至少要两个交易所都有这个币的 USDT 永续)")
-        primary = self.manager.instrument(parts[0])
-        qty_digits = max(self.manager.instrument(part).qty_digits for part in parts)
         with self.manager._lock:
             self.manager._demand[symbol] = time.monotonic()
             for period in NATIVE_TFS:
                 key = feed_key(symbol, period)
                 if key not in self.feeds:
-                    self.feeds[key] = AggregateFeed(key[0], period, parts, primary.price_digits, qty_digits)
+                    self.ensure_feed(symbol, period)
             feed = self.feeds[feed_key(symbol, tf)]
         feed.request(demand=True)
         # 各交易所的 Feed 要马上建好(页面在等快照), 不等下一轮同步
@@ -333,7 +356,7 @@ class AggregateBook:
         now = time.monotonic()
         # 与 ensure(HTTP 线程)同一把锁: 增删 feeds 时不能和页面新建汇总撞在一起
         with manager._lock:
-            watched = {(symbol, tf) for symbol, tf, _ in manager.clients.values()}
+            watched = {subscription[:2] for subscription in manager.clients.values()}
             watched |= rollup_bases(watched)      # 汇总的大周期由汇总的 30s 合成
             wanted = set(manager.pinned_aggregates()) | {symbol for symbol in manager._demand
                                                          if venue_of(symbol) == "AGG"}
@@ -375,3 +398,5 @@ class AggregateBook:
         primary = self.manager.instrument(parts[0])
         qty_digits = max(self.manager.instrument(part).qty_digits for part in parts)
         self.feeds[feed_key(symbol, tf)] = AggregateFeed(symbol, tf, parts, primary.price_digits, qty_digits)
+        self.feeds[feed_key(symbol, tf)].component_feeds = lambda: [
+            self.manager.feeds.get(feed_key(part, tf)) for part in parts]

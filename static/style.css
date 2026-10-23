@@ -211,6 +211,13 @@ body { display: flex; flex-direction: column; }
   min-height: 0;
 }
 .chart-view + .chart-view { border-left: 1px solid #2a2e39; }
+.footprint-info {
+  position: absolute; z-index: 3; top: 42px; left: 12px; max-width: calc(100% - 110px);
+  padding: 0 6px; border-radius: 3px; background: rgba(19, 23, 34, 0.82);
+  color: #9598a1; font-size: 11px; line-height: 18px; cursor: help;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.footprint-info[hidden] { display: none; }
 .history-hint {
   position: absolute; top: 42px; left: 50%; transform: translateX(-50%); z-index: 6;
   padding: 5px 10px; border: 1px solid #363c4b; border-radius: 4px;
@@ -281,7 +288,7 @@ body { display: flex; flex-direction: column; }
 .paper-toast.error { color: #f7525f; }
 .paper-toast[hidden] { display: none; }
 
-/* 每张图的左上角(也就是主图窗格的左上角): 周期下拉框, 下面挂主图指标图例。
+/* 每张图的左上角(也就是主图窗格的左上角): 周期与视图下拉框, 下面挂主图指标图例。
    容器不挡十字光标, 只有下拉框和图例的每一行接收鼠标(选周期、悬停看说明、点眼睛) */
 .chart-corner {
   position: absolute;
@@ -294,7 +301,7 @@ body { display: flex; flex-direction: column; }
   gap: 3px;
   pointer-events: none;
 }
-.tf-select, .pane-select {
+.tf-select, .view-select, .fp-mode-select, .pane-select {
   padding: 0 4px;
   border: 1px solid #2a2e39;
   border-radius: 3px;
@@ -306,7 +313,8 @@ body { display: flex; flex-direction: column; }
   pointer-events: auto;
 }
 .tf-select { color: #f0b90d; font-weight: 600; }
-.tf-select option, .pane-select option { background: #1e222d; color: #d1d4dc; }
+.tf-select option, .view-select option, .fp-mode-select option, .pane-select option { background: #1e222d; color: #d1d4dc; }
+.fp-mode-select[hidden] { display: none; }
 .chart-corner { max-width: calc(100% - 100px); }   /* 不压到右边的价格轴 */
 .chart-corner-row {
   display: flex;

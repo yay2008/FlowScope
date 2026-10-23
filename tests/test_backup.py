@@ -1,8 +1,10 @@
 """data/ 快照备份: 打包内容、保留规则、到期判定与失败隔离。"""
 import os
 import tempfile
+import threading
 import unittest
 import zipfile
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -38,6 +40,64 @@ class BackupTests(unittest.TestCase):
         second = backup.create_snapshot(self.data, inner, NOW + timedelta(hours=1))
         with zipfile.ZipFile(second) as archive:
             self.assertFalse(any(name.startswith("backups/") for name in archive.namelist()))
+
+    def test_live_alert_database_is_backed_up_as_consistent_sqlite(self):
+        path = self.data / "alerts.sqlite3"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE events(id TEXT)")
+            connection.execute("INSERT INTO events VALUES ('saved-alert')")
+            connection.commit()
+            snapshot = backup.create_snapshot(self.data, self.dest, NOW)
+            with zipfile.ZipFile(snapshot) as archive:
+                self.assertFalse(any(n.endswith(("-wal", "-shm")) for n in archive.namelist()))
+                restored = self.dest / "restored.sqlite3"
+                restored.write_bytes(archive.read("alerts.sqlite3"))
+            db = sqlite3.connect(restored)
+            try:
+                self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                self.assertEqual(db.execute("SELECT id FROM events").fetchone()[0], "saved-alert")
+            finally:
+                db.close()
+        finally:
+            connection.close()
+
+    def test_corrupt_database_is_copied_raw_and_does_not_abort_the_snapshot(self):
+        (self.data / "alerts.sqlite3").write_bytes(b"not a database at all" * 10)
+        (self.data / "favorites.json").write_text("[]", encoding="utf-8")
+        with patch("builtins.print"):
+            snapshot = backup.create_snapshot(self.data, self.dest, NOW)
+        with zipfile.ZipFile(snapshot) as archive:
+            self.assertEqual(archive.read("alerts.sqlite3"), b"not a database at all" * 10)
+            self.assertEqual(archive.read("favorites.json"), b"[]")
+
+    def test_database_locked_by_another_writer_is_copied_raw_instead_of_waiting_forever(self):
+        path = self.data / "alerts.sqlite3"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("CREATE TABLE events(id TEXT)")
+            connection.commit()
+            connection.execute("BEGIN EXCLUSIVE")       # 别的进程长时间占着写锁
+            done = {}
+
+            def run():
+                with patch("builtins.print") as printed:
+                    done["snapshot"] = backup.create_snapshot(self.data, self.dest, NOW)
+                done["log"] = printed.call_args.args[0]
+
+            with patch.object(backup, "SQLITE_LOCK_WAIT_SEC", 0.2):
+                thread = threading.Thread(target=run, daemon=True)
+                thread.start()
+                thread.join(10)
+            self.assertFalse(thread.is_alive(), "锁不放时备份不能一直卡住")
+            self.assertIn("直接复制", done["log"])
+            with zipfile.ZipFile(done["snapshot"]) as archive:
+                self.assertEqual(archive.read("alerts.sqlite3"), path.read_bytes())
+                self.assertEqual(archive.read("sub/favorites.json"), b"{}")
+        finally:
+            connection.rollback()
+            connection.close()
 
     def test_retention_keeps_last_week_and_newest_of_each_older_week(self):
         for days in [0, 1, 6, 8, 9, 15, 16, 100]:

@@ -35,6 +35,10 @@ from paper_crypto import CryptoPaperService
 from trade_review import ReviewHistory, TradeReviewService, validate_account
 from training import TrainingService
 from training_api import TrainingDownloads, make_training_router
+from wt2_alerts import AlertService, AlertStore
+from windows_notifications import WindowsNotifier
+from footprint import MIN_TF as FOOTPRINT_MIN_TF
+from pydantic import BaseModel, StrictBool
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "KQ.m@SHFE.fu"
@@ -55,6 +59,8 @@ catalog = CatalogService(lambda: manager)
 # 自选文件落在数据目录里(DATA_DIR 在调用时现取, 便于测试/预览替换)。
 favorites = FavoritesService(lambda: manager,
                              FavoriteStore(lambda: os.path.join(ingest.DATA_DIR, FAVORITES_FILE)))
+alerts = AlertService(AlertStore(lambda: os.path.join(ingest.DATA_DIR, "alerts.sqlite3")),
+                      lambda: favorites.symbols(), lambda: manager, lambda: crypto, WindowsNotifier())
 backups = BackupScheduler(lambda: ingest.DATA_DIR)
 # 模拟交易账户同样落在数据目录里, 随定期快照一起备份。
 paper = PaperService(lambda: manager,
@@ -121,15 +127,21 @@ async def _startup():
         manager.loop_hooks.append(paper.on_loop)
     if crypto_paper.on_cycle not in crypto.loop_hooks:
         crypto.loop_hooks.append(crypto_paper.on_cycle)
+    if alerts.on_futures not in manager.loop_hooks:
+        manager.loop_hooks.append(alerts.on_futures)
+    if alerts.on_crypto not in crypto.loop_hooks:
+        crypto.loop_hooks.append(alerts.on_crypto)
     manager.start(asyncio.get_running_loop())
     crypto.start(asyncio.get_running_loop())
     sync_collection()
+    alerts.start()
     backups.start()
 
 
 @app.on_event("shutdown")
 async def _shutdown():
     training_downloads.stop()
+    alerts.stop()
     manager.stop()
     crypto.stop()
     backups.stop()
@@ -155,9 +167,10 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_
     source = manager_for(symbol)
 
     if before is not None:
+        if isinstance(source, FeedManager) and ltf > 0 and since is None:
+            # 小周期回补在后台跑, 先返回现有的这一页; 补好后页面收到 history 通知再重读
+            source.schedule_backfill(symbol, tf, ltf, before, limit)
         try:
-            if isinstance(source, FeedManager) and ltf > 0 and since is None:
-                await source.backfill_history(symbol, tf, ltf, before, limit)
             page = await source.query(lambda _: read_history_page(source, symbol, tf, ltf, before, limit, since))
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -171,16 +184,8 @@ async def history(symbol: str = DEFAULT_SYMBOL, ltf: int = 0, tf: int = DEFAULT_
         snapshot = feed.snapshot_for(ltf)
         if snapshot is not None:
             if isinstance(source, FeedManager) and ltf > 0:
-                try:
-                    await source.backfill_history(symbol, tf, ltf)
-                except RuntimeError as exc:
-                    raise HTTPException(status_code=503, detail=f"历史 K 线回补失败: {exc}") from exc
-                if not source.serves(symbol, tf, feed):
-                    feed = require_feed(symbol, tf)
-                    continue
-                snapshot = feed.snapshot_for(ltf)
-                if snapshot is None:
-                    continue
+                # 下载可能要几分钟甚至失败, 不能挡住出图: 后台回补, 补好后经推送更新
+                source.schedule_backfill(symbol, tf, ltf)
             return {**snapshot, "symbol": symbol}
         # 订阅失败(含冷却期内的重试中)都走这里, 不再等到 90 秒超时才回话。
         retry_error = source.feed_retry_error(feed)
@@ -318,6 +323,30 @@ async def watch(symbols: str = "", refresh: bool = False):
             "error": payload["error"]}
 
 
+class AlertSettings(BaseModel):
+    enabled: StrictBool
+    symbol: str | None = None
+
+
+@app.get("/api/alerts")
+def alert_status():
+    return alerts.snapshot()
+
+
+@app.post("/api/alerts/settings")
+def alert_settings(settings: AlertSettings):
+    try:
+        alerts.configure(settings.enabled, settings.symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return alerts.snapshot()
+
+
+@app.post("/api/alerts/test", status_code=202)
+def alert_test():
+    return alerts.test_notification()
+
+
 @app.get("/api/footprint")
 async def footprint(symbol: str = DEFAULT_SYMBOL, tf: int = DEFAULT_TF_SEC):
     """返回 tick 窗口内各 bar 的分价位买卖量矩阵(足迹图)，口径同 ltf=0。
@@ -326,6 +355,8 @@ async def footprint(symbol: str = DEFAULT_SYMBOL, tf: int = DEFAULT_TF_SEC):
     快照未就绪时最多等 90 秒(闭市回填慢)；历史覆盖取决于 tick 窗口和持续采集。
     """
     tf = validate_tf(tf)
+    if tf < FOOTPRINT_MIN_TF:
+        raise HTTPException(status_code=400, detail="足迹图最小周期为 30 秒")
     feed = require_feed(symbol, tf)
     symbol = validate_symbol(symbol)
     source = manager_for(symbol)
@@ -570,6 +601,8 @@ async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, f
     try:
         symbol = validate_symbol(symbol)
         tf = validate_tf(tf)
+        if footprint and tf < FOOTPRINT_MIN_TF:
+            raise ValueError("足迹图最小周期为 30 秒")
         source = manager_for(symbol)
         feed = source.ensure(symbol, tf)
         if ltf not in ltf_options(tf):
@@ -615,12 +648,15 @@ async def ws(websocket: WebSocket, symbol: str = DEFAULT_SYMBOL, ltf: int = 0, f
                 await websocket.close(code=1013, reason="客户端积压，请重取快照")
                 return
             is_fp = msg.get("type") in {"footprints", "footprint_snapshot"}
-            revision = msg.get("revision", -1)
-            if revision <= (fp_revision if is_fp else bar_revision):
+            # 历史回补通知(history)不带 revision, 不参与新旧判断, 也不推进 bar 的 revision
+            revision = msg.get("revision")
+            if revision is not None and revision <= (fp_revision if is_fp else bar_revision):
                 continue
             if msg.get("symbol") == symbol:
                 await websocket.send_json(msg)
-                if is_fp:
+                if revision is None:
+                    pass
+                elif is_fp:
                     fp_revision = revision
                 else:
                     bar_revision = revision

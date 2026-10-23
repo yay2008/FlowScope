@@ -130,7 +130,13 @@ function createChartStub() {
     record.series.push(entry);
     return {
       _record: record,
-      setData(data) { entry.data = data; }, update() {}, setMarkers() {},
+      setData(data) { entry.data = data; },
+      update(data) {
+        entry.data ||= [];
+        const index = entry.data.findIndex(item => item.time === data.time);
+        if (index < 0) entry.data.push(data); else entry.data[index] = data;
+      },
+      setMarkers() {},
       applyOptions(options) { record.applied.push(options); entry.applied.push(options); },
       createPriceLine(options) { createdPriceLines.push(options); return { applyOptions() {} }; }, removePriceLine() {},
       priceScale() {
@@ -171,7 +177,7 @@ function createChartStub() {
   };
 }
 
-// 页面默认左 30s、右 5m; 多数用例按 10s、30s 两张图写(10s 有足迹图、两图差 3 倍), 所以默认先记下这两个周期,
+// 页面默认左 30s、右 5m; 多数用例按 10s、30s 两张图写(两图差 3 倍), 所以默认先记下这两个周期,
 // 测默认周期的用例传 { chartTfs: null }。
 function createLocalStorage({ chartTfs = "[10,30]" } = {}) {
   const data = new Map();
@@ -857,7 +863,6 @@ test("工具栏默认值与 app.js 初始状态一致", () => {
   // 下拉框的默认选项写在两处: index.html 的 selected 和 app.js 的初始状态。
   // 只改一处就会出现"页面显示 A、实际按 B 渲染", 这里把两处钉在一起。
   const table = [
-    ["view", /\bview: "([^"]+)"/],
     ["cvd-source", /\bcvdSource: "([^"]+)"/],
   ];
   for (const [id, pattern] of table) {
@@ -919,8 +924,8 @@ test("工具栏的周期下拉框已移除: 默认 30s、5m 两张图左右并�
   for (const corner of corners) {
     assert.equal(corner.children[0].className, "chart-corner-row");
     assert.deepEqual(corner.children[0].children.map((node) => node.className),
-                     ["tf-select", "measure-btn", "vp-btn", "measure-hint", "readout"],
-                     "周期下拉框右边是测量与成交量分布按钮, 再往右是价格读数");
+                     ["tf-select", "view-select", "fp-mode-select", "measure-btn", "vp-btn", "measure-hint", "readout"],
+                     "周期与视图下拉框(足迹视图下还有显示模式框)右边是测量与成交量分布按钮, 再往右是价格读数");
     assert.equal(corner.children[1].className, "main-legend", "主图图例应挂在周期标签下面");
   }
 });
@@ -1127,8 +1132,15 @@ const selectLargeSize = (context, index, value) => {
   select.handlers.change[0]();
 };
 const bandKOf = (context, index) => findByClass(legendRow(context, index, "band"), "ml-params");   // 带宽按钮
-const viewSetter = (context) => (value) =>
-  context.document.getElementById("view").handlers.change[0]({ target: { value } });
+const viewSelectOf = (context, index) => findByClass(chartEl(context, index), "view-select");
+// 不指定区域的旧回归用例, 分别操作两张图的选择框。
+const viewSetter = (context, index = null) => (value) => {
+  for (const i of index == null ? [0, 1] : [index]) {
+    const select = viewSelectOf(context, i);
+    select.value = value;
+    select.handlers.change[0]();
+  }
+};
 
 const obPrimitiveOf = (index) => stubCharts[index].primitives.find((p) => p.constructor.name === "ObZonesPrimitive");
 const obInput = (ctx, index, key) => findByClass(legendRow(ctx, index, "ob"), `ob-${key}`);
@@ -1397,6 +1409,20 @@ test("向左翻页: 同时只请求一页, 按响应到达时的视口定位, �
   assert.equal(h.hint().hidden, false);
 });
 
+test("断线太久: 重连快照与已有 K 线接不上就整份替换, 翻页从快照起点重新取", async () => {
+  const h = await pagingBrowser();
+  h.scale.setVisibleLogicalRange({ from: 0, to: 100 }); h.fire();
+  await h.resolve(h.requests[0], h.all.slice(100, 900));
+  assert.equal(h.bars().length, 1600);
+  const later = Array.from({ length: 800 }, (_, i) => ({ ...h.all[0], time: h.all[1699].time + (i + 100) * 30 }));
+  h.send({ type: "snapshot", revision: 5, bars: later });
+  assert.equal(h.bars().length, 800, "缺口两边不能拼在一起");
+  assert.equal(h.bars()[0].time, later[0].time);
+  h.scale.setVisibleLogicalRange({ from: 0, to: 100 });
+  h.fire();
+  assert.equal(Number(h.requests.at(-1).parsed.searchParams.get("before")), later[0].time);
+});
+
 test("向左翻页: 失败保留图表与实时连接, 点击提示可重试", async () => {
   const h = await pagingBrowser();
   h.scale.setVisibleLogicalRange({ from: 0, to: 100 }); h.fire();
@@ -1438,7 +1464,7 @@ test("向左翻页: 旧合约请求在主力换月后失效", async () => {
 });
 
 test("大额成交: 买卖两侧各画一个点, 大小按该侧量, 对冲不抵消, 只有未知方向不画, 悬停保留买卖明细", () => {
-  const storage = createLocalStorage();
+  const storage = createLocalStorage({ chartTfs: "[30,30]" });
   const context = runBrowser({ localStorage: storage });
   selectLargeSize(context, 0, 0);
   selectLargeSize(context, 1, 0);
@@ -1549,7 +1575,7 @@ test("大额成交尺寸筛选: 两侧两层包含半径边界, 隐藏点不悬�
   assert.equal(select.value, "16");
   viewSetter(context)("footprint");
   assert.equal(p.geometry().length, 0);
-  viewSetter(context)("candles");
+  viewSetter(context)("candle");
   assert.deepEqual(sizes(p.geometry()), sizes(before.filter(m => m.r >= 16)));
   vm.runInContext("charts[1].setTf(60)", context);
   assert.equal(select.value, "16", "切周期保留选择");
@@ -1781,7 +1807,7 @@ test("截止标记: HTTP/WS 共用合约时段, 配置单独补到也更新, 换
     open: 3000, high: 3002, low: 2999, close: 3001, volume: 100,
     buy: 60, sell: 40, delta: 20, cvd: 20, coverage: "complete" };
   const sockets = [];
-  const context = runBrowser({ fetch: (url) => {
+  const context = runBrowser({ localStorage: createLocalStorage({ chartTfs: "[30,30]" }), fetch: (url) => {
     const request = new URL(String(url), "http://local/");
     if (request.pathname !== "/api/history") return stubFetch(url);
     return Promise.resolve(jsonResponse({ cfg, bars: [bar], ltf: 0 }));
@@ -2429,6 +2455,185 @@ test("自定义 series 只画 visibleRange 内的 bar: 区间外的旧坐标不�
   assert.ok(r.fpXs.every((x) => x > r.stale + 1000), `足迹用到了区间外的旧坐标: ${r.fpXs}`);
 });
 
+test("足迹不平衡门槛随典型半格量自适应: 加密随币量缩放, 期货另有 10 手下限", () => {
+  const context = runBrowser();
+  const result = JSON.parse(vm.runInContext(`JSON.stringify((() => {
+    // 不平衡把触发的那半格涂成实色; history 是此前的完整足迹(门槛由渲染器按显示档自己算), 只画最后一根
+    function draw(levels, crypto, history = [[[100, .01, .01, 0]]], coverage = "complete") {
+      const fills = [];
+      const ctx = { fillRect() { fills.push(this.fillStyle); }, fillText() {}, strokeRect() {} };
+      const items = [...history, levels].map((rows, i) => ({ x: 100, originalData: {
+        barTime: i + 1, levels: rows, coverage: i === history.length ? coverage : "complete" } }));
+      const fp = new ChartView.FootprintRenderer();
+      fp.update({ barSpacing: 60, visibleRange: { from: history.length, to: items.length }, bars: items },
+                { tickSize: 1, priceTick: 1, lots: !crypto });
+      fp.draw({ useMediaCoordinateSpace: fn => fn({ context: ctx }) }, p => -p * 20);
+      return fills.filter(color => color === "#00e676" || color === "#f23645");
+    }
+    return {
+      scales: [0.000001, 1, 1000000].map(scale =>
+        draw([[100, 0, scale, 0], [101, 4 * scale, 0, 0]], true, [[[100, scale, scale, 0]]])),
+      sell: draw([[100, 0, .02]], true),
+      dust: draw([[100, .000001, 0]], true),
+      balanced: draw([[100, 0, .01], [101, .02, 0]], true),
+      partial: draw([[100, 100, 0]], true, undefined, "partial"),
+      futuresNine: draw([[100, 9, 0]], false),
+      futuresTen: draw([[100, 10, 0]], false),
+      futuresSell: draw([[100, 0, 10]], false),
+      futuresRatio: draw([[100, 0, 4], [101, 11, 0]], false),
+      // 此前完整足迹的典型半格量是 50 手: 门槛跟着升到 50, 合档后量大的品种不会满屏不平衡
+      futuresBusyBelow: draw([[100, 40, 0]], false, [[[100, 50, 50, 0]]]),
+      futuresBusyAbove: draw([[100, 60, 0]], false, [[[100, 50, 50, 0]]]),
+    };
+  })())`, context));
+  assert.deepEqual(result.scales, [["#00e676"], ["#00e676"], ["#00e676"]],
+    "比例与相对成交量相同，不能因币数量级不同而改变不平衡");
+  assert.deepEqual(result.sell, ["#f23645"]);
+  for (const key of ["dust", "balanced", "partial", "futuresNine", "futuresRatio", "futuresBusyBelow"]) {
+    assert.deepEqual(result[key], [], key);
+  }
+  assert.deepEqual(result.futuresTen, ["#00e676"]);
+  assert.deepEqual(result.futuresSell, ["#f23645"]);
+  assert.deepEqual(result.futuresBusyAbove, ["#00e676"]);
+  const minimum = (value, lots) => vm.runInContext(
+    `ChartView.FootprintRenderer.minimum(new Map([[1, ${value}]]), 1, ${lots})`, context);
+  assert.deepEqual([minimum(23.4, true), minimum(3.2, true), minimum(3.2, false), minimum(null, true)],
+    [23.4, 10, 3.2, Infinity], "期货取自适应门槛与 10 手的较大者, 加密原样, 没有门槛就不标");
+});
+
+test("足迹按行高合档、按格宽分数字/量柱/蜡烛三级, POC 与不平衡缩小后照样画", () => {
+  const context = runBrowser();
+  const r = JSON.parse(vm.runInContext(`JSON.stringify((() => {
+    // 一根 40 个价位(最小价位 1、底档 1), 120 价位成交最多, 125 买方对角不平衡
+    const levels = Array.from({ length: 40 }, (_, i) => [100 + i, i === 20 ? 50 : 5, i === 20 ? 50 : 5, 0]);
+    levels[25][1] = 400;
+    function draw(barSpacing, pxPerTick) {
+      const calls = { text: [], fills: [], frames: 0 };
+      const ctx = { fillRect() { calls.fills.push(this.fillStyle); }, fillText(text) { calls.text.push(text); },
+                    strokeRect() { calls.frames++; }, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {} };
+      const fp = new ChartView.FootprintRenderer();
+      fp.update({ barSpacing, visibleRange: { from: 0, to: 1 }, bars: [{ x: 300, originalData: {
+        barTime: 1, levels, coverage: "complete", open: 105, high: 139, low: 100, close: 130 } }] },
+        { tickSize: 1, priceTick: 1, lots: true });
+      fp.draw({ useMediaCoordinateSpace: fn => fn({ context: ctx }) }, p => -p * pxPerTick);
+      return { step: fp.grid().step, text: calls.text.filter(Boolean).length, frames: calls.frames,
+               imbalance: calls.fills.includes("#00e676"), candle: calls.fills.includes("#f0b90d") };
+    }
+    return { tall: draw(72, 20), short: draw(72, 2), bars: draw(20, 2), candle: draw(6, 2) };
+  })())`, context));
+  assert.equal(r.tall.step, 1, "行高够就按底档");
+  assert.ok(r.tall.text > 0 && r.tall.frames === 1 && r.tall.imbalance && r.tall.candle, JSON.stringify(r.tall));
+  assert.equal(r.short.step, 10, "每 tick 只有 2px 时并成 10 个价位一行(行高 20px)");
+  assert.ok(r.short.text > 0, "合档后仍写数字");
+  assert.equal(r.bars.step, 2, "量柱模式只要行高 3px");
+  assert.equal(r.bars.text, 0);
+  assert.ok(r.bars.frames === 1 && r.bars.imbalance, "量柱模式照样标 POC 与不平衡");
+  assert.equal(r.candle.text, 0);
+  assert.ok(r.candle.candle && r.candle.frames === 0, "蜡烛模式只画蜡烛和 POC 横线");
+});
+
+test("足迹差值模式: 每档写买减卖, 按正负染色; 写不下时从中线往两边长柱; 不平衡画在格子外侧", () => {
+  const context = runBrowser();
+  const r = JSON.parse(vm.runInContext(`JSON.stringify((() => {
+    // 100: 卖多 3; 101: 买多 40 且对角不平衡(40 >= 3 * 卖[100] 6); 102: 买卖相等
+    const levels = [[100, 3, 6, 0], [101, 40, 2, 0], [102, 5, 5, 0]];
+    function draw(barSpacing) {
+      const calls = [];
+      const ctx = { fillRect(x, y, w, h) { calls.push({ fill: this.fillStyle, x, w }); },
+                    fillText(text, x) { calls.push({ text, x, align: this.textAlign }); },
+                    strokeRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {} };
+      const fp = new ChartView.FootprintRenderer();
+      fp.update({ barSpacing, visibleRange: { from: 0, to: 1 }, bars: [{ x: 300, originalData: {
+        barTime: 1, levels, coverage: "complete" } }] },
+        { tickSize: 1, priceTick: 1, lots: true, footprintMode: "delta" });
+      fp.draw({ useMediaCoordinateSpace: fn => fn({ context: ctx }) }, p => -p * 20);
+      return calls;
+    }
+    const text = draw(72), bars = draw(30);
+    const center = bars.find(c => c.fill === "rgba(149, 152, 161, 0.3)");
+    return {
+      texts: text.filter(c => c.text).map(c => [c.text, c.align]),
+      edge: text.filter(c => c.fill === "#00e676").map(c => c.w),
+      barTexts: bars.filter(c => c.text).length,
+      sellBar: bars.find(c => c.fill?.startsWith("rgba(242, 54, 69") && c.w > 0),
+      buyBar: bars.find(c => c.fill?.startsWith("rgba(0, 230, 118") && c.w > 0),
+      center: center && center.x,
+    };
+  })())`, context));
+  assert.deepEqual(r.texts, [["-3", "center"], ["+38", "center"], ["0", "center"]]);
+  assert.equal(r.edge.length, 1, "不平衡只在买方外侧画一条实色竖条");
+  assert.ok(r.edge[0] <= 3);
+  assert.equal(r.barTexts, 0);
+  assert.ok(r.sellBar.x + r.sellBar.w <= r.center + 0.01 && r.buyBar.x >= r.center - 0.01,
+    `卖多往左、买多往右: ${JSON.stringify(r)}`);
+});
+
+test("堆叠不平衡按底档找连续 3 档同向, 延伸到后面 K 线碰到为止", () => {
+  const context = runBrowser();
+  const r = JSON.parse(vm.runInContext(`JSON.stringify((() => {
+    const zones = (items) => ChartView.FootprintRenderer.stackedZones(items, 1, 1, false,
+      new Map(items.map(d => [d.barTime, 20])));
+    // 101~103 连续买方不平衡(支撑), 实际成交到 103; 200~202 连续卖方不平衡(阻力)
+    const support = { barTime: 1, coverage: "complete",
+      levels: [[100, 0, 10, 0], [101, 40, 0, 0], [102, 40, 0, 0], [103, 40, 0, 0], [104, 0, 5, 0]] };
+    const resistance = { barTime: 1, coverage: "complete",
+      levels: [[200, 0, 40, 0], [201, 0, 40, 0], [202, 0, 40, 0], [203, 10, 0, 0]] };
+    const bar = (barTime, low, high) => ({ barTime, coverage: "complete", levels: [], low, high });
+    const gap = { ...support, levels: [[100, 0, 10, 0], [101, 40, 0, 0], [102, 40, 0, 0], [104, 40, 0, 0]] };
+    const short = { ...support, levels: [[100, 0, 10, 0], [101, 40, 0, 0], [102, 40, 0, 0]] };
+    return {
+      touched: zones([support, bar(2, 105, 110), bar(3, 103.5, 106), bar(4, 103, 104)]),
+      open: zones([resistance, bar(2, 190, 199), bar(3, 195, 199.9)]),
+      gap: zones([gap]), short: zones([short]), partial: zones([{ ...support, coverage: "partial" }]),
+      weak: ChartView.FootprintRenderer.stackedZones([support], 1, 1, false, new Map([[1, 50]])),
+    };
+  })())`, context));
+  assert.deepEqual(r.touched, [{ from: 0, to: 3, side: "buy", low: 101, high: 103 }],
+    "最低价 103.5 还没碰到成交到 103 的支撑, 103 才算碰到");
+  assert.deepEqual(r.open, [{ from: 0, to: null, side: "sell", low: 200, high: 202 }], "一直没碰到的阻力 to 为 null");
+  assert.deepEqual([r.gap, r.short, r.partial, r.weak], [[], [], [], []],
+    "中间缺一档、只有两档、部分覆盖、优势侧不够门槛都不算");
+});
+
+test("堆叠不平衡色带从出现那根的右边画起, 没碰到就画到窗格右边缘", () => {
+  const context = runBrowser();
+  const r = JSON.parse(vm.runInContext(`JSON.stringify((() => {
+    const bands = [];
+    const ctx = { fillRect(x, y, w, h) { if (this.fillStyle === "rgba(0, 230, 118, 0.13)") bands.push([x, w]); },
+                  fillText() {}, strokeRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {} };
+    const support = [[100, 0, 10, 0], [101, 40, 0, 0], [102, 40, 0, 0], [103, 40, 0, 0], [104, 0, 5, 0]];
+    const fp = new ChartView.FootprintRenderer();
+    fp.update({ barSpacing: 72, visibleRange: { from: 0, to: 2 }, bars: [
+      { x: 100, originalData: { barTime: 1, levels: support, coverage: "complete" } },
+      { x: 172, originalData: { barTime: 2, levels: [[110, 1, 1, 0]], coverage: "complete", low: 110, high: 111 } }] },
+      { tickSize: 1, priceTick: 1, lots: false });
+    fp.draw({ useMediaCoordinateSpace: fn => fn({ context: ctx, mediaSize: { width: 640 } }) }, p => -p * 20);
+    return bands;
+  })())`, context));
+  assert.equal(r.length, 1);
+  assert.ok(Math.abs(r[0][0] - (100 + 72 * 0.88 / 2)) < 1e-9, `起点是出现那根格子的右边: ${r[0]}`);
+  assert.ok(Math.abs(r[0][0] + r[0][1] - 640) < 1e-9, "没碰到就画到右边缘");
+});
+
+test("足迹数字按半格宽度缩写: 0 不写, 小于 1 省前导 0, 大数用 k/M, 过小写上限", () => {
+  const context = runBrowser();
+  const text = (v, chars) => vm.runInContext(`ChartView.footprintVolumeText(${v}, ${chars})`, context);
+  assert.deepEqual([[0, 4], [.0768, 4], [.45, 4], [12.35, 4], [275.4, 4], [12345, 4], [123456789, 4], [.0003, 4],
+    [2, 4], [.0768, 3], [27.5, 3]].map(([v, chars]) => text(v, chars)),
+    ["", ".077", ".45", "12.3", "275", "12k", "123M", "<.01", "2", ".08", "28"]);
+});
+
+test("只有期货足迹按整数手比较(10 手下限、对侧至少 1 手)", () => {
+  for (const symbol of ["BINANCE.BTCUSDT.P", "OKX.ETH-USDT-SWAP", "AGG.ZEC", "KQ.m@SHFE.fu"]) {
+    runBrowser({ search: "?symbol=" + symbol });
+    const lots = !/^(BINANCE|OKX|AGG)\./.test(symbol);
+    for (const chart of stubCharts) {
+      const fp = chart.series.find(series => series.type?.constructor?.name === "FootprintSeries");
+      assert.equal(fp.options.lots, lots, symbol);
+    }
+  }
+});
+
 test("叠加带的 custom series 满足 lightweight-charts 契约", () => {
   const context = runBrowser();
   const r = vm.runInContext(`(() => {
@@ -2667,7 +2872,7 @@ test("十字线加号: 贴住价格轴、悬停保持价位, 点击只开菜单,
 });
 
 test("十字线加号: 只在鼠标所在主图显示, 留白可选价, 离开/绘图/换视图/报价失效时收起", async () => {
-  const context = runBrowser();
+  const context = runBrowser({ localStorage: createLocalStorage({ chartTfs: "[30,30]" }) });
   await vm.runInContext("paperPanel.refresh()", context);
   feedBothCharts(context);
   const { el, button, fire, move } = paperEntryFixture(context);
@@ -2701,10 +2906,10 @@ test("十字线加号: 只在鼠标所在主图显示, 留白可选价, 离开/�
   assert.equal(button.getAttribute("aria-expanded"), "false", "缩放同时关闭旧价位菜单");
 
   move();
-  vm.runInContext('settings.view = "footprint"; charts[0].setView()', context);
+  viewSetter(context, 0)("footprint");
   move();
   assert.equal(button.hidden, true);
-  vm.runInContext('settings.view = "candles"; charts[0].setView()', context);
+  viewSetter(context, 0)("candle");
   move();
   assert.equal(button.hidden, false);
   vm.runInContext("charts[0].setPaperState(null)", context);
@@ -3190,6 +3395,219 @@ test("成交量分布: Esc 取消画了一半的; 和测量互斥; 切周期按�
 // ---------- 切换周期 ----------
 
 const tfSelectOf = (context, index) => findByClass(chartEl(context, index), "tf-select");
+
+test("左右图独立切换视图、指标与工具随本图恢复, 刷新和切合约保留选择", () => {
+  const localStorage = createLocalStorage({ chartTfs: "[30,30]" });
+  const context = runBrowser({ localStorage, fetch: historyRecorder([]) });
+  feedBothCharts(context);
+  const modes = (ctx) => [0, 1].map(index => viewSelectOf(ctx, index).value);
+  const visible = (index, footprint) => {
+    const series = stubCharts[index].series.find(s => footprint
+      ? s.type?.constructor?.name === "FootprintSeries" : s.type === "CandlestickSeries" && s.pane === 0);
+    return Object.assign({ visible: true }, series.options, ...series.applied).visible;
+  };
+  assert.deepEqual(modes(context), ["candle", "candle"]);
+  const rightApplications = stubCharts[1].applied.length;
+  viewSetter(context, 0)("footprint");
+  assert.deepEqual(modes(context), ["footprint", "candle"]);
+  assert.deepEqual([visible(0, false), visible(0, true), visible(1, false), visible(1, true)],
+    [false, true, true, false]);
+  assert.equal(stubCharts[1].applied.length, rightApplications, "切左图不刷新右图的显示开关");
+  assert.deepEqual([0, 1].map(index => legendOf(context, index).hidden), [true, false]);
+  assert.deepEqual([0, 1].map(index => findByClass(chartEl(context, index), "vp-btn").disabled), [true, false]);
+  assert.equal(vm.runInContext("charts.map(c => c.analysisInput().view).join()", context), "footprint,candle");
+
+  viewSetter(context, 1)("footprint");
+  assert.deepEqual(modes(context), ["footprint", "footprint"]);
+  viewSetter(context, 0)("candle");
+  assert.deepEqual(modes(context), ["candle", "footprint"]);
+  assert.deepEqual([0, 1].map(index => legendOf(context, index).hidden), [false, true]);
+  assert.deepEqual([0, 1].map(index => findByClass(chartEl(context, index), "vp-btn").disabled), [false, true]);
+  assert.equal(localStorage.getItem("flowscope.chartViews"), '["candle","footprint"]');
+  vm.runInContext("charts[0].setTf(60)", context);
+  assert.deepEqual(modes(context), ["candle", "footprint"], "切周期保留各自视图");
+
+  const reloaded = runBrowser({ localStorage, search: "?symbol=AGG.BTC", fetch: historyRecorder([]) });
+  assert.deepEqual(modes(reloaded), ["candle", "footprint"]);
+  assert.deepEqual([visible(0, false), visible(0, true), visible(1, false), visible(1, true)],
+    [true, false, false, true], "恢复记录时画面与选择框一致");
+  assert.deepEqual([0, 1].map(index => tfSelectOf(reloaded, index).children.find(o => o.value === "10").disabled),
+    [false, true]);
+});
+
+test("足迹显示模式只在足迹视图下出现, 左右图各记各的, 刷新后恢复", () => {
+  const localStorage = createLocalStorage({ chartTfs: "[30,30]" });
+  const context = runBrowser({ localStorage, fetch: historyRecorder([]) });
+  const modeSelect = (ctx, index) => findByClass(chartEl(ctx, index), "fp-mode-select");
+  const fpOptions = (index) => {
+    const series = stubCharts[index].series.find(s => s.type?.constructor?.name === "FootprintSeries");
+    return Object.assign({}, series.options, ...series.applied);
+  };
+  assert.deepEqual([0, 1].map(index => modeSelect(context, index).hidden), [true, true], "K 线视图下不显示");
+  assert.deepEqual([0, 1].map(index => fpOptions(index).footprintMode), ["bidask", "bidask"]);
+  viewSetter(context, 0)("footprint");
+  assert.deepEqual([0, 1].map(index => modeSelect(context, index).hidden), [false, true]);
+  const select = modeSelect(context, 0);
+  select.value = "delta";
+  select.handlers.change[0]();
+  assert.equal(fpOptions(0).footprintMode, "delta");
+  assert.equal(fpOptions(1).footprintMode, "bidask", "只换本图");
+  assert.equal(vm.runInContext("charts.map(c => c.footprintMode).join()", context), "delta,bidask");
+  assert.equal(localStorage.getItem("flowscope.footprintModes"), '["delta","bidask"]');
+  select.value = "unknown";
+  select.handlers.change[0]();
+  assert.equal(select.value, "delta", "不认识的值退回当前模式");
+
+  const reloaded = runBrowser({ localStorage, fetch: historyRecorder([]) });
+  assert.deepEqual([0, 1].map(index => modeSelect(reloaded, index).value), ["delta", "bidask"]);
+  assert.deepEqual([0, 1].map(index => fpOptions(index).footprintMode), ["delta", "bidask"]);
+  localStorage.setItem("flowscope.footprintModes", '["oops"]');
+  const fallback = runBrowser({ localStorage, fetch: historyRecorder([]) });
+  assert.deepEqual([0, 1].map(index => modeSelect(fallback, index).value), ["bidask", "bidask"]);
+});
+
+test("恢复视图: 不合法的记录独立回退, 足迹 10s 只升级本图, 存储不可用仍能切换", () => {
+  for (const [saved, expected] of [["bad json", "candle,candle"], ['{"0":"footprint"}', "candle,candle"],
+    ['["footprint","unknown"]', "footprint,candle"], ['[null,"footprint"]', "candle,footprint"]]) {
+    const localStorage = createLocalStorage({ chartTfs: "[10,10]" });
+    localStorage.setItem("flowscope.chartViews", saved);
+    const context = runBrowser({ localStorage, fetch: historyRecorder([]) });
+    assert.equal(vm.runInContext("charts.map(c => c.view).join()", context), expected);
+    assert.equal(vm.runInContext("charts.map(c => c.tf).join()", context),
+      expected.split(",").map(view => view === "footprint" ? 30 : 10).join());
+    if (expected.includes("footprint")) {
+      assert.equal(localStorage.getItem("flowscope.chartTfs"), vm.runInContext("JSON.stringify(chartTfs)", context));
+    }
+  }
+  const context = runBrowser({ localStorage: {
+    getItem() { throw new Error("storage unavailable"); },
+    setItem() { throw new Error("storage unavailable"); },
+  }, fetch: historyRecorder([]) });
+  assert.doesNotThrow(() => viewSetter(context, 0)("footprint"));
+  assert.equal(vm.runInContext("charts.map(c => c.view).join()", context), "footprint,candle");
+});
+
+test("混合视图联动: 保留各自缩放宽度, 对齐右边缘, 十字光标仍联动", () => {
+  const context = runBrowser({ fetch: historyRecorder([]) });
+  feedBothCharts(context);
+  const [ts10, ts30] = stubCharts.map(chart => chart.timeScale);
+  ts30.setVisibleLogicalRange({ from: 20, to: 60 });
+  viewSetter(context, 1)("footprint");
+  ts30.setVisibleLogicalRange({ from: 50, to: 60 });
+  near(ts10.getVisibleLogicalRange(), { from: 60, to: 180 });
+  chartEl(context, 0).handlers.pointerenter.forEach(fn => fn());
+  ts10.setVisibleLogicalRange({ from: 90, to: 210 });
+  near(ts30.getVisibleLogicalRange(), { from: 60, to: 70 });
+  stubCharts[0].crosshairHandlers[0]({ time: T0 + 1800, point: { x: 100, y: 200 }, paneIndex: 0 });
+  assert.deepEqual(stubCharts[1].crosshair.at(-1), { price: 4200, time: T0 + 1800 });
+  viewSetter(context, 1)("candle");
+  ts10.setVisibleLogicalRange({ from: 120, to: 240 });
+  near(ts30.getVisibleLogicalRange(), { from: 40, to: 80 });
+});
+
+test("足迹最小 30s: 从 10s 自动升级、禁止退回 10s，切回 K 线恢复选择", () => {
+  const calls = [], localStorage = createLocalStorage();
+  const context = runBrowser({ fetch: historyRecorder(calls), localStorage });
+  feedBothCharts(context);
+  viewSetter(context, 0)("footprint");
+  assert.equal(vm.runInContext("charts.map(c => c.tf).join()", context), "30,30");
+  assert.equal(vm.runInContext("charts[1].view", context), "candle");
+  assert.equal(tfSelectOf(context, 1).children.find(option => option.value === "10").disabled, false);
+  assert.equal(localStorage.getItem("flowscope.chartTfs"), "[30,30]");
+  const select = tfSelectOf(context, 0);
+  assert.equal(select.children.find(option => option.value === "10").disabled, true);
+  assert.equal(vm.runInContext("charts[0].bars.length", context), 0, "升周期不能留下 10s 的画面");
+  assert.equal(calls.at(-1).get("tf"), "30");
+  vm.runInContext("charts[0].setTf(10)", context);
+  assert.equal(vm.runInContext("charts[0].tf", context), 30);
+  for (const tf of [60, 300, 900, 3600, 14400, 30]) {
+    select.value = String(tf);
+    select.handlers.change[0]();
+    assert.equal(vm.runInContext("charts[0].tf", context), tf);
+    assert.equal(calls.at(-1).get("tf"), String(tf));
+    assert.equal(vm.runInContext("charts[1].tf", context), 30, "只改本图周期");
+  }
+  viewSetter(context, 0)("candle");
+  assert.equal(select.children.find(option => option.value === "10").disabled, false);
+  vm.runInContext("charts[0].setTf(10)", context);
+  assert.equal(vm.runInContext("charts[0].tf", context), 10);
+});
+
+test("加密足迹: 空快照提示采集，首批分价量可见，换周期时旧连接不能污染新图", async () => {
+  const symbol = "AGG.ZEC", sockets = [];
+  const cfg = { mult: [1.5, 2.5, 3.5], rellen: 20, smalen: 300, zlen: 50, tf: 30,
+    colors: { up: "#ccc", down: "#555", upLevels: ["#ccc", "#ccc", "#ccc"], downLevels: ["#555", "#555", "#555"] } };
+  const bar = { time: T0, open: 100, high: 102, low: 99, close: 101, volume: 3,
+    buy: 1, sell: 2, delta: -1, cvd: -1, coverage: "complete" };
+  const context = runBrowser({ search: `?symbol=${symbol}`,
+    localStorage: createLocalStorage({ chartTfs: "[30,30]" }), fetch: (url) => {
+      if (!String(url).startsWith("/api/history")) return stubFetch(url);
+      const tf = Number(new URL(url, "http://local/").searchParams.get("tf"));
+      return Promise.resolve(jsonResponse({ symbol, tf, cfg: { ...cfg, tf }, bars: [bar], ltf: 0 }));
+    } });
+  context.WebSocket = class {
+    constructor(url) { this.url = url; sockets.push(this); }
+    close() { this.closed = true; }
+  };
+  await new Promise(resolve => setImmediate(resolve));
+  const [oldLeft, right] = sockets;
+  viewSetter(context, 0)("footprint");
+  assert.equal(sockets.length, 3, "只重连切换视图的区域");
+  assert.equal(oldLeft.closed, true);
+  assert.notEqual(right.closed, true, "另一侧继续使用原连接");
+  assert.equal(new URL(right.url).searchParams.get("footprint"), "false");
+  const current = sockets.at(-1);
+  assert.equal(new URL(current.url).searchParams.get("footprint"), "true");
+  viewSetter(context, 0)("footprint");
+  assert.equal(sockets.length, 3, "重复选择同一视图无需重连");
+  const send = (socket, msg) => socket.onmessage({ data: JSON.stringify(msg) });
+  const base = { symbol, tf: 30, ltf: 0 };
+  send(current, { ...base, type: "snapshot", cfg, bars: [bar], revision: 1,
+    footprint: { revision: 1, tickSize: .1, bars: [] } });
+  assert.doesNotMatch(context.document.getElementById("status").textContent, /数据同步失败/);
+  const info = findByClass(chartEl(context, 0), "footprint-info");
+  assert.equal(info.hidden, false);
+  assert.match(info.textContent, /等待逐笔成交/);
+  const fp = stubCharts[0].series.find(series => series.type?.constructor?.name === "FootprintSeries");
+  // 门槛由渲染器按显示档算: 拿图上现有数据和选项实际画一遍(行高 20px, 不会再合档), 读它报出的门槛
+  const thresholds = async () => {
+    const renderer = fp.type.renderer();
+    // 库交给渲染器的 originalData 不带 time(实测), 这里照样去掉, 渲染器只能靠 barTime 认 bar
+    renderer.update({ barSpacing: 72, visibleRange: { from: 0, to: fp.data.length },
+      bars: fp.data.map(({ time, ...originalData }) => ({ x: 100, originalData })) },
+      Object.assign({}, fp.options, ...fp.applied));
+    const ctx = { fillRect() {}, fillText() {}, strokeRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {} };
+    renderer.draw({ useMediaCoordinateSpace: fn => fn({ context: ctx }) }, p => -p * 40);
+    await new Promise(resolve => setImmediate(resolve));
+    return Array.from(fp.data, item => renderer.grid().thresholds.get(item.time));   // 换成本 realm 的数组, deepEqual 才认
+  };
+  send(current, { ...base, type: "footprints", revision: 2, tickSize: .5, priceTick: .1,
+    bars: [{ time: T0, coverage: "partial", levels: [[100, 1, 2, 0]] }] });
+  assert.equal(fp.data[0].levels[0][1], 1);
+  assert.deepEqual(await thresholds(), [1.5], "首根用自身非零半格均量启动");
+  assert.match(info.textContent, /价格档 0.5 · 不平衡 ≥ 3× 且 ≥ 1.5 ZEC/, "画过之后说明里换成渲染器报的门槛");
+  send(current, { ...base, type: "footprint_snapshot", revision: 3, tickSize: .5, priceTick: .1,
+    bars: [{ time: T0, coverage: "complete", levels: [[100, .001, .003, 0]] },
+      { time: T0 + 30, coverage: "complete", levels: [[100, .1, .2, 0]] }] });
+  assert.ok(Math.abs((await thresholds())[1] - .002) < 1e-12, "后续根按此前完整足迹自适应");
+  send(current, { ...base, type: "footprints", revision: 4, tickSize: .5, priceTick: .1,
+    bars: [{ time: T0, coverage: "complete", levels: [[100, .01, .03, 0]] }] });
+  assert.ok(Math.abs((await thresholds())[1] - .02) < 1e-12, "修订历史后重算后续门槛");
+  vm.runInContext("charts[0].setTf(60)", context);
+  assert.equal(fp.data.length, 0);
+  send(current, { ...base, type: "footprints", revision: 99, tickSize: .5,
+    bars: [{ time: T0, coverage: "complete", levels: [[100, 100, 100, 0]] }] });
+  assert.equal(fp.data.length, 0, "旧周期足迹到达也保持清空");
+  await new Promise(resolve => setImmediate(resolve));
+  const next = sockets.at(-1);
+  assert.equal(new URL(next.url).searchParams.get("tf"), "60");
+  send(next, { ...base, tf: 60, type: "snapshot", cfg: { ...cfg, tf: 60 }, bars: [bar], revision: 1,
+    footprint: { revision: 1, tickSize: 1,
+      bars: [{ time: T0, coverage: "partial", levels: [[100, 3, 4, 0]] }] } });
+  assert.equal(fp.data[0].levels[0][1], 3);
+  assert.deepEqual(await thresholds(), [3.5], "切换周期后不沿用之前的币量基线");
+  assert.match(info.textContent, /价格档 1 /);
+});
 
 test("周期显示名与本地兜底的拆分粒度: 能整除主周期的才合法", () => {
   const context = runBrowser();

@@ -205,25 +205,27 @@
 
   // ---------- LSMA × CRVOL 共振 ----------
 
-  // crv: derive 里算好的 CRVOL 累计序列(斜率复用它)
-  function deriveLw(bars, crv) {
+  // 离线/训练数据的后备计算；实时图表直接消费后端 flowWave，与警报共用结果。
+  function deriveLwSegment(bars) {
     const n = bars.length;
     const hlc3 = hlc3Of(bars);
-    const vol = bars.map((b) => b.volume || 0);
+    const vol = bars.map((b) => Number.isFinite(b.volume) && b.volume >= 0 &&
+      b.volumeValid !== false && b.valid !== false ? b.volume : null);
 
     // tci = ema(channelIndex(src, n1, 0.025), n2) + 50
     const tci = ema(channelIndex(hlc3, LW.n1, 0.025), LW.n2).map((x) => (x == null ? null : x + 50));
 
     // mf = n3 周期 MFI(典型价用 hlc3)
-    const rmf = hlc3.map((tp, i) => tp * vol[i]);
+    const rmf = hlc3.map((tp, i) => vol[i] == null ? null : tp * vol[i]);
     const mf = new Array(n).fill(null);
     for (let i = LW.n3 - 1; i < n; i++) {
-      let pos = 0, neg = 0;
+      let pos = 0, neg = 0, complete = true;
       for (let j = Math.max(i - LW.n3 + 1, 1); j <= i; j++) {
+        if (rmf[j] == null) { complete = false; break; }
         if (hlc3[j] > hlc3[j - 1]) pos += rmf[j];
         else if (hlc3[j] < hlc3[j - 1]) neg += rmf[j];
       }
-      mf[i] = 100 - 100 / (1 + (neg === 0 ? 1e10 : pos / neg));
+      if (complete) mf[i] = 100 - 100 / (1 + (neg === 0 ? 1e10 : pos / neg));
     }
 
     // tradition = avg(tci, mf, rsi3); wave = linreg(wt1, n4) 即 LSMA Main
@@ -232,6 +234,31 @@
       tci[i] == null || mf[i] == null || rsi3[i] == null ? null : (tci[i] + mf[i] + rsi3[i]) / 3);
     const wt2 = smaStrict(wt1, 6);
     const wave = linreg(wt1, LW.n4);
+    return { wave, wt2 };
+  }
+
+  // crv: derive 里算好的 CRVOL 累计序列(斜率复用它)。null 是权威的缺失结果，不回退计算。
+  function deriveLw(bars, crv, options = {}) {
+    const authoritative = (b) => b.flowWave?.version === 1;
+    let wave = bars.map(() => null), wt2 = bars.map(() => null);
+    if (!bars.every(authoritative)) {
+      const validPrice = (b) => [b.time, b.open, b.high, b.low, b.close].every(Number.isFinite) &&
+        b.low <= Math.min(b.open, b.close) && b.high >= Math.max(b.open, b.close) && b.priceValid !== false;
+      let start = 0;
+      const fill = (end) => {
+        const local = deriveLwSegment(bars.slice(start, end));
+        local.wt2.forEach((v, j) => { wt2[start + j] = v; wave[start + j] = local.wave[j]; });
+      };
+      for (let i = 0; i < bars.length; i++) {
+        const gap = options.continuous && options.tf && i > 0 && bars[i].time !== bars[i - 1].time + options.tf;
+        if (gap || !validPrice(bars[i])) { fill(i); start = i; }
+        if (!validPrice(bars[i])) start = i + 1;
+      }
+      fill(bars.length);
+    }
+    bars.forEach((b, i) => {
+      if (authoritative(b)) { wt2[i] = b.flowWave.wt2; wave[i] = b.flowWave.wave; }
+    });
 
     // CRVOL 斜率(数据窗口输出): linreg(crvol, slopeLen) 的一阶差分
     const reg = linreg(crv, LW.slopeLen);
@@ -463,7 +490,7 @@
 
     const derived = { vol, buy, sell, delta, posd, negd, smaVolN, rvol, rpos, rneg, rbuy, rsell,
                       zVol, zRpos, zRneg, zBuy, zSell, crv, emaLines };
-    derived.lw = deriveLw(bars, crv);
+    derived.lw = deriveLw(bars, crv, { tf: cfg.tf, continuous: cfg.flowWaveContinuous });
     derived.band = deriveBand(bars, derived.lw.wt2, bandK);
     return derived;
   }

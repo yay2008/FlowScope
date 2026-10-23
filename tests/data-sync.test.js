@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeBars, mergeCvdHistory, diagonalVolumes, cvdCandle, splitLtf, relativeLevel,
+const { mergeBars, snapshotGap, mergeCvdHistory, diagonalVolumes, footprintRows, footprintMultiple, footprintThresholds, cvdCandle, splitLtf, relativeLevel,
         parseSymbolParts, formatOpenInterest, formatAmount, liquidityLabel,
         watchLabel, formatPrice,
         formatChangePct, changeClass, productLabel, monthLabel } =
@@ -74,9 +74,91 @@ test("diagonal comparison uses adjacent price ticks, never the next traded row",
   assert.deepEqual(diagonalVolumes(levels, null), [null, null]);
 });
 
+test("footprint rows merge adjacent bands onto the lowest price and keep every side", () => {
+  const levels = [[100.1, 1, 2, 0], [100.2, 3, 4, 1], [100.5, 1, 0, 0]];
+  assert.deepEqual(footprintRows(levels, .1, 5), [[100, 4, 6, 1], [100.5, 1, 0, 0]]);
+  assert.equal(footprintRows(levels, .1, 1), levels, "倍数 1 原样返回");
+  assert.deepEqual(footprintRows([[3, 1, 0]], 1, 2), [[2, 1, 0, 0]], "缺未知量的旧格式补 0");
+});
+
+test("display multiple divides the base band and never jumps more than 2.5x between choices", () => {
+  assert.equal(footprintMultiple(10, 3), 10, "底档已经够高就不合");
+  assert.equal(footprintMultiple(10, 23), 50, "25 不能被底档 10 整除");
+  assert.equal(footprintMultiple(5, 23), 25, "整数价位序列优先给出 25");
+  assert.equal(footprintMultiple(2, 2.2), 4, "底档 2 个价位时 4 补在 2 和 10 之间(黄金 5m: 0.04 -> 0.08 -> 0.2)");
+  assert.equal(footprintMultiple(20, 230), 400);
+  assert.equal(footprintMultiple(3, 7), 15, "多所公约数这类不在序列上的底档按它的 1-2-5 倍");
+  for (const base of [1, 2, 3, 5, 10, 20, 50]) {
+    let previous = base;
+    for (let needed = base; needed < base * 1000; needed *= 1.1) {
+      const multiple = footprintMultiple(base, needed);
+      assert.equal(multiple % base, 0, `${base} ${needed}`);
+      assert.ok(multiple >= needed && multiple <= Math.max(base, needed * 2.5), `${base} ${needed} -> ${multiple}`);
+      assert.ok(multiple >= previous, "需要的行高越大, 档只会越粗");
+      previous = multiple;
+    }
+  }
+});
+
 test("decimal price ticks keep adjacency despite binary floating-point rounding", () => {
   assert.deepEqual(diagonalVolumes([[.1, 10, 20], [.2, 30, 40]], .1),
     [{sellBelow: 0, buyAbove: 30}, {sellBelow: 20, buyAbove: 0}]);
+});
+
+const footprintBar = (time, quantity, coverage = "complete") => ({
+  time, coverage, levels: [[100, quantity, quantity, 0]],
+});
+
+test("crypto footprint minimum scales with coin quantities, including fractions of one coin", () => {
+  const base = [footprintBar(1, 2), footprintBar(2, 4), footprintBar(3, 6)];
+  const reference = footprintThresholds(base);
+  for (const scale of [0.000001, 1, 1000000]) {
+    const scaled = base.map(bar => ({ ...bar,
+      levels: bar.levels.map(([price, buy, sell]) => [price, buy * scale, sell * scale, 0]),
+    }));
+    for (const [time, minimum] of footprintThresholds(scaled)) {
+      const expected = reference.get(time) * scale;
+      assert.ok(Math.abs(minimum - expected) <= expected * 1e-12);
+    }
+  }
+  assert.ok(footprintThresholds([footprintBar(1, .0001)]).get(1) < 1);
+});
+
+test("crypto footprint baseline excludes current and future volume", () => {
+  const history = [footprintBar(1, 2), footprintBar(2, 4), footprintBar(3, 6)];
+  const original = footprintThresholds([...history, footprintBar(4, 100)]);
+  const revised = footprintThresholds([...history, footprintBar(4, 1000000), footprintBar(5, 1e9)]);
+  assert.equal(original.get(4), 4);
+  assert.equal(revised.get(4), 4, "当前根放量不改变自己的历史门槛");
+  for (const bar of history) assert.equal(revised.get(bar.time), original.get(bar.time));
+});
+
+test("partial coverage, empty sides and unknown volume cannot dilute the crypto baseline", () => {
+  const result = footprintThresholds([
+    footprintBar(1, 4), footprintBar(2, 1e9, "partial"), footprintBar(3, 0),
+    { time: 4, coverage: "complete", levels: [[100, NaN, Infinity, 1e9], [101, 0, 0, 1e9]] },
+    footprintBar(5, .0001),
+  ]);
+  assert.equal(result.get(5), 4);
+  assert.equal(footprintThresholds([{ time: 1, levels: [] }]).get(1), null);
+  assert.equal(footprintThresholds([
+    footprintBar(1, 1000, "partial"), footprintBar(2, .25),
+  ]).get(2), .25, "没有完整历史时以自身有效半格均量启动");
+});
+
+test("crypto footprint follows the latest twenty complete bars and resists a single volume spike", () => {
+  const history = Array.from({ length: 40 }, (_, i) => footprintBar(i, i < 20 ? 1 : 100));
+  const result = footprintThresholds([...history, footprintBar(40, 1e9), footprintBar(41, 1)]);
+  assert.equal(result.get(40), 100, "更早的低量不再参与近期门槛");
+  assert.equal(result.get(41), 100, "单根异常放量不抬高典型成交量");
+});
+
+test("crypto footprint historical corrections and new price grouping rebuild their own baseline", () => {
+  const history = [footprintBar(1, 1), footprintBar(2, 3), footprintBar(3, 2)];
+  assert.equal(footprintThresholds(history).get(3), 2);
+  assert.equal(footprintThresholds([footprintBar(1, 5), ...history.slice(1)]).get(3), 4);
+  assert.equal(footprintThresholds([footprintBar(3, .01)]).get(3), .01,
+    "新币种、周期或分档不沿用上一次调用的量级");
 });
 
 test("FlowMeter renders an isolated valid CVD bar without a preceding bar", () => {
@@ -158,4 +240,12 @@ test("contract picker labels show the main month and yesterday's open interest",
   assert.equal(monthLabel({name: "燃油2611", openInterest: 428100}), "燃油2611 · 昨仓 42.8万");
   assert.equal(monthLabel({name: "燃油2611", openInterest: null}), "燃油2611");
   assert.equal(monthLabel({symbol: "SHFE.fu2611"}), "SHFE.fu2611");
+});
+
+test("重连快照接不上已有 K 线时才算缺口", () => {
+  const bars = [{ time: 30 }, { time: 60 }];
+  assert.equal(snapshotGap(bars, [{ time: 60 }, { time: 90 }]), false);
+  assert.equal(snapshotGap(bars, [{ time: 90 }]), true);
+  assert.equal(snapshotGap([], [{ time: 90 }]), false);
+  assert.equal(snapshotGap(bars, []), false);
 });

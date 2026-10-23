@@ -154,6 +154,19 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(self.feed.snapshots[10]["bars"][0]["delta"], 20)
         self.assertEqual(self.feed.snapshots[0]["bars"][0]["delta"], 10)
 
+    def test_kline_volumes_are_saved_only_when_closed_klines_change(self):
+        self.feed.request(ltf=10)
+        self.feed.lower_klines[10] = klines()
+        saved = []
+        with patch.object(self.feed, "save_kline_volumes", side_effect=lambda k, final=False: saved.append(len(k))):
+            self.feed.recompute(lambda _: None)
+            self.feed.klines.loc[self.feed.klines.index[-1], "volume"] += 1   # 末根还在走
+            self.feed.recompute(lambda _: None)
+            self.assertEqual(len(saved), 1)
+            self.feed.klines.loc[self.feed.klines.index[0], "volume"] += 1    # 已收盘的被改
+            self.feed.recompute(lambda _: None)
+            self.assertEqual(len(saved), 2)
+
     def test_snapshot_cfg_carries_contract_price_digits_once_quote_is_ready(self):
         # 国债期货步长 0.005: 位数要下发, 否则前端按 0 位取整, 107.85 变成 108
         self.feed.quote = SimpleNamespace(price_tick=0.005, price_decs=3)
@@ -291,6 +304,34 @@ class FeedTests(unittest.TestCase):
                 task.cancel()
                 await task
             self.assertEqual(manager.clients, {})
+
+        with patch.object(server, "manager", manager):
+            asyncio.run(exercise())
+
+    def test_ws_relays_history_notice_without_revision(self):
+        manager = ingest.FeedManager()
+        manager.feeds[ingest.feed_key(self.feed.symbol, self.feed.tf)] = self.feed
+        self.feed.recompute(lambda _: None)
+        sent = asyncio.Queue()
+        socket = SimpleNamespace(accept=lambda: asyncio.sleep(0), close=lambda **_: asyncio.sleep(0),
+                                 send_json=lambda message: asyncio.sleep(0, sent.put_nowait(message)))
+
+        async def exercise():
+            manager.loop = asyncio.get_running_loop()
+            task = asyncio.create_task(server.ws(socket, self.feed.symbol, 0, False))
+            try:
+                first = await asyncio.wait_for(sent.get(), timeout=2)
+                manager.broadcast({"type": "history", "symbol": self.feed.symbol, "tf": self.feed.tf,
+                                   "ltf": 0, "historyRevision": 3, "historyBackfill": None})
+                notice = await asyncio.wait_for(sent.get(), timeout=2)
+                self.assertEqual((notice["type"], notice["historyRevision"]), ("history", 3))
+                # 通知不推进 bar 的 revision: 同一 revision 之后的增量照常转发
+                manager.broadcast({"type": "bars", "symbol": self.feed.symbol, "tf": self.feed.tf,
+                                   "ltf": 0, "revision": first["revision"] + 1, "bars": []})
+                self.assertEqual((await asyncio.wait_for(sent.get(), timeout=2))["type"], "bars")
+            finally:
+                task.cancel()
+                await task
 
         with patch.object(server, "manager", manager):
             asyncio.run(exercise())
